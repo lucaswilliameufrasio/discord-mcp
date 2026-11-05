@@ -293,6 +293,28 @@ detentor autorizado e tratar de forma segura uma captura que sobreviva à morte
 da autoridade, inclusive quando conexão e processo divergem. Sem solução e
 testes adicionais, não integrar este fixture aos escritores da aplicação.
 
+#### Alternativa com lock no processo de captura
+
+Um caminho separado `CLOSE_OWNED` no fixture experimenta manter um lock
+exclusivo adicional no próprio subprocesso de captura, adquirido antes do pedido
+à autoridade e mantido até encerrar sua transação SQLite sintética. A resposta
+de conclusão deve chegar pela conexão que pediu a captura; outro cliente recebe
+`NOT_OWNER`. A reabertura testa o lock de captura além da barreira de escritores.
+Nos casos testados, a captura viva bloqueou reabertura após morte e reinício da
+autoridade; terminar ou matar o subprocesso liberou seu lock. Se o subprocesso
+morre com a autoridade ativa, o fixture permanece fechado até reinício. Os
+caminhos antigos e seus testes inseguros permanecem para comparação.
+
+Isso é somente uma hipótese cooperativa, não segurança de produção: a
+autoridade não verifica se o cliente detém o lock, nem autentica processos ou
+vincula uma identidade ao inode. Não foi testado `capture_once`, transferência
+de lock, filesystem remoto, perda de energia, captura com filhos que sobrevivem
+ao detentor do lock, nem recuperação de captura parcial. A combinação com
+`RETRY_DRAIN` após desconexão ou falha de drenagem ainda não estabelece uma
+transferência segura de propriedade; conexão encerrada e estado fechado podem
+exigir intervenção. Não integrar à aplicação antes de definir e verificar esses
+casos e a coordenação de todos os escritores.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

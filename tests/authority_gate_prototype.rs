@@ -23,6 +23,7 @@ struct Gate {
     active: usize,
     capturing: bool,
     drained: bool,
+    owned_capture: bool,
     capture_barrier: Option<File>,
 }
 type Shared = Arc<(Mutex<Gate>, Condvar)>;
@@ -65,7 +66,7 @@ fn serve_client(
             condition.notify_all();
             result?;
         }
-        "CLOSE" | "CLOSE_FAIL" => {
+        "CLOSE" | "CLOSE_FAIL" | "CLOSE_OWNED" => {
             let mut state = mutex.lock().unwrap();
             if state.capturing {
                 writeln!(socket, "CAPTURE_BUSY")?;
@@ -73,6 +74,7 @@ fn serve_client(
             }
             state.open = false;
             state.capturing = true;
+            state.owned_capture = command.trim() == "CLOSE_OWNED";
             state.drained = false;
             if persist_closed(&marker, command.trim() == "CLOSE_FAIL").is_err() {
                 writeln!(socket, "PERSIST_FAILED")?;
@@ -89,6 +91,18 @@ fn serve_client(
                 state.capture_barrier = Some(file);
                 state.drained = true;
                 writeln!(socket, "DRAINED")?;
+                if state.owned_capture {
+                    drop(state);
+                    let mut finish = String::new();
+                    reader.read_line(&mut finish)?;
+                    if finish.trim() == "FINISH" {
+                        let mut state = mutex.lock().unwrap();
+                        drop(state.capture_barrier.take());
+                        state.capturing = false;
+                        state.owned_capture = false;
+                        writeln!(socket, "FINISHED_CLOSED")?;
+                    }
+                }
             }
         }
         "RETRY_DRAIN" => {
@@ -112,7 +126,9 @@ fn serve_client(
         }
         "FINISH" => {
             let mut state = mutex.lock().unwrap();
-            if !state.capturing || !state.drained {
+            if state.owned_capture {
+                writeln!(socket, "NOT_OWNER")?;
+            } else if !state.capturing || !state.drained {
                 writeln!(socket, "NOT_DRAINED")?;
             } else {
                 drop(state.capture_barrier.take());
@@ -124,6 +140,14 @@ fn serve_client(
             let mut state = mutex.lock().unwrap();
             if state.open || state.active != 0 || state.capturing {
                 writeln!(socket, "NOT_DRAINED")?;
+                return Ok(());
+            }
+            let capture_lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(marker.with_file_name("capture.lock"))?;
+            if capture_lock.try_lock().is_err() {
+                writeln!(socket, "CAPTURE_BUSY")?;
                 return Ok(());
             }
             let file = OpenOptions::new().read(true).write(true).open(&barrier)?;
@@ -140,6 +164,7 @@ fn serve_client(
                 writeln!(socket, "OPENED")?;
             }
             drop(file);
+            drop(capture_lock);
         }
         "STATUS" => {
             let state = mutex.lock().unwrap();
@@ -210,6 +235,145 @@ fn cooperative_writer_worker() {
     drop(reader);
     drop(socket);
     drop(barrier);
+}
+
+#[test]
+fn owned_capture_worker() {
+    let Ok(dir) = std::env::var("CAPTURE_FIXTURE_DIR") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("capture.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let mut socket = StdStream::connect(dir.join("gate.sock")).unwrap();
+    writeln!(socket, "CLOSE_OWNED").unwrap();
+    let mut reader = StdReader::new(socket.try_clone().unwrap());
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    assert_eq!(response.trim(), "CLOSED");
+    response.clear();
+    reader.read_line(&mut response).unwrap();
+    assert_eq!(response.trim(), "DRAINED");
+    let db = rusqlite::Connection::open(dir.join("owned-capture.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sample(value INTEGER); BEGIN; SELECT * FROM sample;",
+    )
+    .unwrap();
+    eprintln!("MARK capturing");
+    let mut action = String::new();
+    std::io::stdin().read_line(&mut action).unwrap();
+    db.execute_batch("ROLLBACK").unwrap();
+    drop(db);
+    if action.trim() == "finish" {
+        writeln!(socket, "FINISH").unwrap();
+        response.clear();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(response.trim(), "FINISHED_CLOSED");
+    } else {
+        assert_eq!(action.trim(), "release");
+    }
+    drop(lock);
+}
+
+async fn start_owned_capture(dir: &Path) -> Child {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("CAPTURE_FIXTURE_DIR", dir)
+        .args(["--exact", "owned_capture_worker", "--nocapture"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut marker = String::new();
+    timeout(Duration::from_secs(5), stderr.read_line(&mut marker))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.trim(), "MARK capturing");
+    child
+}
+
+#[tokio::test]
+async fn owned_capture_rejects_unrelated_finish_until_owner_finishes() {
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut capture = start_owned_capture(fixture.dir.path()).await;
+    assert_eq!(fixture.command("FINISH").await, "NOT_OWNER");
+    assert_eq!(fixture.command("OPEN").await, "NOT_DRAINED");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    capture
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"finish\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), capture.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+}
+
+#[tokio::test]
+async fn live_capture_lock_blocks_reopening_after_authority_restart() {
+    let mut fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut capture = start_owned_capture(fixture.dir.path()).await;
+    fixture.restart().await;
+    assert_eq!(fixture.command("OPEN").await, "CAPTURE_BUSY");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    capture
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"release\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), capture.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+}
+
+#[tokio::test]
+async fn killed_capture_releases_process_lock_after_restart() {
+    let mut fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut capture = start_owned_capture(fixture.dir.path()).await;
+    fixture.restart().await;
+    assert_eq!(fixture.command("OPEN").await, "CAPTURE_BUSY");
+    capture.kill().await.unwrap();
+    capture.wait().await.unwrap();
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+}
+
+#[tokio::test]
+async fn owner_death_leaves_live_authority_closed_until_restart() {
+    let mut fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut capture = start_owned_capture(fixture.dir.path()).await;
+    capture.kill().await.unwrap();
+    capture.wait().await.unwrap();
+    assert_eq!(fixture.command("FINISH").await, "NOT_OWNER");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    assert_eq!(fixture.command("OPEN").await, "NOT_DRAINED");
+    fixture.restart().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
 }
 
 async fn start_writer(dir: &Path) -> Child {
@@ -404,6 +568,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("closed-marker"), b"closed\n").unwrap();
         std::fs::write(dir.path().join("activity.lock"), []).unwrap();
+        std::fs::write(dir.path().join("capture.lock"), []).unwrap();
         let child = Self::spawn(dir.path(), false).await;
         Self { dir, child }
     }
