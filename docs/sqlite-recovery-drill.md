@@ -490,6 +490,22 @@ Não há aqui monitoramento confiável do processo escritor, fencing, recuperaç
 após morte do supervisor ou integração à admissão real; o probe representa
 somente um concorrente sintético, não uma captura executada pela aplicação.
 
+Um cenário Linux adicional entrega à autoridade reiniciada um `pidfd` aberto
+para o escritor anterior antes da morte do supervisor. O escritor desbloqueia
+seu próprio descritor com uma transação SQLite aberta e o supervisor independente
+é morto. O teste comprova que um probe exclusivo já consegue adquirir a
+barreira, mas a autoridade mantém admissão fechada e recusa drenagem enquanto
+o `pidfd` não sinaliza saída. Depois do commit e término do escritor, a linha é
+verificada e a autoridade executa drenagem, persistência e abertura explícitas.
+
+O `pidfd` identifica apenas **esse processo**, não garante ausência de filhos,
+outros escritores ou novos participantes. O processo de teste conserva a âncora
+e entrega o handle correto à nova autoridade; não foi demonstrada descoberta,
+custódia ou transferência segura de todos os handles após uma perda real do
+supervisor. Também não há captura real, validação de continuidade ou garantia
+de durabilidade após crash. O teste é condicional à disponibilidade de
+`pidfd_open` e não autoriza integração operacional.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;

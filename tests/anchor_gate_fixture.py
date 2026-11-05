@@ -67,7 +67,7 @@ def publisher(sock_fd, directory, failure):
             os.close(fd)
 
 
-def transition_authority(control_fd, writer_fd, barrier_fd, state_path):
+def transition_authority(control_fd, writer_fd, barrier_fd, state_path, previous_pidfd=None):
     control = socket.socket(fileno=control_fd)
     writer = socket.socket(fileno=writer_fd)
     opened = False
@@ -82,6 +82,9 @@ def transition_authority(control_fd, writer_fd, barrier_fd, state_path):
             if not command:
                 return
             if command == b"D":
+                if previous_pidfd is not None and not select.select([previous_pidfd], [], [], 0)[0]:
+                    control.sendall(b"B")
+                    continue
                 try:
                     fcntl.flock(barrier_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -265,6 +268,113 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd_open is required")
+    def test_pidfd_reconciliation_refuses_live_writer_after_supervisor_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            database = os.path.join(directory, "synthetic.db")
+            state_path = os.path.join(directory, "state")
+            with open(path, "wb"), open(state_path, "wb") as state:
+                state.write(b"uncertain\n")
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            anchor = os.open(path, os.O_RDWR)
+            sender, receiver = socket.socketpair()
+            sockets = [sender, receiver]
+            processes = []
+            pidfd = None
+            try:
+                def start_with_fd(role):
+                    fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                    try:
+                        process = subprocess.Popen(
+                            [sys.executable, __file__, role, str(fd)], pass_fds=(fd,),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                    finally:
+                        os.close(fd)
+                    processes.append(process)
+                    return process
+
+                guard = start_with_fd("independent_guard")
+                self.assertEqual(line(guard.stdout), "GUARDED")
+                fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    authority = subprocess.Popen(
+                        [sys.executable, __file__, "grant_authority", str(sender.fileno()), str(fd)],
+                        pass_fds=(sender.fileno(), fd), stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(fd)
+                processes.append(authority)
+                writer = subprocess.Popen(
+                    [sys.executable, __file__, "early_writer", str(receiver.fileno()), database, "unlock"],
+                    pass_fds=(receiver.fileno(),), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                processes.append(writer)
+                pidfd = os.pidfd_open(writer.pid)
+                sender.close()
+                receiver.close()
+                self.assertEqual(line(authority.stdout), "ACK")
+                authority.kill()
+                authority.wait(timeout=5)
+                writer.stdin.write("start\n")
+                writer.stdin.flush()
+                self.assertEqual(line(writer.stdout), "RELEASED")
+                guard.kill()
+                guard.wait(timeout=5)
+
+                # Prove the lock alone is insufficient, then release the probe.
+                probe = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.close(probe)
+                control, control_peer = socket.socketpair()
+                candidate, candidate_peer = socket.socketpair()
+                control.settimeout(5)
+                candidate.settimeout(5)
+                sockets.extend((control, candidate))
+                barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    restarted = subprocess.Popen(
+                        [sys.executable, __file__, "pidfd_transition", str(control_peer.fileno()),
+                         str(candidate_peer.fileno()), str(barrier), state_path, str(pidfd)],
+                        pass_fds=(control_peer.fileno(), candidate_peer.fileno(), barrier, pidfd),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                finally:
+                    control_peer.close()
+                    candidate_peer.close()
+                    os.close(barrier)
+                processes.append(restarted)
+                candidate.sendall(b"W")
+                self.assertEqual(candidate.recv(1), b"N")
+                control.sendall(b"D")
+                self.assertEqual(control.recv(1), b"B")
+                writer.stdin.write("commit\n")
+                writer.stdin.flush()
+                self.assertEqual(writer.wait(timeout=5), 0)
+                with sqlite3.connect(database) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+                for sent, expected in ((b"D", b"D"), (b"P", b"P"), (b"O", b"O")):
+                    control.sendall(sent)
+                    self.assertEqual(control.recv(1), expected)
+                candidate.sendall(b"W")
+                self.assertEqual(candidate.recv(1), b"Y")
+                control.close()
+                self.assertEqual(restarted.wait(timeout=5), 0)
+            finally:
+                for sock in sockets:
+                    sock.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                if pidfd is not None:
+                    os.close(pidfd)
+                os.close(anchor)
+
     def test_independent_supervisor_lock_is_lost_on_supervisor_death(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
@@ -959,7 +1069,9 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "early_writer":
+    if len(sys.argv) == 7 and sys.argv[1] == "pidfd_transition":
+        transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6]))
+    elif len(sys.argv) == 5 and sys.argv[1] == "early_writer":
         early_release_writer(int(sys.argv[2]), sys.argv[3], sys.argv[4])
     elif len(sys.argv) == 4 and sys.argv[1] == "grant_authority":
         grant_authority(int(sys.argv[2]), int(sys.argv[3]))
