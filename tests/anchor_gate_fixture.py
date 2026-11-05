@@ -148,10 +148,11 @@ def sqlite_writer(fd, database):
     os.close(fd)
 
 
-def spawn_descendant(database):
+def spawn_descendant(database, detached=False):
     descendant = subprocess.Popen(
         [sys.executable, __file__, "descendant", database],
         stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+        start_new_session=detached,
     )
     print(f"CHILD {descendant.pid}", flush=True)
 
@@ -362,6 +363,86 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+                         "Linux pidfd APIs are required")
+    def test_detached_descendant_invalidates_process_group_completeness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            state = os.path.join(directory, "state")
+            database = os.path.join(directory, "synthetic.db")
+            with open(path, "wb"), open(state, "wb") as marker:
+                marker.write(b"uncertain\n")
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            parent = subprocess.Popen(
+                [sys.executable, __file__, "spawn_detached", database],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
+            )
+            child_handle = None
+            parent_handle = os.pidfd_open(parent.pid)
+            anchor = os.open(path, os.O_RDWR)
+            control = control_peer = candidate = candidate_peer = None
+            authority = None
+            try:
+                announcement = line(parent.stdout).split()
+                self.assertEqual(announcement[0], "CHILD")
+                child_pid = int(announcement[1])
+                child_handle = os.pidfd_open(child_pid)
+                self.assertEqual(parent.wait(timeout=5), 0)
+                self.assertEqual(os.getpgid(child_pid), child_pid)
+                self.assertNotEqual(child_pid, parent.pid)
+                parent.stdin.write("begin\n")
+                parent.stdin.flush()
+                self.assertEqual(line(parent.stdout), "DESCENDANT_WRITING")
+                self.assertTrue(select.select([parent_handle], [], [], 0)[0])
+                self.assertFalse(select.select([child_handle], [], [], 0)[0])
+
+                control, control_peer = socket.socketpair()
+                candidate, candidate_peer = socket.socketpair()
+                control.settimeout(5)
+                candidate.settimeout(5)
+                barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    authority = subprocess.Popen(
+                        [sys.executable, __file__, "multi_transition", str(control_peer.fileno()),
+                         str(candidate_peer.fileno()), str(barrier), state, "0", str(parent_handle)],
+                        pass_fds=(control_peer.fileno(), candidate_peer.fileno(), barrier, parent_handle),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                finally:
+                    control_peer.close()
+                    candidate_peer.close()
+                    os.close(barrier)
+                candidate.sendall(b"W")
+                self.assertEqual(candidate.recv(1), b"N")
+                control.sendall(b"D")
+                self.assertEqual(control.recv(1), b"B")
+                parent.stdin.write("commit\n")
+                parent.stdin.flush()
+                self.assertTrue(select.select([child_handle], [], [], 5)[0])
+                with sqlite3.connect(database) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+                control.sendall(b"D")
+                self.assertEqual(control.recv(1), b"B")
+            finally:
+                if child_handle is not None:
+                    if not select.select([child_handle], [], [], 0)[0]:
+                        signal.pidfd_send_signal(child_handle, signal.SIGKILL)
+                    os.close(child_handle)
+                for sock in (control, control_peer, candidate, candidate_peer):
+                    if sock is not None:
+                        sock.close()
+                if authority is not None:
+                    if authority.poll() is None:
+                        authority.kill()
+                    authority.communicate(timeout=5)
+                if parent.poll() is None:
+                    parent.kill()
+                parent.communicate(timeout=5)
+                os.close(parent_handle)
+                os.close(anchor)
+
     @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
                          "Linux pidfd APIs are required")
     def test_registry_restart_rejects_unfinished_descendant_and_partial_records(self):
@@ -1465,6 +1546,8 @@ if __name__ == "__main__":
                              [int(value) for value in sys.argv[7:]], sys.argv[6] == "1")
     elif len(sys.argv) == 3 and sys.argv[1] == "spawn_descendant":
         spawn_descendant(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "spawn_detached":
+        spawn_descendant(sys.argv[2], detached=True)
     elif len(sys.argv) == 3 and sys.argv[1] == "descendant":
         descendant_writer(sys.argv[2])
     elif len(sys.argv) == 7 and sys.argv[1] == "pidfd_transition":

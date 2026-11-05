@@ -523,6 +523,22 @@ como completa continua inseguro. O caso cobre apenas uma árvore sintética e
 depende de `pidfd_open` e `pidfd_send_signal`; não constitui fencing, controle
 de processos externos ou reconciliação operacional.
 
+Uma investigação adicional iniciou um pai em sessão própria e um descendente
+em outra sessão e grupo de processos. O pai terminou, mas o descendente ficou
+vivo e iniciou uma transação SQLite; seu grupo era distinto do grupo do pai.
+Uma autoridade sintética sem prova de completude recusou admissão e drenagem,
+inclusive depois de o descendente confirmar e terminar. A limpeza usou `pidfd`
+para identificar o descendente, sem sinalizar grupos do host. O teste mostra
+que acompanhar apenas o líder ou seu grupo não comprova ausência de descendentes;
+ele não prova que um grupo esteja vazio nem implementa contenção.
+
+No host de teste existe cgroup v2. A inspeção somente leitura encontrou o grupo
+da sessão sem permissão de escrita e uma hierarquia de usuário compartilhada
+gravável; sua delegação, fronteiras de acesso e contenção não foram qualificadas
+ou modificadas. Não foi executado teste de cgroup isolado e não se conclui que
+esse recurso esteja indisponível. A fixture continua recebendo a condição de
+inventário incompleto do teste, sem um mecanismo que a determine por si só.
+
 Uma fixture de inventário investiga a janela entre lançar e registrar um
 escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
 subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de
