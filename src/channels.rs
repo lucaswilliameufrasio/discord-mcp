@@ -966,7 +966,10 @@ impl ChannelStore {
         getrandom::fill(&mut token).map_err(|_| StoreError::Storage)?;
         let encoded = hex::encode(token);
         let hash = Sha256::digest(encoded.as_bytes());
-        self.db.execute("INSERT INTO mcp_access_tokens(token_hash,user_id,resource,expires_at) VALUES (?1,?2,?3,?4)", params![hash.as_slice(), user_id, resource, expires_at]).map_err(|_| StoreError::Storage)?;
+        let inserted = self.db.execute("INSERT INTO mcp_access_tokens(token_hash,user_id,resource,expires_at) SELECT ?1,?2,?3,?4 WHERE NOT EXISTS (SELECT 1 FROM recovery_control WHERE id=1 AND quarantined=1)", params![hash.as_slice(), user_id, resource, expires_at]).map_err(|_| StoreError::Storage)?;
+        if inserted != 1 {
+            return Err(StoreError::RecoveryPending);
+        }
         Ok(encoded)
     }
 
@@ -1023,7 +1026,10 @@ impl ChannelStore {
         getrandom::fill(&mut random).map_err(|_| StoreError::Storage)?;
         let code = hex::encode(random);
         let hash = Sha256::digest(code.as_bytes());
-        self.db.execute("INSERT INTO mcp_authorization_codes(code_hash,client_id,redirect_uri,resource,user_id,challenge,created_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![hash.as_slice(),grant.client_id,grant.redirect_uri,grant.resource,grant.user_id,grant.code_challenge,now,expires_at]).map_err(|_| StoreError::Storage)?;
+        let inserted = self.db.execute("INSERT INTO mcp_authorization_codes(code_hash,client_id,redirect_uri,resource,user_id,challenge,created_at,expires_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS (SELECT 1 FROM recovery_control WHERE id=1 AND quarantined=1)", params![hash.as_slice(),grant.client_id,grant.redirect_uri,grant.resource,grant.user_id,grant.code_challenge,now,expires_at]).map_err(|_| StoreError::Storage)?;
+        if inserted != 1 {
+            return Err(StoreError::RecoveryPending);
+        }
         Ok(code)
     }
 
@@ -1048,6 +1054,7 @@ impl ChannelStore {
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
         let hash = Sha256::digest(exchange.code.as_bytes());
         let record: Option<(String, String)> = transaction.query_row(
             "SELECT user_id, challenge FROM mcp_authorization_codes WHERE code_hash=?1 AND client_id=?2 AND redirect_uri=?3 AND resource=?4 AND created_at<=?5 AND expires_at>?5",

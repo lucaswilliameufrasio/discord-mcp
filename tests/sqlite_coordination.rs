@@ -15,6 +15,125 @@ use tokio::{
 };
 
 #[test]
+fn issue_during_quarantine_worker() {
+    use discord_mcp::channels::{AuthorizationExchange, AuthorizationGrant, StoreError};
+    let Some(path) = std::env::var_os("ISSUE_FIXTURE_DB") else {
+        return;
+    };
+    let store = ChannelStore::open(std::path::Path::new(&path), &[185; 32]).unwrap();
+    eprintln!("READY");
+    let mut command = String::new();
+    std::io::stdin().read_line(&mut command).unwrap();
+    eprintln!("ISSUING");
+    let result = match command.trim() {
+        "token" => store.issue_access_token("101", "https://example.invalid/mcp", 1000, 60),
+        "code" => store.issue_authorization_code(
+            &AuthorizationGrant {
+                user_id: "101",
+                client_id: "client",
+                redirect_uri: "http://127.0.0.1:8765/callback",
+                resource: "https://example.invalid/mcp",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            },
+            1000,
+        ),
+        "exchange" => store.exchange_authorization_code(
+            &AuthorizationExchange {
+                code: &std::env::var("ISSUE_FIXTURE_CODE").unwrap(),
+                client_id: "client",
+                redirect_uri: "http://127.0.0.1:8765/callback",
+                resource: "https://example.invalid/mcp",
+                code_verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            },
+            1001,
+        ),
+        _ => panic!("invalid synthetic operation"),
+    };
+    assert!(
+        matches!(result, Err(StoreError::RecoveryPending)),
+        "issuance crossed quarantine"
+    );
+}
+
+#[tokio::test]
+async fn issuance_refuses_concurrent_quarantine_without_persisting_credentials() {
+    for mode in ["token", "code", "exchange"] {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("issue.db");
+        let store = ChannelStore::open(&database, &[185; 32]).unwrap();
+        let code = if mode == "exchange" {
+            store
+                .issue_authorization_code(
+                    &discord_mcp::channels::AuthorizationGrant {
+                        user_id: "101",
+                        client_id: "client",
+                        redirect_uri: "http://127.0.0.1:8765/callback",
+                        resource: "https://example.invalid/mcp",
+                        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                    },
+                    1000,
+                )
+                .unwrap()
+        } else {
+            String::new()
+        };
+        let mut worker = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("ISSUE_FIXTURE_DB", &database)
+            .env("ISSUE_FIXTURE_CODE", code)
+            .args(["--exact", "issue_during_quarantine_worker", "--nocapture"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stderr = BufReader::new(worker.stderr.take().unwrap());
+        let mut marker = String::new();
+        timeout(Duration::from_secs(5), stderr.read_line(&mut marker))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.trim(), "READY");
+        let blocker = rusqlite::Connection::open(&database).unwrap();
+        blocker
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+            )
+            .unwrap();
+        worker
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("{mode}\n").as_bytes())
+            .await
+            .unwrap();
+        marker.clear();
+        timeout(Duration::from_secs(5), stderr.read_line(&mut marker))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.trim(), "ISSUING");
+        assert!(
+            timeout(Duration::from_millis(300), worker.wait())
+                .await
+                .is_err()
+        );
+        blocker.execute_batch("COMMIT").unwrap();
+        assert!(
+            timeout(Duration::from_secs(6), worker.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success(),
+            "{mode} was not refused"
+        );
+        let count: i64 = blocker.query_row("SELECT (SELECT COUNT(*) FROM mcp_access_tokens) + (SELECT COUNT(*) FROM mcp_authorization_codes)", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, i64::from(mode == "exchange"));
+    }
+}
+
+#[test]
 fn delete_worker() {
     let Some(path) = std::env::var_os("DELETE_FIXTURE_DB") else {
         return;

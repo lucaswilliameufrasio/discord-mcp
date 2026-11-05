@@ -152,6 +152,17 @@ revogação e exclusão. Antes dessa alteração, a transação diferida falhava
 tentar promover a leitura para escrita sob contenção. A espera continua sujeita
 ao limite configurado; isso não implementa exclusividade para replicação.
 
+Uma auditoria das transações restantes em `ChannelStore` encontrou que as
+transações diferidas de auditoria e métricas começam com escrita; a de resolução
+de canal autorizado é somente leitura. A emissão de token e código OAuth,
+entretanto, verificava quarentena em leitura separada antes de inserir. Um teste
+com subprocesso e reserva SQLite reproduziu emissão após outra conexão confirmar
+quarentena. As inserções agora verificam quarentena atomicamente na própria
+instrução; a troca de código também verifica novamente após reservar a escrita.
+O teste cobre token, código e troca concorrentes com quarentena, sem credenciais
+reais. Ele não comprova exclusividade de todos os escritores nem recuperação
+operacional; a captura incremental continua desabilitada.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin
