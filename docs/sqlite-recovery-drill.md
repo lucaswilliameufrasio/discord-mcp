@@ -27,6 +27,51 @@ restaurado tem limite de cinco segundos. Ele não carrega configuração de
 produção nem faz requisições ao Discord: as ferramentas são invocadas com
 entradas inválidas para verificar o carregamento sem efeitos externos.
 
+### Exercício opt-in S3 simulado
+
+`bash drills/s3/run.sh` compila um programa isolado contra os checkouts locais
+do Discord MCP e `../sqlite-replication`, inicia um contêiner Floci próprio e
+descartável em `127.0.0.1`, executa o exercício e para somente esse contêiner.
+São necessários Cargo, Python 3, `timeout`, contexto Docker `rootless` realmente
+acessível e a imagem `floci/floci:2.3.0` no digest fixado no script já
+disponível localmente. O script não faz pull, usa porta aleatória e não usa
+volumes ou recursos S3 preexistentes; a imagem declara um volume anônimo, que
+o Docker remove com o contêiner `--rm`. Seu processo de teste recebe ambiente
+mínimo e credenciais sintéticas, e rejeita qualquer endpoint que não seja
+`127.0.0.1` com porta explícita. Não forneça credenciais ou dados reais.
+
+O subprojeto `drills/s3` tem `Cargo.lock` próprio, mas as bibliotecas de
+replicação são obtidas do checkout irmão por caminho, não fixadas pelo lockfile.
+Para reproduzir, registre sua revisão e alterações locais antes de executar;
+essa dependência não integra nem habilita replicação operacional no aplicativo.
+O programa cria sua própria base sintética, snapshot e bucket, envia o
+repositório ao Floci e restaura em um caminho novo. Em seguida prepara outra
+cópia, verifica quarentena e invalidação de permissões, tokens e códigos, ativa
+explicitamente e verifica que não reaparecem. Uma tentativa contra destino
+existente deve falhar sem modificá-lo; o teste também confirma que revogações
+feitas na fonte após o snapshot permanecem na fonte. O tempo exibido exclui
+build e inicialização do emulador, portanto não é RTO.
+
+O isolamento usa contêiner e diretório temporário próprios; interrupções abruptas
+podem deixar recursos do exercício, que devem ser identificados antes de limpar.
+O emulador local não valida IAM, criptografia de objetos, rede, consistência,
+latência ou políticas de qualquer provedor real, nem perda de host. O restore
+S3 da biblioteca irmã baixa o repositório inteiro para staging temporário e
+exige espaço proporcional; limites de tamanho para um repositório remoto não
+são demonstrados por este exercício.
+
+Execução local em 2026-11-05: `sqlite-replication` na revisão local
+`3553f91cce2535b4fbe521c6582bec64db94477d`, com alterações preexistentes em
+documentação e testes, e Discord MCP em `4dfdde4` mais o subprojeto deste
+exercício. Docker rootless e imagem pelo digest do script. Duas execuções
+passaram: snapshot TXID 1 e dois objetos confirmados, restore e reconciliação,
+com 0,183 s e 0,173 s para o trecho medido. Esses tempos não incluem compilação,
+emulador, obtenção de credenciais ou configuração, e não são RTO. Não foram
+testados restart do Floci, truncamento de objetos, falhas de rede, recuperação
+de host ou provedores reais. O checkout irmão foi usado sem modificar seus
+arquivos; sua revisão e seu estado precisam ser preservados independentemente
+para reproduzir o resultado.
+
 ## Preparar uma cópia restaurada
 
 Os comandos abaixo descrevem a ferramenta, não autorizam acesso a backups reais

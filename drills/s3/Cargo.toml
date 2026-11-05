@@ -1,0 +1,16 @@
+[package]
+name = "discord-mcp-s3-drill"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+discord-mcp = { path = "../.." }
+sqlite-replication-core = { path = "../../../sqlite-replication/rust/crates/core" }
+sqlite-replication-storage-s3 = { path = "../../../sqlite-replication/rust/crates/storage-s3" }
+aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-credential-types = "=1.3.1"
+tempfile = "3.27.0"
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "time"] }
