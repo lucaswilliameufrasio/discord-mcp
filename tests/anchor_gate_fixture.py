@@ -153,6 +153,41 @@ def admitted_sqlite_writer(fd, socket_fd, database):
     sock.close()
 
 
+def grant_authority(socket_fd, barrier_fd):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    fcntl.flock(barrier_fd, fcntl.LOCK_SH)
+    sock.sendmsg([b"F"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [barrier_fd]))])
+    if sock.recv(1) != b"A":
+        raise RuntimeError("missing receipt acknowledgment")
+    # The receiver now holds a reference to the same locked description.
+    os.close(barrier_fd)
+    print("ACK", flush=True)
+    sys.stdin.readline()
+
+
+def transferred_sqlite_writer(socket_fd, database):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    fd = receive_descriptor(sock)
+    if fd is None:
+        raise RuntimeError("missing barrier")
+    sock.sendall(b"A")
+    print("ADMITTED", flush=True)
+    if sys.stdin.readline().strip() != "disconnect":
+        raise RuntimeError("expected disconnect")
+    sock.close()
+    print("DISCONNECTED", flush=True)
+    if sys.stdin.readline().strip() != "commit":
+        raise RuntimeError("expected commit")
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    connection.commit()
+    connection.close()
+    os.close(fd)
+
+
 def receive_descriptor(sock):
     data, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
     if not data:
@@ -203,6 +238,66 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_transferred_writer_lock_survives_disconnect_and_authority_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            database = os.path.join(directory, "synthetic.db")
+            with open(path, "wb"):
+                pass
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            anchor = os.open(path, os.O_RDWR)
+            authority_socket, writer_socket = socket.socketpair()
+            processes = []
+
+            def cleanup():
+                authority_socket.close()
+                writer_socket.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                os.close(anchor)
+
+            self.addCleanup(cleanup)
+            barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            try:
+                authority = subprocess.Popen(
+                    [sys.executable, __file__, "grant_authority", str(authority_socket.fileno()), str(barrier)],
+                    pass_fds=(authority_socket.fileno(), barrier), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+            finally:
+                os.close(barrier)
+            processes.append(authority)
+            writer = subprocess.Popen(
+                [sys.executable, __file__, "transferred_writer", str(writer_socket.fileno()), database],
+                pass_fds=(writer_socket.fileno(),), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            processes.append(writer)
+            authority_socket.close()
+            writer_socket.close()
+            self.assertEqual(line(writer.stdout), "ADMITTED")
+            self.assertEqual(line(authority.stdout), "ACK")
+            writer.stdin.write("disconnect\n")
+            writer.stdin.flush()
+            self.assertEqual(line(writer.stdout), "DISCONNECTED")
+            authority.kill()
+            authority.wait(timeout=5)
+            probe = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                writer.stdin.write("commit\n")
+                writer.stdin.flush()
+                self.assertEqual(writer.wait(timeout=5), 0)
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+
     def test_admitted_sqlite_writer_retains_barrier_after_authority_death(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
@@ -699,7 +794,11 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "admitted_sqlite_writer":
+    if len(sys.argv) == 4 and sys.argv[1] == "grant_authority":
+        grant_authority(int(sys.argv[2]), int(sys.argv[3]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "transferred_writer":
+        transferred_sqlite_writer(int(sys.argv[2]), sys.argv[3])
+    elif len(sys.argv) == 5 and sys.argv[1] == "admitted_sqlite_writer":
         admitted_sqlite_writer(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
     elif len(sys.argv) == 4 and sys.argv[1] == "sqlite_writer":
         sqlite_writer(int(sys.argv[2]), sys.argv[3])

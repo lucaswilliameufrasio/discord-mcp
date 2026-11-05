@@ -442,6 +442,22 @@ possui esse lock; um cliente não cooperativo poderia ignorar o protocolo. O
 supervisor de teste ainda retém a âncora, controla os processos e não simula
 captura ou perda de energia. Não é garantia para os escritores da aplicação.
 
+Um experimento complementar transfere via `SCM_RIGHTS` um descritor já
+bloqueado em modo compartilhado pela autoridade sintética. O subprocesso
+escritor recebe o descritor e confirma recebimento; a autoridade fecha sua
+referência. Depois da desconexão do socket e morte da autoridade, uma tentativa
+de lock exclusivo em uma descrição independente do inode ancorado retorna
+ocupado. O escritor confirma uma transação SQLite e fecha o descritor; então o
+lock exclusivo é adquirido e o banco contém a linha esperada.
+
+A transferência mostra que o lock do kernel sobrevive enquanto o receptor mantém
+a descrição aberta; o ACK não prova que ele continuará fazendo isso. O escritor
+pode fechar ou desbloquear o descritor antes do commit, compartilhar a descrição
+ou ignorar a disciplina. Não há autenticação do receptor, associação segura ao
+SQLite, teste de falha da transferência/ACK nessa fixture, nem protocolo completo
+de reinício, captura ou recuperação. O supervisor mantém a âncora viva. Portanto
+isso não qualifica a admissão de escritores reais nem substitui cooperação.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
