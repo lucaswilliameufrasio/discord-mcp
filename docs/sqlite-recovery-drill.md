@@ -567,6 +567,24 @@ cgroup namespaces, uma configuração endurecida, acesso a SQLite ou efeitos
 externos, nem prova resistência a todos os escapes. O sistema de produção não
 possui essa fronteira integrada ou qualificada; não reabrir com base neste ensaio.
 
+O mesmo exercício oferece uma variante experimental `--identity`, executada com
+o mesmo comando acima e esse argumento adicional. Após entrar no subgrupo, um
+descendente passa por um user namespace com UID/GID subordinados e sem
+capacidades efetivas; outro descendente cria uma sessão própria. O controlador
+verifica que o UID efetivo no host difere do seu e que `CapEff` é zero; o
+descendente tenta recuperar UID 0 no namespace e migrar-se para o escopo pai.
+Em duas execuções locais, a recuperação de UID 0 não ocorreu, a migração foi
+negada, `populated` continuou ativo até a saída e o subgrupo próprio ficou vazio.
+O controlador permanece fechado por padrão; o escopo é removido ao final.
+
+Esse teste usa mapeamentos subordinados e ferramentas já disponíveis, sem
+alterar permissões do host. Ele cobre apenas uma identidade e uma tentativa de
+migração para o pai imediato. Não prova ausência de outros acessos ou escapes,
+integridade da hierarquia, proteção dos dados SQLite, criação de todos os
+escritores dentro do domínio, morte do controlador, recuperação após reinício,
+nem comportamento sob outras configurações. Não é sandbox qualificada nem
+autorização para integrar a fronteira ao gate de produção.
+
 Uma fixture de inventário investiga a janela entre lançar e registrar um
 escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
 subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de
