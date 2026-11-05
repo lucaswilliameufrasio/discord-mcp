@@ -40,9 +40,11 @@ middleware HTTP para verificá-los. O roteador isolado oferece descoberta do
 recurso e do servidor OAuth, autorização com consentimento e endpoint de troca
 de código com PKCE S256. A troca é atômica e exige o cliente, URI de retorno e
 recurso configurados. Atualmente há apenas um cliente pré-registrado na
-configuração; ainda faltam gestão de clientes, integração com o transporte MCP,
-validação com Discord real e preparação operacional. O roteador ainda não é
-exposto por um comando de servidor. Nenhum endpoint remoto de produção deve ser
+configuração; o transporte MCP HTTP sem sessões já está composto com esse
+roteador e verifica o token em cada requisição e as permissões em cada operação.
+Ainda faltam gestão de clientes, administração compartilhada de permissões,
+validação com Discord real e preparação operacional. O roteador integrado ainda
+não é exposto por um comando de servidor. Nenhum endpoint remoto de produção deve ser
 habilitado até que essas partes sejam implementadas e testadas.
 Cada operação deverá verificar o token em toda requisição e obter o usuário do
 contexto autenticado, nunca de argumentos fornecidos pelo cliente.

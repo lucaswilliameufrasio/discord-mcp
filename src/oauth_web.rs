@@ -611,7 +611,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("oauth.db");
         let key = [41; 32];
-        ChannelStore::open(&db, &key).unwrap();
+        let store = ChannelStore::open(&db, &key).unwrap();
+        store
+            .put_bot("permitted", "123", "synthetic-bot-token")
+            .unwrap();
+        store
+            .set_permissions("123", "permitted", true, false)
+            .unwrap();
+        drop(store);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let resource = format!("{origin}/mcp");
@@ -637,7 +644,7 @@ mod tests {
             discord,
         };
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(config).unwrap())
+            axum::serve(listener, crate::http_mcp::router(config).unwrap())
                 .await
                 .unwrap()
         });
@@ -890,6 +897,18 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("123")
+        );
+        let response: rmcp::serde_json::Value = client.post(&resource)
+            .bearer_auth(token)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .json(&rmcp::serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"read_messages", "arguments":{"channel":"permitted", "limit":0}}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("limit must be")
         );
         server.abort();
     }
