@@ -790,6 +790,66 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn continuity_known_writer_worker() {
+        let Some(dir) = std::env::var_os("CONTINUITY_WRITER_DIR") else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        let id: i64 = std::env::var("CONTINUITY_WRITER_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("writers.lock"))
+            .unwrap();
+        lock.lock_shared().unwrap();
+        let db = rusqlite::Connection::open(dir.join("source.db")).unwrap();
+        if id == 2 {
+            db.execute_batch("BEGIN IMMEDIATE; INSERT INTO records VALUES(2, 'first');")
+                .unwrap();
+        }
+        eprintln!("MARK holding");
+        let mut command = String::new();
+        std::io::stdin().read_line(&mut command).unwrap();
+        assert_eq!(command.trim(), "commit");
+        if id == 2 {
+            db.execute_batch("COMMIT").unwrap();
+        } else {
+            assert_eq!(id, 3);
+            db.execute("INSERT INTO records VALUES(3, 'second')", [])
+                .unwrap();
+        }
+        drop(db);
+        drop(lock);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn start_continuity_writer(dir: &Path, id: i64) -> tokio::process::Child {
+        use std::process::Stdio;
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("CONTINUITY_WRITER_DIR", dir)
+            .env("CONTINUITY_WRITER_ID", id.to_string())
+            .args([
+                "--exact",
+                "tests::continuity_known_writer_worker",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+        barrier_marker(&mut stderr, "holding").await;
+        child
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn continuity_authority_worker() {
         use std::{
             io::{BufRead, BufReader, Write},
@@ -1096,6 +1156,131 @@ mod tests {
                 .unwrap(),
             2
         );
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn authority_restart_drains_two_writers_before_incremental_capture() {
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+
+        let (dir, db) = barrier_fixture();
+        let repository = dir.path().join("repository");
+        let mut authority = start_continuity_authority(dir.path()).await;
+        let mut initial = authority_command(dir.path(), "CAPTURE").await;
+        assert_eq!(authority_line(&mut initial).await, "VERIFIED");
+        initial.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut initial).await, "CAPTURED");
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "OPENED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "ADMITTED"
+        );
+        let mut first = start_continuity_writer(dir.path(), 2).await;
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "ADMITTED"
+        );
+        let mut second = start_continuity_writer(dir.path(), 3).await;
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let mut restarted = start_continuity_authority(dir.path()).await;
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE").await).await,
+            "BUSY"
+        );
+        first
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"commit\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), first.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE").await).await,
+            "BUSY"
+        );
+        second
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"commit\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), second.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE").await).await,
+            "MISMATCH"
+        );
+        assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+        assert!(!ltx_path(&repository, 2, 2).exists());
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+
+        // Fixture-only evidence rebuilt from the same source: not independent
+        // proof of identity, completeness, or permission to reopen.
+        let witness = image_state(&db, &dir.path().join("two-writer-witness.db"));
+        fs::write(dir.path().join("witness.txt"), format!("{witness:?}")).unwrap();
+        let mut capture = authority_command(dir.path(), "CAPTURE").await;
+        assert_eq!(authority_line(&mut capture).await, "VERIFIED");
+        capture.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut capture).await, "CAPTURED");
+        assert_eq!(read_watermark(&repository).unwrap().txid, 3);
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        let restored = dir.path().join("two-writer-restore.db");
+        sqlite_replication_core::restore_to_target(
+            &repository,
+            &restored,
+            sqlite_replication_core::RestoreTarget::Txid(3),
+        )
+        .unwrap();
+        let recovered = rusqlite::Connection::open(restored).unwrap();
+        let read_rows = |connection: &rusqlite::Connection| {
+            connection
+                .prepare("SELECT id, value FROM records ORDER BY id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(read_rows(&db), read_rows(&recovered));
+        assert_eq!(read_rows(&recovered).len(), 3);
         restarted.kill().await.unwrap();
         timeout(Duration::from_secs(5), restarted.wait())
             .await

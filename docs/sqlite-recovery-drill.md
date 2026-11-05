@@ -506,6 +506,21 @@ supervisor. Também não há captura real, validação de continuidade ou garant
 de durabilidade após crash. O teste é condicional à disponibilidade de
 `pidfd_open` e não autoriza integração operacional.
 
+O exemplo de spool também exercita dois subprocessos escritores conhecidos após
+morte da autoridade. Um mantém transação SQLite aberta e o outro já mantém lock
+compartilhado antes de escrever. Após reinício fechado, a captura retorna `BUSY`
+até os dois processos terminarem; a evidência anterior é então recusada como
+`MISMATCH`, sem avançar o watermark TXID 1. O teste recria uma testemunha a
+partir da própria fonte sintética, captura os dois commits, verifica watermark
+TXID 3 e restaura as três linhas em outro banco, mantendo a admissão fechada.
+
+Essa testemunha recriada não é independente nem comprova que todos os escritores
+foram identificados: o próprio teste controla os dois subprocessos, e a admissão
+é consultada separadamente de sua criação. O gate interno da biblioteca é sem
+bloqueio no exercício e a barreira é consultiva. A dependência continua sendo o
+checkout irmão modificável, não uma revisão publicada e reproduzível. Não há
+prova de continuidade operacional, restauração de host ou permissão para reabrir.
+
 Uma ampliação acompanha múltiplos processos sintéticos por `pidfd`, incluindo
 um pai que inicia um descendente e termina enquanto o descendente permanece
 ativo. Após a morte do supervisor e o término dos processos inicialmente
