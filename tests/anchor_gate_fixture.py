@@ -134,6 +134,25 @@ def sqlite_writer(fd, database):
     os.close(fd)
 
 
+def admitted_sqlite_writer(fd, socket_fd, database):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    sock.sendall(b"W")
+    if sock.recv(1) != b"Y":
+        raise RuntimeError("admission denied")
+    print("ADMITTED", flush=True)
+    if sys.stdin.readline().strip() != "begin":
+        raise RuntimeError("expected begin")
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    connection.commit()
+    connection.close()
+    os.close(fd)
+    sock.close()
+
+
 def receive_descriptor(sock):
     data, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
     if not data:
@@ -184,6 +203,93 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_admitted_sqlite_writer_retains_barrier_after_authority_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            state = os.path.join(directory, "state")
+            database = os.path.join(directory, "synthetic.db")
+            with open(path, "wb"), open(state, "wb") as marker:
+                marker.write(b"uncertain\n")
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            anchor = os.open(path, os.O_RDWR)
+            processes = []
+            sockets = []
+
+            def cleanup():
+                for sock in sockets:
+                    sock.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                os.close(anchor)
+
+            self.addCleanup(cleanup)
+
+            def start_authority():
+                control, control_peer = socket.socketpair()
+                writer, writer_peer = socket.socketpair()
+                control.settimeout(5)
+                writer.settimeout(5)
+                barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, __file__, "transition", str(control_peer.fileno()),
+                         str(writer_peer.fileno()), str(barrier), state],
+                        pass_fds=(control_peer.fileno(), writer_peer.fileno(), barrier),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                finally:
+                    control_peer.close()
+                    writer_peer.close()
+                    os.close(barrier)
+                processes.append(process)
+                sockets.extend((control, writer))
+                return process, control, writer
+
+            def command(sock, value):
+                sock.sendall(value)
+                return sock.recv(1)
+
+            authority, control, writer_socket = start_authority()
+            self.assertEqual(command(control, b"D"), b"D")
+            self.assertEqual(command(control, b"P"), b"P")
+            self.assertEqual(command(control, b"O"), b"O")
+            writer_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            try:
+                writer = subprocess.Popen(
+                    [sys.executable, __file__, "admitted_sqlite_writer", str(writer_fd),
+                     str(writer_socket.fileno()), database],
+                    pass_fds=(writer_fd, writer_socket.fileno()), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+            finally:
+                os.close(writer_fd)
+                writer_socket.close()
+            processes.append(writer)
+            self.assertEqual(line(writer.stdout), "ADMITTED")
+            authority.kill()
+            authority.wait(timeout=5)
+            restarted, new_control, new_writer_socket = start_authority()
+            self.assertEqual(command(new_writer_socket, b"W"), b"N")
+            self.assertEqual(command(new_control, b"D"), b"B")
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+            # The old authority's death does not revoke the admitted client;
+            # its held lock is what prevents the new authority from draining.
+            writer.stdin.write("begin\n")
+            writer.stdin.flush()
+            self.assertEqual(writer.wait(timeout=5), 0)
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+            self.assertEqual(command(new_control, b"D"), b"D")
+            self.assertEqual(command(new_control, b"P"), b"P")
+            self.assertEqual(command(new_control, b"O"), b"O")
+            self.assertEqual(command(new_writer_socket, b"W"), b"Y")
+            new_control.close()
+            restarted.wait(timeout=5)
+
     def test_sqlite_writer_reconciles_before_transition_and_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
@@ -593,7 +699,9 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "sqlite_writer":
+    if len(sys.argv) == 5 and sys.argv[1] == "admitted_sqlite_writer":
+        admitted_sqlite_writer(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+    elif len(sys.argv) == 4 and sys.argv[1] == "sqlite_writer":
         sqlite_writer(int(sys.argv[2]), sys.argv[3])
     elif len(sys.argv) == 6 and sys.argv[1] == "transition":
         transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])

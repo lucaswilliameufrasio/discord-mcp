@@ -427,6 +427,21 @@ lista confiável de escritores por conta própria. Não foram testados morte do
 supervisor, escritores que ignorem o lock, corrupção/persistência real ou
 captura incremental. Esta combinação permanece insuficiente para integração.
 
+Outro cenário liga a solicitação de admissão ao próprio subprocesso escritor:
+ele obtém lock compartilhado no inode ancorado **antes** de enviar `W`, recebe
+admissão e espera antes do `BEGIN`. A autoridade é morta nessa janela. A nova
+autoridade começa fechada, nega outro pedido e recebe `B` ao tentar drenar. O
+escritor antigo então inicia e confirma uma transação SQLite, fecha o banco e
+libera o lock; somente depois a nova autoridade drena e reabre explicitamente.
+O teste verifica zero linhas antes e uma após o commit.
+
+O resultado mostra que perder a autoridade **não revoga** a admissão já dada:
+a segurança observada depende de o escritor manter o lock durante toda a
+transação. A autoridade da fixture não verifica que o solicitante realmente
+possui esse lock; um cliente não cooperativo poderia ignorar o protocolo. O
+supervisor de teste ainda retém a âncora, controla os processos e não simula
+captura ou perda de energia. Não é garantia para os escritores da aplicação.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
