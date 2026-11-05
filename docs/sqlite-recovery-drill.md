@@ -476,6 +476,20 @@ externos ou descendentes que continuem escrevendo. A fixture não impõe posse
 contínua nem prova que o processo acompanhado seja o único capaz de escrever;
 continua imprópria para integração operacional.
 
+Outra fixture abre duas descrições independentes do inode ancorado: uma é
+bloqueada em modo compartilhado por um subprocesso supervisor; a outra é
+transferida ao escritor SQLite. O escritor inicia uma transação e chama
+`LOCK_UN` em seu descritor. Enquanto o supervisor vive, um probe exclusivo em
+terceira descrição continua bloqueado. Quando o supervisor é morto, o probe
+adquire o lock exclusivo e o escritor confirma a transação ainda com o probe
+mantido. O teste confirma a linha no banco.
+
+Assim, uma descrição independente resiste ao `LOCK_UN` do escritor, mas sua
+liberação automática na morte do supervisor ainda pode criar falsa drenagem.
+Não há aqui monitoramento confiável do processo escritor, fencing, recuperação
+após morte do supervisor ou integração à admissão real; o probe representa
+somente um concorrente sintético, não uma captura executada pela aplicação.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;

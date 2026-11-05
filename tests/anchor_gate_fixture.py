@@ -20,6 +20,10 @@ def child(role, fd):
     elif role == "keeper":
         print("ANCHORED", flush=True)
         sys.stdin.readline()
+    elif role == "independent_guard":
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        print("GUARDED", flush=True)
+        sys.stdin.readline()
     elif role == "guard":
         print("OPEN" if os.read(fd, 64) == b"clean\n" else "CLOSED", flush=True)
     elif role == "restart":
@@ -261,6 +265,76 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_independent_supervisor_lock_is_lost_on_supervisor_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            database = os.path.join(directory, "synthetic.db")
+            with open(path, "wb"):
+                pass
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            anchor = os.open(path, os.O_RDWR)
+            sender, receiver = socket.socketpair()
+            processes = []
+            try:
+                guard_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    guard = subprocess.Popen(
+                        [sys.executable, __file__, "independent_guard", str(guard_fd)],
+                        pass_fds=(guard_fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(guard_fd)
+                processes.append(guard)
+                self.assertEqual(line(guard.stdout), "GUARDED")
+                writer_lock = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    authority = subprocess.Popen(
+                        [sys.executable, __file__, "grant_authority", str(sender.fileno()), str(writer_lock)],
+                        pass_fds=(sender.fileno(), writer_lock), stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(writer_lock)
+                processes.append(authority)
+                writer = subprocess.Popen(
+                    [sys.executable, __file__, "early_writer", str(receiver.fileno()), database, "unlock"],
+                    pass_fds=(receiver.fileno(),), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                processes.append(writer)
+                sender.close()
+                receiver.close()
+                self.assertEqual(line(authority.stdout), "ACK")
+                authority.kill()
+                authority.wait(timeout=5)
+                writer.stdin.write("start\n")
+                writer.stdin.flush()
+                self.assertEqual(line(writer.stdout), "RELEASED")
+                probe = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    guard.kill()
+                    guard.wait(timeout=5)
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    writer.stdin.write("commit\n")
+                    writer.stdin.flush()
+                    self.assertEqual(writer.wait(timeout=5), 0)
+                finally:
+                    os.close(probe)
+                with sqlite3.connect(database) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+            finally:
+                sender.close()
+                receiver.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                os.close(anchor)
+
     def test_early_release_and_supervisor_reference_limits(self):
         cases = ((False, "close", False), (True, "close", True), (True, "unlock", False))
         for retain, action, blocked in cases:
@@ -901,7 +975,7 @@ if __name__ == "__main__":
         transition_contender(int(sys.argv[2]))
     elif len(sys.argv) == 5 and sys.argv[1] == "publisher":
         publisher(int(sys.argv[2]), sys.argv[3], sys.argv[4])
-    elif len(sys.argv) == 3 and sys.argv[1] in ("writer", "authority", "keeper", "guard", "restart"):
+    elif len(sys.argv) == 3 and sys.argv[1] in ("writer", "authority", "keeper", "guard", "restart", "independent_guard"):
         child(sys.argv[1], int(sys.argv[2]))
     else:
         unittest.main(verbosity=2)
