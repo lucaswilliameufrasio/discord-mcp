@@ -507,6 +507,23 @@ uma corrida não protegida por este fixture. Não se deve autorizar captura real
 com base nesse experimento; é necessário um protocolo de evidência e coordenação
 que cubra essas fronteiras, inclusive crash, falhas de persistência e escritores.
 
+Um teste posterior reproduz essa corrida com uma segunda conexão SQLite e
+sincronização por canais: a evidência e a imagem candidata coincidem; somente
+depois da comparação aceita o escritor confirma uma nova linha; a captura é
+chamada em seguida com o gate sem bloqueio. Uma comparação atualizada detecta
+que a evidência ficou desatualizada, sem alterar snapshot ou watermark. Porém,
+um chamador que confie no resultado anterior ainda chama `capture_once`, que
+aceita e captura a nova linha. O restore TXID 2 contém ambas as linhas, assim
+como a fonte. O resultado demonstra uma janela TOCTOU, **não perda de dados**
+neste cenário. Evidência desatualizada também rejeita essa alteração legítima;
+o teste não decide se ela deve ser aceita na política operacional.
+
+O teste é limitado a uma alteração confirmada entre comparação e captura, sem
+substituição do arquivo, queda, prova de identidade ou processo real da
+aplicação. Para evitar a janela é necessário vincular verificação e captura a
+uma exclusão que cubra todos os escritores e a mesma identidade da origem; o
+fixture não oferece essa garantia e não deve ser integrado à aplicação.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

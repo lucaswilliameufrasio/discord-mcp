@@ -91,6 +91,22 @@ mod tests {
     use super::*;
     use std::io;
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn image_state(source: &rusqlite::Connection, path: &Path) -> (u32, u32, u64) {
+        use rusqlite::{
+            Connection,
+            backup::{Backup, StepResult},
+        };
+        let mut destination = Connection::open(path).unwrap();
+        {
+            let backup = Backup::new(source, &mut destination).unwrap();
+            assert_eq!(backup.step(-1).unwrap(), StepResult::Done);
+        }
+        drop(destination);
+        let state = DatabaseState::load(&mut File::open(path).unwrap(), 1).unwrap();
+        (state.page_size, state.commit, state.checksum)
+    }
+
     // Fixture is single-threaded: the test itself is the only writer and does
     // not write during capture. This is not an application write gate.
     struct IsolatedGate;
@@ -321,23 +337,9 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn independent_image_witness_blocks_stale_source_before_spool_mutation() {
-        use rusqlite::{
-            Connection,
-            backup::{Backup, StepResult},
-        };
+        use rusqlite::Connection;
         use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
         use sqlite_replication_wal::translate::translate_wal;
-
-        fn image_state(source: &Connection, path: &Path) -> (u32, u32, u64) {
-            let mut destination = Connection::open(path).unwrap();
-            {
-                let backup = Backup::new(source, &mut destination).unwrap();
-                assert_eq!(backup.step(-1).unwrap(), StepResult::Done);
-            }
-            drop(destination);
-            let state = DatabaseState::load(&mut File::open(path).unwrap(), 1).unwrap();
-            (state.page_size, state.commit, state.checksum)
-        }
 
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.db");
@@ -411,6 +413,80 @@ mod tests {
         let complete = image_state(&db, &dir.path().join("complete-image.db"));
         let result = guarded_capture(&source, Some(witness), complete).unwrap();
         assert_eq!(result.txid, 2);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn witness_check_can_become_stale_before_capture() {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
+        use std::{sync::mpsc, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let repository = dir.path().join("repository");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &repository).unwrap();
+        recover(&repository, &[]).unwrap();
+        let watermark_before = read_watermark(&repository).unwrap();
+        let snapshot_before = fs::read(ltx_path(&repository, 1, 1)).unwrap();
+        let witness = image_state(&db, &dir.path().join("witness.db"));
+        let verified = image_state(&db, &dir.path().join("verified.db"));
+        assert_eq!(verified, witness);
+        // Synchronize a real second connection to commit precisely after the
+        // witness was accepted, but before the later capture call.
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_path = source.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let writer_db = Connection::open(writer_path).unwrap();
+            writer_db
+                .execute("INSERT INTO records VALUES(2, 'after-check')", [])
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        start_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.join().unwrap();
+        let changed = image_state(&db, &dir.path().join("changed.db"));
+        assert_ne!(changed, witness);
+        // A fresh check would reject this legitimate change without touching
+        // the spool; the earlier successful check is now stale.
+        let current_check = if changed == witness {
+            Ok(())
+        } else {
+            Err("stale witness")
+        };
+        assert!(current_check.is_err());
+        assert_eq!(read_watermark(&repository).unwrap(), watermark_before);
+        assert_eq!(
+            fs::read(ltx_path(&repository, 1, 1)).unwrap(),
+            snapshot_before
+        );
+        assert!(!ltx_path(&repository, 2, 2).exists());
+        // Model a caller that trusts the previously successful comparison:
+        // no-op IsolatedGate cannot fence the write that already happened.
+        assert_eq!(verified, witness);
+        let result = capture_once(&source, &repository, &IsolatedGate).unwrap();
+        assert_eq!(result.txid, 2);
+        let restored = dir.path().join("restored.db");
+        restore_to_target(&repository, &restored, RestoreTarget::Txid(2)).unwrap();
+        let restored_db = Connection::open(restored).unwrap();
+        assert_eq!(
+            restored_db
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
