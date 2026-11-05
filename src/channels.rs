@@ -1307,4 +1307,54 @@ mod token_snapshot_tests {
             Err(super::StoreError::RecoveryPending)
         ));
     }
+
+    #[test]
+    fn authorized_channel_retains_earlier_snapshot_during_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.db");
+        let store = ChannelStore::open(&path, &[135; 32]).unwrap();
+        store.put_bot("alerts", "123", "synthetic-token").unwrap();
+        store.set_permissions("101", "alerts", false, true).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut barrier = Box::new(TraceBarrier {
+                entered: entered_tx,
+                resume: resume_rx,
+                prefix: b"SELECT nonce, ciphertext",
+            });
+            // SAFETY: this thread owns the connection and callback context;
+            // tracing is removed before either is dropped.
+            let handle = unsafe { store.db.handle() };
+            let registered = unsafe {
+                ffi::sqlite3_trace_v2(
+                    handle,
+                    ffi::SQLITE_TRACE_STMT,
+                    Some(pause_token_statement),
+                    (&mut *barrier as *mut TraceBarrier).cast(),
+                )
+            };
+            assert_eq!(registered, ffi::SQLITE_OK);
+            let result = store.authorized_channel("101", "alerts", super::ChannelAction::Send);
+            let removed = unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+            assert_eq!(removed, ffi::SQLITE_OK);
+            result
+        });
+        // The authorization transaction has already read its permission and
+        // established a snapshot before it reaches the channel lookup.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE; INSERT INTO recovery_control(id,quarantined) VALUES(1,1); DELETE FROM channel_permissions; DELETE FROM mcp_access_tokens; DELETE FROM mcp_authorization_codes; COMMIT;").unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(matches!(worker.join().unwrap(), Ok(super::Channel::Bot(_))));
+        let fresh = ChannelStore::open(&path, &[135; 32]).unwrap();
+        assert!(matches!(
+            fresh.authorized_channel("101", "alerts", super::ChannelAction::Send),
+            Err(super::StoreError::PermissionDenied)
+        ));
+        assert!(matches!(
+            fresh.get_channel("alerts"),
+            Err(super::StoreError::RecoveryPending)
+        ));
+    }
 }

@@ -193,6 +193,15 @@ com o estado anterior. O fluxo de preparação normal exige cópia privada: esse
 ensaio concorrente não demonstra publicação simultânea suportada nem revogação
 de operações já autorizadas, e não qualifica captura ou recuperação operacional.
 
+Um teste adicional de `authorized_channel` pausa a consulta do destino depois
+que a transação já leu a permissão. Outra conexão confirma, atomicamente, a
+quarentena e a remoção de permissões, tokens e códigos. A operação pausada ainda
+resolve o canal usando o snapshot anterior; uma nova autorização é recusada e
+uma nova leitura direta do canal retorna `RecoveryPending`. O teste não envia
+mensagens nem acessa Discord. Ele confirma o limite de operações em andamento,
+não uma garantia de revogação instantânea. A preparação de recuperação suportada
+continua restrita a uma cópia privada, não a uma transição em banco ativo.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin
