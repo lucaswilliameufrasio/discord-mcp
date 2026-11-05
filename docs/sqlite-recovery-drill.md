@@ -217,6 +217,33 @@ processo viu o byte fechado no mesmo sistema em execução; isso não prova que 
 fechamento sobreviva a queda de energia. O protocolo deve ser redesenhado e
 revalidado antes de qualquer integração, não tratado como solução fail-closed.
 
+#### Experimento alternativo: autoridade por processo
+
+`cargo test --test authority_gate_prototype` exercita outro desenho, apenas em
+subprocessos sintéticos. Um coordenador temporário em socket Unix começa sempre
+fechado, inclusive após reinício; o único marcador escrito no disco diz
+`closed`. A reabertura modifica somente memória depois de uma escrita e
+`sync_all` bem-sucedidos. Uma falha sintética após a escrita, mas antes do
+`sync_all`, mantém a autoridade fechada; falha equivalente no início impede a
+publicação do socket. Para a captura, a autoridade fecha a admissão, aguarda
+conexões de escritores admitidos terminarem e exige conclusão explícita antes de
+aceitar reabrir. O teste verifica falhas de fechamento e reabertura, reinício,
+drenagem e recusa durante a captura. A falha injetada não é uma falha real do
+filesystem e não qualifica perda de energia.
+
+Esse desenho evita, nos casos exercitados, publicar um **byte aberto** antes de
+saber que sua persistência teve sucesso, mas **ainda não é um gate seguro para
+produção**. A morte do coordenador fecha novas admissões após reinício, porém
+não revoga transações SQLite já admitidas: um teste demonstra que uma transação
+sintética pode confirmar após a morte e reinício do coordenador. A autoridade
+perde a contagem desses escritores; reabri-la sem reconciliação e uma barreira
+que abarque escritores anteriores pode violar a captura. O fixture também não
+implementa autenticação de pares, exclusão de coordenadores concorrentes,
+tratamento seguro de socket obsoleto, deadlines, persistência de diretório,
+defesa contra processos externos ou coordenação real dos módulos da aplicação.
+Não há garantia de crash/power-loss ou de segurança em filesystem de rede.
+Nenhuma autoridade ou comando deste teste é integrado à CLI ou ao servidor.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
