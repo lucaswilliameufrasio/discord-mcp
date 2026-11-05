@@ -326,6 +326,28 @@ liberar o lock sintético e então verifica a abertura. Não há retomada segura
 captura interrompida: o teste não valida recuperação de captura parcial nem
 autoriza reiniciar ou reabrir um sistema real nessas condições.
 
+#### Experimento de transferência de descritor — Linux
+
+`tests/fd_gate_fixture.py`, executado por `cargo test --test fd_gate_prototype`
+no Linux com Python 3 em `/usr/bin` ou `/bin`, pesquisa uma primitiva distinta:
+o remetente adquire `flock` exclusivo e transfere o descritor já bloqueado por
+`SCM_RIGHTS` em socket Unix a um subprocesso. O receptor valida que recebeu um
+descritor e o mantém aberto. Os testes verificam que o lock impede outra
+aquisição depois do fechamento da cópia do remetente e da desconexão do socket;
+que a morte do receptor libera o lock; que uma transferência a socket já
+desconectado falha e o lock permanece no remetente até ele fechar sua cópia; e
+que um lock compartilhado impede a aquisição exclusiva até ser liberado.
+
+Este é um teste da primitiva, não uma autoridade completa: não executa o gate
+anterior nem `capture_once`, não mata e reinicia uma autoridade real, não liga
+transferência à persistência do fechamento, nem garante recuperação após
+captura parcial. Um descritor prova que o receptor recebeu uma referência ao
+lock, mas pode ser duplicado, transferido ou fechado antes de terminar; não
+prova identidade, autorização, exclusividade lógica da captura ou conclusão
+durável. Descendentes que herdam descritores, perda de mensagem/ACK, troca de
+inodes e clientes não cooperativos permanecem fora da prova. Não usar essa
+primitiva como gate de produção sem protocolo e testes completos.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
