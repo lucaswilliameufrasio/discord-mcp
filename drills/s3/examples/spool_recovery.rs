@@ -319,6 +319,101 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn independent_image_witness_blocks_stale_source_before_spool_mutation() {
+        use rusqlite::{
+            Connection,
+            backup::{Backup, StepResult},
+        };
+        use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
+        use sqlite_replication_wal::translate::translate_wal;
+
+        fn image_state(source: &Connection, path: &Path) -> (u32, u32, u64) {
+            let mut destination = Connection::open(path).unwrap();
+            {
+                let backup = Backup::new(source, &mut destination).unwrap();
+                assert_eq!(backup.step(-1).unwrap(), StepResult::Done);
+            }
+            drop(destination);
+            let state = DatabaseState::load(&mut File::open(path).unwrap(), 1).unwrap();
+            (state.page_size, state.commit, state.checksum)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let stale = dir.path().join("stale.db");
+        let repository = dir.path().join("repository");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &repository).unwrap();
+        let base = recover(&repository, &[]).unwrap();
+        db.execute("INSERT INTO records VALUES(2, 'committed-in-wal')", [])
+            .unwrap();
+        let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        let (transactions, state) = translate_wal(&wal, &base, 200).unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert!(
+            publish_transactions(&repository, &transactions, &state, |point, _| {
+                if point == FaultPoint::AfterLtxPublish {
+                    return Err(io::Error::other("synthetic interruption"));
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        // The witness is obtained independently of spool recovery while the
+        // complete source and its committed WAL are still available.
+        let witness = image_state(&db, &dir.path().join("witness.db"));
+        fs::copy(&source, &stale).unwrap();
+        let candidate = Connection::open(&stale).unwrap();
+        let candidate_state = image_state(&candidate, &dir.path().join("candidate-image.db"));
+        drop(candidate);
+        let snapshot_path = ltx_path(&repository, 1, 1);
+        let delta_path = ltx_path(&repository, 2, 2);
+        let snapshot_before = fs::read(&snapshot_path).unwrap();
+        let delta_before = fs::read(&delta_path).unwrap();
+        let watermark_before = read_watermark(&repository).unwrap();
+        let gate = |expected: Option<(u32, u32, u64)>, actual| -> io::Result<()> {
+            match expected {
+                Some(value) if value == actual => Ok(()),
+                _ => Err(io::Error::other("missing or mismatched continuity witness")),
+            }
+        };
+        let guarded_capture = |path: &Path, expected, actual| {
+            gate(expected, actual)?;
+            capture_once(path, &repository, &IsolatedGate)
+        };
+        assert!(guarded_capture(&stale, None, candidate_state).is_err());
+        assert!(guarded_capture(&stale, Some(witness), candidate_state).is_err());
+        assert_eq!(fs::read(snapshot_path).unwrap(), snapshot_before);
+        assert_eq!(fs::read(delta_path).unwrap(), delta_before);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark_before);
+        assert!(!ltx_path(&repository, 3, 3).exists());
+        assert_eq!(fs::read(dir.path().join("source.db-wal")).unwrap(), wal);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+
+        let retained = dir.path().join("retained.db");
+        restore_to_target(&repository, &retained, RestoreTarget::Txid(2)).unwrap();
+        let restored = Connection::open(retained).unwrap();
+        assert_eq!(
+            restored
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        // Positive control: no writers run between evidence and capture.
+        let complete = image_state(&db, &dir.path().join("complete-image.db"));
+        let result = guarded_capture(&source, Some(witness), complete).unwrap();
+        assert_eq!(result.txid, 2);
+    }
+
+    #[test]
     fn real_sqlite_wal_reconciles_published_delta_and_restores_rows() {
         use rusqlite::Connection;
         use sqlite_replication_core::{RestoreTarget, restore_to_target, snapshot};

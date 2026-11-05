@@ -482,6 +482,31 @@ O exercício é uma simulação deliberada com arquivos próprios, não uma perd
 real, nem prova de comportamento sob falha física, execução concorrente ou em
 outras revisões da biblioteca. O gate continua sendo um fixture sem bloqueio.
 
+#### Evidência independente experimental de continuidade
+
+Um teste separado obtém, antes de simular a perda, uma imagem consistente da
+fonte sintética usando SQLite Backup API e registra em memória sua tupla de
+page size, tamanho em páginas e checksum calculado pela biblioteca LTX. Essa
+evidência é obtida da fonte completa, independentemente da reconciliação do
+spool; não é um registro operacional independente do host. O teste compara a
+imagem consistente de uma cópia candidata contra a tupla antes de chamar
+`capture_once`. Evidência ausente ou divergente recusa a chamada; snapshot,
+delta TXID 2 e watermark são comparados com seus bytes/valores anteriores, TXID
+3 não aparece e o restore TXID 2 ainda contém as duas linhas. A fonte e os
+bytes do seu WAL permanecem intactos. Como controle positivo, a fonte completa
+corresponde à evidência e é aceita para captura no mesmo teste, sem escritores
+entre a verificação e a chamada.
+
+Essa é uma barreira **somente do teste**, não uma funcionalidade ou garantia da
+biblioteca nem da aplicação. A tupla LTX não é uma assinatura criptográfica;
+o teste não comprova resistência a colisões ou manipulação. Evidência velha
+pode rejeitar mudanças legítimas ou não incluir commits posteriores, e não há
+garantia de frescor, identidade da base, publicação independente durável ou
+custódia fora do host. Uma alteração entre a cópia de verificação e a captura é
+uma corrida não protegida por este fixture. Não se deve autorizar captura real
+com base nesse experimento; é necessário um protocolo de evidência e coordenação
+que cubra essas fronteiras, inclusive crash, falhas de persistência e escritores.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
