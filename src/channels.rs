@@ -14,6 +14,13 @@ pub enum Channel {
     Bot(BotChannel),
 }
 
+/// An authenticated Discord identity may be authorized independently for each action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelAction {
+    Read,
+    Send,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     InvalidInput,
@@ -65,6 +72,8 @@ impl ChannelStore {
         let db = Connection::open(path).map_err(|_| StoreError::Storage)?;
         db.busy_timeout(Duration::from_secs(5))
             .map_err(|_| StoreError::Storage)?;
+        db.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|_| StoreError::Storage)?;
         db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channels (name TEXT PRIMARY KEY NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL); CREATE TABLE IF NOT EXISTS key_check (id INTEGER PRIMARY KEY CHECK(id=1), nonce BLOB NOT NULL, ciphertext BLOB NOT NULL);")
             .map_err(|_| StoreError::Storage)?;
         let store = Self {
@@ -103,6 +112,18 @@ impl ChannelStore {
         if plaintext != b"discord-mcp-key-check" {
             return Err(StoreError::Decryption);
         }
+        store
+            .db
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS channel_permissions (
+            user_id TEXT NOT NULL,
+            channel_name TEXT NOT NULL REFERENCES channels(name) ON DELETE CASCADE,
+            can_read INTEGER NOT NULL CHECK(can_read IN (0, 1)),
+            can_send INTEGER NOT NULL CHECK(can_send IN (0, 1)),
+            PRIMARY KEY (user_id, channel_name)
+        );",
+            )
+            .map_err(|_| StoreError::Storage)?;
         Ok(store)
     }
 
@@ -137,7 +158,20 @@ impl ChannelStore {
                 },
             )
             .map_err(|_| StoreError::Storage)?;
-        self.db.execute("INSERT INTO channels(name, nonce, ciphertext) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext", params![name, nonce.as_slice(), encrypted]).map_err(|_| StoreError::Storage)?;
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        // A name can be repointed to a different Discord resource. Never carry
+        // old grants over to a newly configured destination.
+        transaction
+            .execute(
+                "DELETE FROM channel_permissions WHERE channel_name=?1",
+                [name],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        transaction.execute("INSERT INTO channels(name, nonce, ciphertext) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext", params![name, nonce.as_slice(), encrypted]).map_err(|_| StoreError::Storage)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
         Ok(())
     }
 
@@ -206,4 +240,73 @@ impl ChannelStore {
         }
         Ok(())
     }
+
+    /// This persists policy only; the caller must authenticate and authorize the administrator.
+    pub fn set_permissions(
+        &self,
+        user_id: &str,
+        channel: &str,
+        can_read: bool,
+        can_send: bool,
+    ) -> Result<(), StoreError> {
+        if !valid_user_id(user_id) {
+            return Err(StoreError::InvalidInput);
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        if can_read && matches!(self.get_channel(channel)?, Channel::Webhook(_)) {
+            return Err(StoreError::InvalidInput);
+        }
+        if !can_read && !can_send {
+            transaction
+                .execute(
+                    "DELETE FROM channel_permissions WHERE user_id=?1 AND channel_name=?2",
+                    params![user_id, channel],
+                )
+                .map_err(|_| StoreError::Storage)?;
+            return transaction.commit().map_err(|_| StoreError::Storage);
+        }
+        let changed = transaction.execute(
+            "INSERT INTO channel_permissions (user_id, channel_name, can_read, can_send)
+             SELECT ?1, name, ?3, ?4 FROM channels WHERE name=?2
+             ON CONFLICT(user_id, channel_name) DO UPDATE SET can_read=excluded.can_read, can_send=excluded.can_send",
+            params![user_id, channel, can_read, can_send],
+        ).map_err(|_| StoreError::Storage)?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    /// Call on every operation using a user ID established by the authentication layer.
+    pub fn is_permitted(
+        &self,
+        user_id: &str,
+        channel: &str,
+        action: ChannelAction,
+    ) -> Result<bool, StoreError> {
+        if !valid_user_id(user_id) {
+            return Ok(false);
+        }
+        let permission: Option<(bool, bool)> = self.db.query_row(
+            "SELECT can_read, can_send FROM channel_permissions WHERE user_id=?1 AND channel_name=?2",
+            params![user_id, channel], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|_| StoreError::Storage)?;
+        let granted = match (permission, action) {
+            (Some((read, _)), ChannelAction::Read) => read,
+            (Some((_, send)), ChannelAction::Send) => send,
+            (None, _) => false,
+        };
+        if granted && action == ChannelAction::Read {
+            return Ok(matches!(self.get_channel(channel)?, Channel::Bot(_)));
+        }
+        Ok(granted)
+    }
+}
+
+fn valid_user_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
 }

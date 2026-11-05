@@ -48,6 +48,12 @@ acesso limitado ao contexto e às permissões de cada pessoa:
 * **Usuários e permissões:** no modo compartilhado, administração de acesso por
   usuário, canal e operação. Leitura e envio são permissões independentes,
   negadas por padrão. Não confundir permissões locais com as do Discord.
+  A persistência de permissões está implementada, mas ainda não está ligada a
+  autenticação nem a um servidor compartilhado. Substituir a configuração de um
+  canal revoga seus acessos existentes atomicamente, evitando que uma permissão
+  antiga passe a valer para outro destino; excluir o canal também revoga acessos.
+  O futuro servidor deve verificar o usuário autenticado e a capacidade do canal
+  em toda operação, sem confiar em um ID fornecido como argumento MCP.
 
 O dashboard é uma síntese, não um substituto dos módulos especializados. As
 agregações devem respeitar a autorização do usuário e não inventar números;
