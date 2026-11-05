@@ -14,6 +14,11 @@ def child(role, fd):
         print("HOLDING", flush=True)
         if sys.stdin.readline().strip() != "release":
             raise RuntimeError("expected release")
+    elif role == "keeper":
+        print("ANCHORED", flush=True)
+        sys.stdin.readline()
+    elif role == "guard":
+        print("OPEN" if os.read(fd, 64) == b"clean\n" else "CLOSED", flush=True)
     else:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -35,6 +40,81 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_anchor_death_keeps_restart_closed_with_old_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            marker = os.path.join(directory, "state")
+            with open(path, "wb"):
+                pass
+            with open(marker, "wb") as state:
+                state.write(b"clean\n")
+                state.flush()
+                os.fsync(state.fileno())
+            children = []
+
+            def cleanup():
+                for process in children:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+
+            self.addCleanup(cleanup)
+
+            def spawn(role, fd):
+                process = subprocess.Popen(
+                    [sys.executable, __file__, role, str(fd)],
+                    pass_fds=(fd,), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                children.append(process)
+                return process
+
+            def guarded_restart():
+                fd = os.open(marker, os.O_RDONLY)
+                try:
+                    process = spawn("guard", fd)
+                finally:
+                    os.close(fd)
+                result = line(process.stdout)
+                self.assertEqual(process.wait(timeout=5), 0)
+                return result
+
+            self.assertEqual(guarded_restart(), "OPEN")
+            # The fixture assumes this state is durably written before any
+            # descriptor is distributed. There is no clean transition here.
+            with open(marker, "wb") as state:
+                state.write(b"uncertain\n")
+                state.flush()
+                os.fsync(state.fileno())
+            anchor = os.open(path, os.O_RDWR)
+            keeper = spawn("keeper", anchor)
+            self.assertEqual(line(keeper.stdout), "ANCHORED")
+            writer_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            writer = spawn("writer", writer_fd)
+            os.close(writer_fd)
+            self.assertEqual(line(writer.stdout), "HOLDING")
+            os.close(anchor)
+            replacement = os.path.join(directory, "replacement")
+            with open(replacement, "wb"):
+                pass
+            os.replace(replacement, path)
+            keeper.kill()
+            keeper.wait(timeout=5)
+            self.assertIsNone(writer.poll())
+            # Locking the replacement is possible but must not clear the state.
+            replacement_fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(replacement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(guarded_restart(), "CLOSED")
+            finally:
+                os.close(replacement_fd)
+            writer.stdin.write("release\n")
+            writer.stdin.flush()
+            self.assertEqual(writer.wait(timeout=5), 0)
+            self.assertEqual(guarded_restart(), "CLOSED")
+            with open(marker, "rb") as state:
+                self.assertEqual(state.read(), b"uncertain\n")
+
     def test_anchor_keeps_all_participants_on_original_inode(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
@@ -99,7 +179,7 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] in ("writer", "authority"):
+    if len(sys.argv) == 3 and sys.argv[1] in ("writer", "authority", "keeper", "guard"):
         child(sys.argv[1], int(sys.argv[2]))
     else:
         unittest.main(verbosity=2)

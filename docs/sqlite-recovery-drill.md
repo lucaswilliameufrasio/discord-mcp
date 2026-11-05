@@ -344,6 +344,21 @@ e não há recuperação confiável demonstrada para esse caso. Não foram testa
 perda de energia, filesystem remoto ou disponibilidade de `/proc`. Não usar
 esse experimento como gate de produção.
 
+Um segundo cenário da fixture inicia um guardião da âncora e um escritor em
+subprocessos, registra `uncertain` com `fsync` antes de distribuir descritores,
+substitui o caminho e mata o guardião enquanto o escritor anterior mantém seu
+lock. Uma autoridade sintética reiniciada recusa abrir mesmo quando consegue
+obter lock exclusivo no arquivo substituto. Ela também recusa após o escritor
+terminar, pois o marcador permanece incerto; não há transição automática para
+limpo nem procedimento de reconciliação implementado. O teste inclui controle
+inicial `clean`, mas esse marcador sozinho não comprova segurança de abertura.
+
+O teste pressupõe gravação bem-sucedida e integridade do marcador antes de
+qualquer distribuição: não cobre falha antes/durante `fsync`, persistência do
+diretório, rollback do armazenamento, adulteração do marcador, concorrência de
+autoridades ou perda de energia. O escritor mantém somente um lock sintético,
+não uma transação SQLite; a fixture testa recusa, não recuperação operacional.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
