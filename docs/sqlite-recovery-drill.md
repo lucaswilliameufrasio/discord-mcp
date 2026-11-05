@@ -348,6 +348,26 @@ durável. Descendentes que herdam descritores, perda de mensagem/ACK, troca de
 inodes e clientes não cooperativos permanecem fora da prova. Não usar essa
 primitiva como gate de produção sem protocolo e testes completos.
 
+O fixture Linux também contém uma autoridade sintética de cliente único em
+subprocesso: ela inicia fechada, sincroniza marcador fechado, tenta drenar um
+lock de atividade e transfere um descritor de lock de captura por `SCM_RIGHTS`.
+No teste de reinício, a autoridade é morta depois da confirmação da entrega;
+outra autoridade inicia fechada e recusa abrir enquanto o cliente mantém o
+descritor. No teste de ACK perdido, a primeira tentativa de drenagem encontra
+um escritor sintético; após liberar seu lock, a transferência ocorre, o
+cliente fecha a conexão sem ACK mas mantém o descritor, e a autoridade seguinte
+recusa abertura até que ele seja fechado. Esses testes usam socketpair privado
+e dados sintéticos; o cliente de captura é o próprio processo do teste.
+
+A demonstração não resolve a segurança operacional: a autoridade é uma máquina
+de estados mínima, com um único cliente, e não coordena conexões ou escritores
+da aplicação. A abertura não reconcilia escritores antigos; o lock transferido
+pode ser fechado ou repassado indevidamente; não há autenticação, garantia de
+captura concluída, persistência de diretório, recuperação de publicação parcial
+ou acesso real à biblioteca de captura. A posse do descritor é uma capacidade,
+não prova de identidade nem de que o trabalho terminou. Esses resultados não
+qualificam reinício de host, perda de energia ou implantação.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
