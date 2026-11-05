@@ -309,6 +309,23 @@ nem estabelece identidade confiável após reinício, proteção de diretório,
 persistência, ou segurança contra filesystem hostil. O subprocesso é somente
 uma experiência da primitiva, não uma implementação do protocolo de autoridade.
 
+`tests/barrier_identity_prototype.rs` pesquisa outra barreira sintética: um
+registro prévio de dispositivo/inode é comparado ao descritor e ao caminho,
+antes e depois de adquirir o lock. Em subprocessos, a troca antes do reinício
+foi recusada; após restaurar o inode original preservado por hard link, um
+escritor com lock compartilhado bloqueou a aquisição até sua liberação. Uma
+troca forçada entre verificação e aquisição também foi recusada na segunda
+verificação. A recuperação usa apenas o arquivo original da fixture, não
+estabelece procedimento operacional.
+
+O teste também demonstra uma corrida **após** a última verificação: a autoridade
+mantém o lock original, mas outro processo pode abrir e bloquear o inode recém-
+substituído. Portanto essas comparações não fecham o TOCTOU e não autorizam
+reabrir admissão. O registro é confiável apenas por hipótese; não foram
+qualificados proteção/autenticação do registro e diretório, criação e sync do
+diretório, reutilização de inode, symlinks concorrentes, crash de inicialização,
+nem comportamento em outros filesystems. Não integrar esta fixture ao produto.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
