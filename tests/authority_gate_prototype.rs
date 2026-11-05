@@ -228,6 +228,9 @@ fn cooperative_writer_worker() {
     assert_eq!(response.trim(), "ADMITTED");
     let db = rusqlite::Connection::open(dir.join("writer.db")).unwrap();
     db.execute_batch("CREATE TABLE IF NOT EXISTS writes(value INTEGER); BEGIN IMMEDIATE; INSERT INTO writes VALUES (1);").unwrap();
+    if std::env::var_os("WRITER_DISCONNECT").is_some() {
+        socket.shutdown(std::net::Shutdown::Both).unwrap();
+    }
     eprintln!("MARK transaction");
     let mut command = String::new();
     std::io::stdin().read_line(&mut command).unwrap();
@@ -421,9 +424,16 @@ async fn failed_owned_drain_rejects_retry_from_another_connection() {
 }
 
 async fn start_writer(dir: &Path) -> Child {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .env_clear()
-        .env("WRITER_FIXTURE_DIR", dir)
+    start_writer_with_disconnect(dir, false).await
+}
+
+async fn start_writer_with_disconnect(dir: &Path, disconnect: bool) -> Child {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.env_clear().env("WRITER_FIXTURE_DIR", dir);
+    if disconnect {
+        command.env("WRITER_DISCONNECT", "1");
+    }
+    let mut child = command
         .args(["--exact", "cooperative_writer_worker", "--nocapture"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -439,6 +449,44 @@ async fn start_writer(dir: &Path) -> Child {
         .unwrap();
     assert_eq!(marker.trim(), "MARK transaction");
     child
+}
+
+#[tokio::test]
+async fn disconnected_cooperative_writer_blocks_drain_until_commit() {
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut writer = start_writer_with_disconnect(fixture.dir.path(), true).await;
+    let mut capture = fixture.connect("CLOSE").await;
+    assert_eq!(line(&mut capture).await, "CLOSED");
+    assert_eq!(line(&mut capture).await, "BARRIER_BUSY");
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "BARRIER_BUSY");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    let db = rusqlite::Connection::open(fixture.dir.path().join("writer.db")).unwrap();
+    let count = || {
+        db.query_row("SELECT COUNT(*) FROM writes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count(), 0);
+    writer
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"commit\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), writer.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(count(), 1);
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "DRAINED");
+    assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
 }
 
 #[tokio::test]

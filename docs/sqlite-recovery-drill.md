@@ -278,6 +278,15 @@ de arquivos remotos ou perda de energia. Um escritor que obtém o lock antes de
 ser admitido pode bloquear temporariamente a reabertura. Não há integração com
 captura real, autenticação, deadlines nem política de recuperação de processos.
 
+Em outro teste, um subprocesso escritor cooperativo fecha seu socket após ser
+admitido, mas mantém o lock compartilhado e uma transação SQLite pendente. A
+autoridade fecha a admissão e responde `BARRIER_BUSY` tanto na drenagem inicial
+como na tentativa seguinte; outra escrita é recusada e a linha ainda não está
+confirmada. Após o commit, encerramento do banco e liberação do lock pelo
+subprocesso, a linha aparece e uma nova tentativa retorna `DRAINED`. A conclusão
+e a reabertura continuam explícitas. Isso cobre somente esse protocolo sintético
+e não comprova cooperação de todos os escritores do aplicativo.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
