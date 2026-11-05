@@ -27,6 +27,14 @@ restaurado tem limite de cinco segundos. Ele não carrega configuração de
 produção nem faz requisições ao Discord: as ferramentas são invocadas com
 entradas inválidas para verificar o carregamento sem efeitos externos.
 
+Execução em 2026-11-05: os dois comandos acima concluíram com sucesso; o teste
+`snapshot_and_restore_isolated_synthetic_wal_database` passou (1 teste, 0,34 s).
+O checkout irmão estava em `f5c0984f069407913365136a10d5962f9a33930d` com
+alterações não commitadas, inclusive em código Rust da biblioteca; portanto,
+esse resultado não identifica uma árvore reproduzível nem qualifica uma versão
+publicada. A duração é apenas do teste, não um RTO. O exercício confirma somente
+o cenário local sintético descrito, não perda de host ou recuperação operacional.
+
 ### Exercício opt-in S3 simulado
 
 `bash drills/s3/run.sh` compila um programa isolado contra os checkouts locais
