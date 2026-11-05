@@ -127,6 +127,10 @@ auditoria completa ou imutável.
 Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
 segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;
 isso não garante entrega de mensagens ou recuperação após interrupção forçada.
+O teste local `cargo test --test drain` envia `SIGTERM` enquanto uma requisição
+MCP está sendo recebida e verifica a conclusão, o fechamento do listener e o
+prazo para uma requisição bloqueada. Ele não testa uma chamada real ao Discord,
+streams longos ou efeitos externos iniciados antes do encerramento.
 
 ### Canais com bot
 

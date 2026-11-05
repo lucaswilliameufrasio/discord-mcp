@@ -53,6 +53,12 @@ habilitado até que essas partes sejam implementadas e testadas.
 Cada operação deverá verificar o token em toda requisição e obter o usuário do
 contexto autenticado, nunca de argumentos fornecidos pelo cliente.
 
+No encerramento, o listener para de aceitar conexões e o servidor aguarda até
+15 segundos pelas requisições em andamento. Um teste de processo em loopback
+cobre `SIGTERM` durante o recebimento do corpo, tanto conclusão quanto expiração
+do prazo. Não comprova a conclusão de chamadas reais ao Discord nem durabilidade
+de trabalho interrompido.
+
 ## Interface web
 
 As interfaces local e compartilhada oferecem navegação por finalidade, com

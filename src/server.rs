@@ -102,6 +102,7 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         signal = shutdown_signal() => {
             if signal.is_err() { task.abort(); return Err("unable to install shutdown signal handler".into()); }
             let _ = stop.send(());
+            eprintln!("MCP HTTP draining in-flight requests (15 second limit)");
             match tokio::time::timeout(Duration::from_secs(15), &mut task).await {
                 Ok(result) => { result??; }
                 Err(_) => { task.abort(); return Err("shutdown timed out; in-flight requests may be incomplete".into()); }
