@@ -683,6 +683,30 @@ do launcher pode contorná-lo. O observador não identifica automaticamente esse
 escritor; permanece fechado por política fixa. Não foram alteradas permissões do
 host ou da aplicação, e o experimento não estabelece contenção operacional.
 
+#### Exercício opt-in de acesso mediado ao SQLite
+
+`tests/access_boundary_fixture.py` pesquisa um corretor SQLite em subprocesso
+separado. Dentro de um escopo transitório próprio, ele cria um banco sintético
+em diretório temporário privado (`0700`) e um cliente de UID subordinado sem
+capacidades efetivas. O cliente falha ao abrir o arquivo diretamente tanto via
+`open` quanto via SQLite, mas pede uma escrita ao corretor por socket local. O
+primeiro pedido confirma uma linha; no segundo, o corretor é morto com transação
+aberta. O cliente observa o fechamento do socket e continua sem acesso direto;
+uma conexão independente verifica que a segunda linha não foi persistida e que
+`integrity_check` retorna `ok`. A decisão sintética de recuperação permanece
+fechada. Execute somente no escopo isolado:
+
+```sh
+systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/access_boundary_fixture.py"
+```
+
+O diretório e o banco são exclusivos do exercício e removidos após os processos
+terminarem; nenhum dado ou permissão real é alterado. O teste não autentica o
+socket nem cobre pedidos duplicados, processos com o mesmo UID do corretor,
+descritores vazados, autorização de canais, captura incremental, perda de host
+ou recuperação operacional. O corretor é apenas uma fixture: não foi integrado
+ao aplicativo nem demonstra que todos os escritores reais passem por ele.
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela
