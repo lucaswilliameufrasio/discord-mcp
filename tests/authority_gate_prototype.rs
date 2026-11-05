@@ -308,6 +308,48 @@ async fn retry_after_failed_close_requires_successful_persistence() {
 }
 
 #[tokio::test]
+async fn unrelated_connection_can_finish_another_clients_capture() {
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut capture = fixture.connect("CLOSE").await;
+    assert_eq!(line(&mut capture).await, "CLOSED");
+    assert_eq!(line(&mut capture).await, "DRAINED");
+    // The first client has not declared completion. A separate connection can
+    // nevertheless release its barrier and reopen admission in this fixture.
+    assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut writer = fixture.connect("WRITE").await;
+    assert_eq!(line(&mut writer).await, "ADMITTED");
+    writer.get_mut().write_all(b"DONE\n").await.unwrap();
+}
+
+#[tokio::test]
+async fn restarted_authority_can_reopen_while_old_capture_client_is_alive() {
+    let mut fixture = Fixture::start().await;
+    let db_path = fixture.dir.path().join("capture.db");
+    let capture_db = rusqlite::Connection::open(&db_path).unwrap();
+    capture_db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE writes(value INTEGER); BEGIN; SELECT * FROM writes;").unwrap();
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut capture = fixture.connect("CLOSE").await;
+    assert_eq!(line(&mut capture).await, "CLOSED");
+    assert_eq!(line(&mut capture).await, "DRAINED");
+    // Model a capture client still holding a SQLite snapshot while its
+    // coordinator dies. The old socket and transaction stay alive locally.
+    fixture.restart().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut writer = fixture.connect("WRITE").await;
+    assert_eq!(line(&mut writer).await, "ADMITTED");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute("INSERT INTO writes VALUES (1)", []).unwrap();
+    let old_count: i64 = capture_db
+        .query_row("SELECT COUNT(*) FROM writes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(old_count, 0);
+    writer.get_mut().write_all(b"DONE\n").await.unwrap();
+    capture_db.execute_batch("ROLLBACK").unwrap();
+}
+
+#[tokio::test]
 async fn failed_close_retry_and_restart_preserve_barrier_for_active_writer() {
     let mut fixture = Fixture::start().await;
     assert_eq!(fixture.command("OPEN").await, "OPENED");

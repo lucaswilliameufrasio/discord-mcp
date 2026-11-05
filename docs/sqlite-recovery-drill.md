@@ -273,6 +273,26 @@ autoridade; a barreira permanece ocupada até o commit do escritor anterior.
 Essas falhas são sintéticas ou de arquivo ausente, não prova de durabilidade
 em caso de perda de energia. O protocolo continua inadequado para produção.
 
+#### Propriedade e sobrevivência da captura
+
+Dois testes adicionais reproduzem falhas deliberadamente no fixture de
+autoridade. Primeiro, após uma conexão receber `DRAINED`, uma segunda conexão
+envia `FINISH` e `OPEN` e consegue admitir um escritor, embora a primeira não
+tenha terminado sua captura. Não há vínculo de propriedade ou autenticação do
+comando de encerramento. Segundo, uma transação de leitura SQLite sintética
+permanece ativa enquanto a autoridade morre e reinicia: a nova autoridade
+abre a admissão e uma conexão escreve, enquanto a transação anterior ainda vê
+seu snapshot antigo. A leitura e o socket anteriores permanecem no processo
+do teste; isso modela uma captura sobrevivente, não executa `capture_once` nem
+prova seu comportamento específico. A barreira exclusiva estava em posse da
+autoridade antiga e foi liberada com sua morte, não pelo cliente da captura.
+
+Esses testes passam por registrar o comportamento inseguro, não porque as
+garantias estejam satisfeitas. Uma solução precisa vincular a conclusão ao
+detentor autorizado e tratar de forma segura uma captura que sobreviva à morte
+da autoridade, inclusive quando conexão e processo divergem. Sem solução e
+testes adicionais, não integrar este fixture aos escritores da aplicação.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
