@@ -326,6 +326,24 @@ qualificados proteção/autenticação do registro e diretório, criação e syn
 diretório, reutilização de inode, symlinks concorrentes, crash de inicialização,
 nem comportamento em outros filesystems. Não integrar esta fixture ao produto.
 
+`tests/anchor_gate_fixture.py` experimenta outra alternativa, apenas em Linux:
+um processo de teste mantém um descritor-âncora aberto e cria descrições de
+arquivo independentes via `/proc/self/fd`, entregues a subprocessos escritores
+e autoridades. Após substituir o caminho, um segundo escritor e autoridades
+reiniciadas ainda usam o inode ancorado; o lock exclusivo permanece ocupado até
+os dois escritores liberarem seus locks, quando a aquisição passa. O teste força
+a troca antes de iniciar o segundo escritor e as autoridades; não simula todas
+as interleavings nem uma operação real de captura.
+
+Essa é uma propriedade da fixture enquanto a âncora está viva e todos os
+participantes usam somente seus descritores. Não há supervisor operacional,
+autenticação, transmissão segura entre processos independentes, isolamento do
+diretório, ou coordenação dos escritores reais. A morte da âncora e de todos os
+detentores perde essa referência; reiniciar por caminho substituído é inseguro,
+e não há recuperação confiável demonstrada para esse caso. Não foram testadas
+perda de energia, filesystem remoto ou disponibilidade de `/proc`. Não usar
+esse experimento como gate de produção.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
