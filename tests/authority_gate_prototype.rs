@@ -107,7 +107,9 @@ fn serve_client(
         }
         "RETRY_DRAIN" => {
             let mut state = mutex.lock().unwrap();
-            if !state.capturing || state.drained {
+            if state.owned_capture {
+                writeln!(socket, "NOT_OWNER")?;
+            } else if !state.capturing || state.drained {
                 writeln!(socket, "NOT_DRAINED")?;
             } else if persist_closed(&marker, false).is_err() {
                 writeln!(socket, "PERSIST_FAILED")?;
@@ -373,6 +375,48 @@ async fn owner_death_leaves_live_authority_closed_until_restart() {
     assert_eq!(fixture.command("WRITE").await, "DENIED");
     assert_eq!(fixture.command("OPEN").await, "NOT_DRAINED");
     fixture.restart().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+}
+
+#[tokio::test]
+async fn owned_capture_can_be_requested_without_owning_capture_lock() {
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut client = fixture.connect("CLOSE_OWNED").await;
+    assert_eq!(line(&mut client).await, "CLOSED");
+    assert_eq!(line(&mut client).await, "DRAINED");
+    // The test client never acquired capture.lock: DRAINED is not proof of ownership.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.dir.path().join("capture.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    drop(lock);
+    client.get_mut().write_all(b"FINISH\n").await.unwrap();
+    assert_eq!(line(&mut client).await, "FINISHED_CLOSED");
+}
+
+#[tokio::test]
+async fn failed_owned_drain_rejects_retry_from_another_connection() {
+    let mut fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let barrier = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.dir.path().join("activity.lock"))
+        .unwrap();
+    barrier.lock_shared().unwrap();
+    let mut client = fixture.connect("CLOSE_OWNED").await;
+    assert_eq!(line(&mut client).await, "CLOSED");
+    assert_eq!(line(&mut client).await, "BARRIER_BUSY");
+    drop(barrier);
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "NOT_OWNER");
+    assert_eq!(fixture.command("FINISH").await, "NOT_OWNER");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    assert_eq!(fixture.command("OPEN").await, "NOT_DRAINED");
+    fixture.restart().await;
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
     assert_eq!(fixture.command("OPEN").await, "OPENED");
 }
 

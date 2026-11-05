@@ -315,6 +315,17 @@ transferência segura de propriedade; conexão encerrada e estado fechado podem
 exigir intervenção. Não integrar à aplicação antes de definir e verificar esses
 casos e a coordenação de todos os escritores.
 
+Testes adicionais demonstraram que `CLOSE_OWNED` aceita um cliente que nunca
+obteve `capture.lock`: outra conexão de arquivo consegue adquirir o lock após
+`DRAINED`. Portanto, mesmo observar um lock ocupado não identificaria quem o
+detém, e o fixture ainda não verifica propriedade. Também foi reproduzido que
+outra conexão podia obter `DRAINED` via `RETRY_DRAIN` após uma tentativa de
+captura com barreira ocupada. O fixture agora responde `NOT_OWNER` a essa
+tentativa e permanece fechado; o teste reinicia a autoridade somente depois de
+liberar o lock sintético e então verifica a abertura. Não há retomada segura da
+captura interrompida: o teste não valida recuperação de captura parcial nem
+autoriza reiniciar ou reabrir um sistema real nessas condições.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
