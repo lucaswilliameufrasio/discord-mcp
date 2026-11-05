@@ -593,6 +593,21 @@ externo, identidade da fonte ou escritores que ignorem a autoridade. Os
 marcadores e a evidência são locais e sintéticos; o resultado não qualifica
 o protocolo para uso operacional.
 
+Esse cenário foi ampliado após o reinício: uma evidência sintética divergente
+resulta em `MISMATCH`, e um arquivo de evidência ausente retorna
+`EVIDENCE_UNAVAILABLE`; em ambos `WRITE` e `OPEN` continuam recusados. Antes
+de fornecer novamente a evidência do teste, são comparados snapshot e delta LTX
+em bytes, watermark e WAL da fonte; nenhum TXID 3 aparece e a fonte mantém suas
+linhas. A reconciliação e abertura explícitas só ocorrem depois. A ausência de
+evidência inicialmente causava panic na thread do fixture e conexão sem
+resposta; o teste de regressão reproduziu isso antes do tratamento explícito.
+
+Os casos de divergência e ausência não testam autenticidade, integridade
+criptográfica, frescor ou custódia independente da evidência. Restaurar a
+evidência é uma ação controlada pelo teste, não procedimento seguro de
+recuperação em produção; o ponto de falha continua na API de spool direta, não
+dentro do hook privado de `capture_once`.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

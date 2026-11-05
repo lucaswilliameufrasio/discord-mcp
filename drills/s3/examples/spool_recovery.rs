@@ -602,9 +602,15 @@ mod tests {
                             .tempfile_in(&dir)
                             .unwrap();
                         let actual = image_state(&db, image.path());
-                        if format!("{actual:?}")
-                            != fs::read_to_string(dir.join("witness.txt")).unwrap()
-                        {
+                        let witness = match fs::read_to_string(dir.join("witness.txt")) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                state.lock().unwrap().1 = false;
+                                writeln!(stream, "EVIDENCE_UNAVAILABLE").unwrap();
+                                return;
+                            }
+                        };
+                        if format!("{actual:?}") != witness {
                             state.lock().unwrap().1 = false;
                             writeln!(stream, "MISMATCH").unwrap();
                             return;
@@ -849,6 +855,7 @@ mod tests {
             .unwrap();
         let witness = image_state(&db, &dir.path().join("updated-witness.db"));
         fs::write(dir.path().join("witness.txt"), format!("{witness:?}")).unwrap();
+        let original_wal = fs::read(dir.path().join("source.db-wal")).unwrap();
         let source_count: i64 = db
             .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
             .unwrap();
@@ -858,9 +865,11 @@ mod tests {
         assert_eq!(authority_line(&mut capture).await, "VERIFIED");
         capture.get_mut().write_all(b"GO\n").await.unwrap();
         assert_eq!(authority_line(&mut capture).await, "PUBLISHED");
+        let snapshot = fs::read(ltx_path(&repository, 1, 1)).unwrap();
         let delta_path = ltx_path(&repository, 2, 2);
         let delta = fs::read(&delta_path).unwrap();
-        assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+        let watermark = read_watermark(&repository).unwrap();
+        assert_eq!(watermark.txid, 1);
         assert_eq!(
             authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
             "DENIED"
@@ -883,6 +892,50 @@ mod tests {
             "DENIED"
         );
         assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+        let witness_path = dir.path().join("witness.txt");
+        let saved_witness = fs::read(&witness_path).unwrap();
+        fs::write(&witness_path, b"mismatched synthetic witness").unwrap();
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE").await).await,
+            "MISMATCH"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        let saved_path = dir.path().join("witness-saved.txt");
+        fs::rename(&witness_path, &saved_path).unwrap();
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE").await).await,
+            "EVIDENCE_UNAVAILABLE"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        assert_eq!(fs::read(ltx_path(&repository, 1, 1)).unwrap(), snapshot);
+        assert_eq!(fs::read(&delta_path).unwrap(), delta);
+        assert!(!ltx_path(&repository, 3, 3).exists());
+        assert_eq!(
+            fs::read(dir.path().join("source.db-wal")).unwrap(),
+            original_wal
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            source_count
+        );
+        assert_eq!(
+            fs::read(&saved_path).unwrap(),
+            b"mismatched synthetic witness"
+        );
+        fs::write(&witness_path, saved_witness).unwrap();
         let mut reconcile = authority_command(dir.path(), "CAPTURE").await;
         assert_eq!(authority_line(&mut reconcile).await, "VERIFIED");
         assert_eq!(
