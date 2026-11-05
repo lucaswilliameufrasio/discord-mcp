@@ -167,26 +167,69 @@ impl ServerHandler for DiscordMcp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = StorageConfig::from_environment()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [command, source, destination] = args.as_slice()
+        && command == "recovery-prepare"
+    {
+        let key = std::env::var("DISCORD_MCP_KEY").map_err(|_| "missing DISCORD_MCP_KEY")?;
+        let key: [u8; 32] = hex::decode(key)?
+            .try_into()
+            .map_err(|_| "key must be 32 bytes encoded in hex")?;
+        let days = match std::env::var("DISCORD_MCP_AUDIT_RETENTION_DAYS") {
+            Ok(value) => value
+                .parse::<u16>()
+                .map_err(|_| "invalid audit retention")?,
+            Err(std::env::VarError::NotPresent) => 90,
+            Err(_) => return Err("invalid audit retention".into()),
+        };
+        let report = discord_mcp::recovery::prepare_restored_copy(
+            std::path::Path::new(source),
+            std::path::Path::new(destination),
+            &key,
+            days,
+        )?;
+        println!(
+            "Quarantined copy prepared; invalidated permissions={}, tokens={}, codes={}. Review before activation.",
+            report.permissions, report.tokens, report.codes
+        );
+        return Ok(());
+    }
+    let storage = StorageConfig::from_environment()?;
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|show-permissions CHANNEL]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
         }
         let storage = storage.ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY")?;
         if args.as_slice() == ["web"] {
-            storage.open()?;
+            if storage.open()?.recovery_quarantined()? {
+                return Err(
+                    "database is quarantined; review and explicitly activate recovery first".into(),
+                );
+            }
             return local_web::run(storage).await;
         }
         if args.as_slice() == ["serve"] {
             return server::run(storage).await;
         }
         let db = storage.open()?;
+        if db.recovery_quarantined()? && args.as_slice() != ["recovery-activate", "--confirm"] {
+            return Err(
+                "database is quarantined; review and explicitly activate recovery first".into(),
+            );
+        }
         match args.as_slice() {
+            [command, confirmation]
+                if command == "recovery-activate" && confirmation == "--confirm" =>
+            {
+                db.activate_recovered_copy()?;
+                eprintln!(
+                    "Recovery activated. All prior permissions and MCP tokens remain invalidated."
+                );
+            }
             [command, name] if command == "add-channel" => {
                 let mut input = String::new();
                 std::io::stdin()
@@ -226,6 +269,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("unknown command; use --help".into()),
         }
         return Ok(());
+    }
+    if let Some(config) = &storage
+        && config.open()?.recovery_quarantined()?
+    {
+        return Err(
+            "database is quarantined; review and explicitly activate recovery first".into(),
+        );
     }
     let webhook = match std::env::var("DISCORD_WEBHOOK_URL") {
         Ok(value) => Some(WebhookUrl::parse(&value)?),

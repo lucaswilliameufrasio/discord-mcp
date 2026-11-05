@@ -62,6 +62,13 @@ pub struct AuditRow {
     pub can_send: Option<bool>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecoveryInvalidations {
+    pub permissions: usize,
+    pub tokens: usize,
+    pub codes: usize,
+}
+
 /// Point-in-time database counts; not a measure of live connections or delivery health.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Overview {
@@ -116,6 +123,7 @@ pub enum StoreError {
     Decryption,
     PermissionDenied,
     AuthorizationDenied,
+    RecoveryPending,
 }
 
 impl fmt::Display for StoreError {
@@ -127,6 +135,7 @@ impl fmt::Display for StoreError {
             Self::Decryption => "unable to decrypt channel credential",
             Self::PermissionDenied => "channel access denied",
             Self::AuthorizationDenied => "authorization code invalid or expired",
+            Self::RecoveryPending => "database is quarantined pending recovery activation",
         })
     }
 }
@@ -275,7 +284,95 @@ impl ChannelStore {
         );",
             )
             .map_err(|_| StoreError::Storage)?;
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS recovery_control (id INTEGER PRIMARY KEY CHECK(id=1), quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)));").map_err(|_| StoreError::Storage)?;
         Ok(store)
+    }
+
+    pub fn recovery_quarantined(&self) -> Result<bool, StoreError> {
+        self.db
+            .query_row(
+                "SELECT COALESCE((SELECT quarantined FROM recovery_control WHERE id=1), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Storage)
+    }
+
+    fn require_recovery_active(&self) -> Result<(), StoreError> {
+        if self.recovery_quarantined()? {
+            return Err(StoreError::RecoveryPending);
+        }
+        Ok(())
+    }
+
+    /// Operate only on a private staging copy, never on the active database.
+    pub(crate) fn quarantine_recovered_copy(&self) -> Result<RecoveryInvalidations, StoreError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        if self.recovery_quarantined()? {
+            return Err(StoreError::RecoveryPending);
+        }
+        transaction.execute("INSERT INTO recovery_control(id,quarantined) VALUES(1,1) ON CONFLICT(id) DO UPDATE SET quarantined=1", []).map_err(|_| StoreError::Storage)?;
+        let permissions = transaction
+            .execute("DELETE FROM channel_permissions", [])
+            .map_err(|_| StoreError::Storage)?;
+        let tokens = transaction
+            .execute("DELETE FROM mcp_access_tokens", [])
+            .map_err(|_| StoreError::Storage)?;
+        let codes = transaction
+            .execute("DELETE FROM mcp_authorization_codes", [])
+            .map_err(|_| StoreError::Storage)?;
+        self.append_audit(
+            current_timestamp()?,
+            self.audit_retention_days,
+            "recovery_quarantined",
+            "success",
+            AuditActor::LocalOperator,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(RecoveryInvalidations {
+            permissions,
+            tokens,
+            codes,
+        })
+    }
+
+    /// Local operator explicitly activates only after independently reconciling the restore.
+    pub fn activate_recovered_copy(&self) -> Result<(), StoreError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        if !self.recovery_quarantined()? {
+            return Err(StoreError::InvalidInput);
+        }
+        let remaining: i64 = transaction.query_row("SELECT (SELECT COUNT(*) FROM channel_permissions) + (SELECT COUNT(*) FROM mcp_access_tokens) + (SELECT COUNT(*) FROM mcp_authorization_codes)", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if remaining != 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        transaction
+            .execute("UPDATE recovery_control SET quarantined=0 WHERE id=1", [])
+            .map_err(|_| StoreError::Storage)?;
+        self.append_audit(
+            current_timestamp()?,
+            self.audit_retention_days,
+            "recovery_activated",
+            "success",
+            AuditActor::LocalOperator,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        transaction.commit().map_err(|_| StoreError::Storage)
     }
 
     pub fn with_audit_retention(mut self, days: u16) -> Result<Self, StoreError> {
@@ -319,6 +416,7 @@ impl ChannelStore {
             .db
             .unchecked_transaction()
             .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
         // A name can be repointed to a different Discord resource. Never carry
         // old grants over to a newly configured destination.
         let revoked = transaction
@@ -364,6 +462,7 @@ impl ChannelStore {
     }
 
     pub fn get_channel(&self, name: &str) -> Result<Channel, StoreError> {
+        self.require_recovery_active()?;
         let record: Option<(Vec<u8>, Vec<u8>)> = self
             .db
             .query_row(
@@ -416,6 +515,7 @@ impl ChannelStore {
             .db
             .unchecked_transaction()
             .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
         let grants: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM channel_permissions WHERE channel_name=?1",
@@ -501,6 +601,7 @@ impl ChannelStore {
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
         if can_read && matches!(self.get_channel(channel)?, Channel::Webhook(_)) {
             return Err(StoreError::InvalidInput);
         }
@@ -640,6 +741,8 @@ impl ChannelStore {
                     | "channel_grants_revoked"
                     | "channel_configured"
                     | "channel_deleted"
+                    | "recovery_quarantined"
+                    | "recovery_activated"
             )
         }) {
             return Err(StoreError::InvalidInput);
@@ -846,6 +949,7 @@ impl ChannelStore {
         now: i64,
         lifetime_seconds: i64,
     ) -> Result<String, StoreError> {
+        self.require_recovery_active()?;
         if !valid_user_id(user_id)
             || !valid_resource(resource)
             || now < 0
@@ -871,6 +975,9 @@ impl ChannelStore {
         resource: &str,
         now: i64,
     ) -> Result<Option<String>, StoreError> {
+        if self.recovery_quarantined()? {
+            return Ok(None);
+        }
         if !valid_token(token) || !valid_resource(resource) || now < 0 {
             return Ok(None);
         }
@@ -899,6 +1006,7 @@ impl ChannelStore {
         grant: &AuthorizationGrant<'_>,
         now: i64,
     ) -> Result<String, StoreError> {
+        self.require_recovery_active()?;
         if now < 0
             || !valid_user_id(grant.user_id)
             || !valid_client_id(grant.client_id)
@@ -923,6 +1031,7 @@ impl ChannelStore {
         exchange: &AuthorizationExchange<'_>,
         now: i64,
     ) -> Result<String, StoreError> {
+        self.require_recovery_active()?;
         if now < 0
             || !valid_token(exchange.code)
             || !valid_client_id(exchange.client_id)

@@ -81,6 +81,11 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
             .as_secs(),
     )?;
     let store = storage.open()?;
+    if store.recovery_quarantined()? {
+        return Err(
+            "database is quarantined; review and explicitly activate recovery first".into(),
+        );
+    }
     store.prune_operational_metrics(now, retention_days)?;
     store.prune_audit(now, storage.audit_retention_days)?;
     let router = http_mcp::router(config)?.merge(admin_web::router(admin)?);

@@ -160,4 +160,5 @@ Nunca registre tokens de bot, URLs de webhook ou segredos OAuth no repositório.
 
 Para o exercício opt-in de snapshot e restauração com dados sintéticos usando o
 projeto irmão, consulte [docs/sqlite-recovery-drill.md](docs/sqlite-recovery-drill.md).
-O exercício não configura recuperação de desastre em produção.
+O documento também descreve a preparação em quarentena e a ativação explícita de
+uma cópia offline. O exercício não configura recuperação de desastre em produção.

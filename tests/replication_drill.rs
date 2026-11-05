@@ -2,7 +2,11 @@
 use std::{path::Path, process::Stdio, time::Duration};
 
 use discord_mcp::{
-    channels::{Channel, ChannelAction, ChannelStore, OperationalEvent},
+    channels::{
+        AuthorizationExchange, AuthorizationGrant, Channel, ChannelAction, ChannelStore,
+        OperationalEvent,
+    },
+    recovery::prepare_restored_copy,
     webhook::WebhookUrl,
 };
 use rmcp::serde_json::{Value, json};
@@ -57,9 +61,15 @@ async fn snapshot_and_restore_isolated_synthetic_wal_database() {
     let example = Path::new(&example);
     assert!(example.is_file(), "replication example not found");
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let source = dir.path().join("source.db");
     let repo = dir.path().join("replica");
     let restored = dir.path().join("restored.db");
+    let prepared = dir.path().join("prepared.db");
     let key = [111; 32];
     let store = ChannelStore::open(&source, &key).unwrap();
     let url = "https://discord.com/api/webhooks/123/synthetic-drill-token";
@@ -71,6 +81,20 @@ async fn snapshot_and_restore_isolated_synthetic_wal_database() {
         .set_permissions("101", "support", true, false)
         .unwrap();
     store.set_permissions("202", "alerts", false, true).unwrap();
+    let resource = "https://example.invalid/mcp";
+    let token = store.issue_access_token("101", resource, 1000, 60).unwrap();
+    let code = store
+        .issue_authorization_code(
+            &AuthorizationGrant {
+                user_id: "101",
+                client_id: "client",
+                redirect_uri: "http://127.0.0.1:8765/callback",
+                resource,
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            },
+            1000,
+        )
+        .unwrap();
     store
         .record_operational_event(1_000_000, 30, OperationalEvent::Read { failed: true })
         .unwrap();
@@ -158,9 +182,71 @@ async fn snapshot_and_restore_isolated_synthetic_wal_database() {
     );
     drop(recovered);
 
+    let invalidated = prepare_restored_copy(&restored, &prepared, &key, 90).unwrap();
+    assert_eq!(
+        (
+            invalidated.permissions,
+            invalidated.tokens,
+            invalidated.codes
+        ),
+        (2, 1, 1)
+    );
+    let quarantine = ChannelStore::open(&prepared, &key).unwrap();
+    assert!(quarantine.recovery_quarantined().unwrap());
+    assert!(quarantine.get_channel("alerts").is_err());
+    assert!(
+        quarantine
+            .verify_access_token(&token, resource, 1001)
+            .unwrap()
+            .is_none()
+    );
+    let blocked = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env("DISCORD_MCP_DB", &prepared)
+        .env("DISCORD_MCP_KEY", hex::encode(key))
+        .env_remove("DISCORD_WEBHOOK_URL")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(!blocked.status.success());
+    quarantine.activate_recovered_copy().unwrap();
+    assert!(
+        !quarantine
+            .is_permitted("101", "support", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        !quarantine
+            .is_permitted("202", "alerts", ChannelAction::Send)
+            .unwrap()
+    );
+    assert!(
+        quarantine
+            .verify_access_token(&token, resource, 1001)
+            .unwrap()
+            .is_none()
+    );
+    let exchange = AuthorizationExchange {
+        code: &code,
+        client_id: "client",
+        redirect_uri: "http://127.0.0.1:8765/callback",
+        resource,
+        code_verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+    };
+    assert!(
+        quarantine
+            .exchange_authorization_code(&exchange, 1001)
+            .is_err()
+    );
+    assert_eq!(
+        quarantine.get_webhook("alerts").unwrap(),
+        WebhookUrl::parse(url).unwrap()
+    );
+    drop(quarantine);
+
     // Exercise the restored application without any valid outgoing message/read.
     let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
-        .env("DISCORD_MCP_DB", &restored)
+        .env("DISCORD_MCP_DB", &prepared)
         .env("DISCORD_MCP_KEY", hex::encode(key))
         .env_remove("DISCORD_WEBHOOK_URL")
         .stdin(Stdio::piped())
