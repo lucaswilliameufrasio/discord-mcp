@@ -6,18 +6,21 @@ use std::{
 };
 
 use axum::{
-    Form, Router,
-    extract::{DefaultBodyLimit, Query, State},
+    Form, Json, Router,
+    extract::{DefaultBodyLimit, Query, State, rejection::FormRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use reqwest::Url;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
 use crate::{
-    channels::{AuthorizationGrant, ChannelStore, valid_challenge, valid_redirect, valid_resource},
+    channels::{
+        AuthorizationExchange, AuthorizationGrant, ChannelStore, StoreError, valid_challenge,
+        valid_redirect, valid_resource,
+    },
     discord_login::{DiscordLoginClient, PendingDiscordLogin},
     http_auth::AuthState,
 };
@@ -96,11 +99,129 @@ pub fn router(config: OAuthWebConfig) -> Result<Router, &'static str> {
         consents: Mutex::new(HashMap::new()),
     });
     Ok(Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_metadata),
+        )
         .route("/oauth/authorize", get(authorize))
+        .route("/oauth/token", post(token))
         .route("/oauth/discord/callback", get(callback))
         .route("/oauth/consent", get(consent_page).post(consent_submit))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(state))
+}
+
+async fn resource_metadata(State(app): State<Shared>) -> Response {
+    json_response(
+        StatusCode::OK,
+        rmcp::serde_json::json!({
+            "resource": app.config.auth.resource,
+            "authorization_servers": [app.config.public_origin],
+            "bearer_methods_supported": ["header"]
+        }),
+    )
+}
+
+async fn authorization_metadata(State(app): State<Shared>) -> Response {
+    let origin = &app.config.public_origin;
+    json_response(
+        StatusCode::OK,
+        rmcp::serde_json::json!({
+            "issuer": origin,
+            "authorization_endpoint": format!("{origin}/oauth/authorize"),
+            "token_endpoint": format!("{origin}/oauth/token"),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "code_challenge_methods_supported": ["S256"]
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    client_id: String,
+    code: String,
+    redirect_uri: String,
+    resource: String,
+    code_verifier: String,
+    client_secret: Option<String>,
+}
+
+async fn token(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    form: Result<Form<TokenRequest>, FormRejection>,
+) -> Response {
+    let Form(req) = match form {
+        Ok(form) => form,
+        Err(_) => return oauth_error("invalid_request"),
+    };
+    if headers.contains_key(header::AUTHORIZATION)
+        || req.client_secret.is_some()
+        || req.client_id != app.config.client_id
+    {
+        return oauth_error("invalid_client");
+    }
+    if req.grant_type != "authorization_code" {
+        return oauth_error("unsupported_grant_type");
+    }
+    if req.redirect_uri != app.config.redirect_uri || req.resource != app.config.auth.resource {
+        return oauth_error("invalid_grant");
+    }
+    let now = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_secs()).ok())
+    {
+        Some(value) => value,
+        None => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let store = match ChannelStore::open(
+        &app.config.auth.database_path,
+        &app.config.auth.encryption_key,
+    ) {
+        Ok(store) => store,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let exchange = AuthorizationExchange {
+        code: &req.code,
+        client_id: &req.client_id,
+        redirect_uri: &req.redirect_uri,
+        resource: &req.resource,
+        code_verifier: &req.code_verifier,
+    };
+    match store.exchange_authorization_code(&exchange, now) {
+        Ok(access_token) => json_response(
+            StatusCode::OK,
+            rmcp::serde_json::json!({"access_token":access_token,"token_type":"Bearer","expires_in":3600}),
+        ),
+        Err(StoreError::AuthorizationDenied | StoreError::InvalidInput) => {
+            oauth_error("invalid_grant")
+        }
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+fn oauth_error(code: &'static str) -> Response {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        rmcp::serde_json::json!({"error":code}),
+    )
+}
+
+fn json_response(status: StatusCode, body: rmcp::serde_json::Value) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    secure_headers(&mut response);
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn valid_origin(value: &str) -> bool {
@@ -438,7 +559,6 @@ fn error(status: StatusCode) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::AuthorizationExchange;
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -525,6 +645,32 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
+        let metadata = client
+            .get(format!("{origin}/.well-known/oauth-protected-resource"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let metadata: rmcp::serde_json::Value = metadata.json().await.unwrap();
+        assert_eq!(metadata["resource"], resource);
+        assert_eq!(metadata["authorization_servers"][0], origin);
+        let auth_metadata: rmcp::serde_json::Value = client
+            .get(format!("{origin}/.well-known/oauth-authorization-server"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(auth_metadata["issuer"], origin);
+        assert_eq!(auth_metadata["code_challenge_methods_supported"][0], "S256");
+        assert_eq!(
+            auth_metadata["token_endpoint"],
+            format!("{origin}/oauth/token")
+        );
         let mut url = Url::parse(&format!("{origin}/oauth/authorize")).unwrap();
         url.query_pairs_mut()
             .append_pair("client_id", "trusted-client")
@@ -687,17 +833,60 @@ mod tests {
                 .as_secs(),
         )
         .unwrap();
-        let exchange = AuthorizationExchange {
-            code: &code,
-            client_id: "trusted-client",
-            redirect_uri,
-            resource: &resource,
-            code_verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
-        };
-        let token = store.exchange_authorization_code(&exchange, now).unwrap();
+        let endpoint = format!("{origin}/oauth/token");
+        let mut fields = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", "trusted-client"),
+            ("redirect_uri", redirect_uri),
+            ("resource", resource.as_str()),
+            (
+                "code_verifier",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ];
+        let malformed = client
+            .post(&endpoint)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("grant_type=authorization_code")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            malformed.json::<rmcp::serde_json::Value>().await.unwrap()["error"],
+            "invalid_request"
+        );
+        fields[2].1 = "unregistered-client";
+        let wrong_client = client.post(&endpoint).form(&fields).send().await.unwrap();
+        assert_eq!(wrong_client.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            wrong_client
+                .json::<rmcp::serde_json::Value>()
+                .await
+                .unwrap()["error"],
+            "invalid_client"
+        );
+        fields[2].1 = "trusted-client";
+        let invalid = client.post(&endpoint).form(&fields).send().await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let body: rmcp::serde_json::Value = invalid.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_grant");
+        fields[5].1 = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let success = client.post(&endpoint).form(&fields).send().await.unwrap();
+        assert_eq!(success.status(), StatusCode::OK);
+        assert_eq!(
+            success.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body: rmcp::serde_json::Value = success.json().await.unwrap();
+        assert_eq!(body["token_type"], "Bearer");
+        let token = body["access_token"].as_str().unwrap();
+        let replay = client.post(&endpoint).form(&fields).send().await.unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             store
-                .verify_access_token(&token, &resource, now)
+                .verify_access_token(token, &resource, now)
                 .unwrap()
                 .as_deref(),
             Some("123")

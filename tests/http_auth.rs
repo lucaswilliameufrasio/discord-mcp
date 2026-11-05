@@ -62,9 +62,14 @@ async fn http_authenticates_each_request_and_enforces_channel_permissions() {
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let client = reqwest::Client::new();
     let alpha = format!("http://{address}/channels/alpha");
+    let unauthenticated = client.get(&alpha).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        client.get(&alpha).send().await.unwrap().status(),
-        StatusCode::UNAUTHORIZED
+        unauthenticated
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .unwrap(),
+        "Bearer resource_metadata=\"https://example.invalid/.well-known/oauth-protected-resource\""
     );
     assert_eq!(
         client

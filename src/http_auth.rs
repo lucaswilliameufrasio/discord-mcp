@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::channels::{Channel, ChannelAction, ChannelStore, StoreError};
+use crate::channels::{Channel, ChannelAction, ChannelStore, StoreError, valid_resource};
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -48,13 +48,29 @@ pub async fn authenticate(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if request
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .count()
+        != 1
+    {
+        return unauthorized(&state.resource);
+    }
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(|value| value.split_once(' '))
+        .and_then(|(scheme, token)| {
+            if scheme.eq_ignore_ascii_case("bearer") {
+                Some(token)
+            } else {
+                None
+            }
+        });
     let Some(token) = token else {
-        return unauthorized();
+        return unauthorized(&state.resource);
     };
     let now = match SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -70,7 +86,7 @@ pub async fn authenticate(
     };
     let user_id = match store.verify_access_token(token, &state.resource, now) {
         Ok(Some(user_id)) => user_id,
-        Ok(None) => return unauthorized(),
+        Ok(None) => return unauthorized(&state.resource),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     drop(store);
@@ -80,10 +96,24 @@ pub async fn authenticate(
     next.run(request).await
 }
 
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-    )
-        .into_response()
+fn unauthorized(resource: &str) -> Response {
+    if !valid_resource(resource) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(url) = reqwest::Url::parse(resource) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let metadata = format!(
+        "{}/.well-known/oauth-protected-resource",
+        url.origin().ascii_serialization()
+    );
+    let challenge = format!("Bearer resource_metadata=\"{metadata}\"");
+    let Ok(challenge) = axum::http::HeaderValue::from_str(&challenge) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, challenge);
+    response
 }
