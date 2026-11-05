@@ -615,6 +615,21 @@ O escopo e o processo de teste sobrevivem; não há perda de host, falha de disc
 escritores externos ou acesso a dados reais. A configuração e as limitações de
 contenção anteriores continuam aplicáveis; não integrar essa fixture ao gate.
 
+A variante SQLite agora cria um snapshot sintético com a API de backup do
+SQLite antes da transação e outro após o commit. Depois da saída do escritor,
+um subprocesso de reconciliação verifica integridade e compara as linhas da
+tabela de teste: o snapshot anterior retorna `stale`, o posterior `matched` e
+um snapshot ausente `unavailable`; todos mantêm `decision=closed`. Para essa
+fixture exclusivamente, a leitura usa `immutable=1` somente depois de observar
+a saída do escritor e confirmar ausência dos sidecars `-wal` e `-journal`.
+
+A comparação cobre uma única tabela e dados sintéticos locais; não valida
+identidade ou completude da fonte, LTX, WAL histórico, publicação remota,
+revogações, todas as tabelas da aplicação ou continuidade de replicação. Mesmo
+`matched` não autoriza reabrir. O modo imutável não deve ser generalizado para
+bancos vivos ou com sidecars. Não houve restauração operacional ou prova de
+recuperação de host.
+
 Uma fixture de inventário investiga a janela entre lançar e registrar um
 escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
 subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de
