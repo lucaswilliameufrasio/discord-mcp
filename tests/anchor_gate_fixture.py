@@ -209,6 +209,32 @@ def inventory_launcher(socket_fd, directory, mode):
         sys.stdin.readline()
 
 
+def registry_guard(path):
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            epochs = connection.execute("SELECT state FROM epoch").fetchall()
+            entries = connection.execute("SELECT token, state FROM writers").fetchall()
+            valid = (integrity == ("ok",) and epochs == [("sealed",)] and bool(entries)
+                     and all(token and state == "done" for token, state in entries))
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        valid = False
+    print("OPEN" if valid else "CLOSED", flush=True)
+
+
+def registry_crash(path):
+    connection = sqlite3.connect(path, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("UPDATE writers SET state='done' WHERE token='parent'")
+    print("UNCOMMITTED", flush=True)
+    sys.stdin.readline()
+    connection.rollback()
+    connection.close()
+
+
 def admitted_sqlite_writer(fd, socket_fd, database):
     sock = socket.socket(fileno=socket_fd)
     sock.settimeout(5)
@@ -336,6 +362,99 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+                         "Linux pidfd APIs are required")
+    def test_registry_restart_rejects_unfinished_descendant_and_partial_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = os.path.join(directory, "registry.db")
+            database = os.path.join(directory, "synthetic.db")
+            with sqlite3.connect(registry) as db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("CREATE TABLE epoch(state TEXT NOT NULL)")
+                db.execute("CREATE TABLE writers(token TEXT PRIMARY KEY, state TEXT NOT NULL)")
+                db.execute("INSERT INTO epoch VALUES ('unsealed')")
+                db.execute("INSERT INTO writers VALUES ('parent', 'intent')")
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            child_handle = None
+            processes = []
+
+            def guard():
+                result = subprocess.run(
+                    [sys.executable, __file__, "registry_guard", registry],
+                    capture_output=True, text=True, timeout=5, check=True,
+                )
+                return result.stdout.strip()
+
+            try:
+                self.assertEqual(guard(), "CLOSED")
+                parent = subprocess.Popen(
+                    [sys.executable, __file__, "spawn_descendant", database],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                processes.append(parent)
+                announcement = line(parent.stdout).split()
+                self.assertEqual(announcement[0], "CHILD")
+                child_handle = os.pidfd_open(int(announcement[1]))
+                self.assertEqual(parent.wait(timeout=5), 0)
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE writers SET state='running' WHERE token='parent'")
+                crasher = subprocess.Popen(
+                    [sys.executable, __file__, "registry_crash", registry],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                processes.append(crasher)
+                self.assertEqual(line(crasher.stdout), "UNCOMMITTED")
+                crasher.kill()
+                crasher.wait(timeout=5)
+                with sqlite3.connect(registry) as db:
+                    self.assertEqual(db.execute("SELECT state FROM writers WHERE token='parent'").fetchone(),
+                                     ("running",))
+                self.assertEqual(guard(), "CLOSED")
+
+                parent.stdin.write("begin\n")
+                parent.stdin.flush()
+                self.assertEqual(line(parent.stdout), "DESCENDANT_WRITING")
+                # Parent is gone, but the supervisor has not proved the process
+                # set complete; registering the parent as done cannot seal it.
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE writers SET state='done' WHERE token='parent'")
+                self.assertEqual(guard(), "CLOSED")
+                # A forged or premature seal is not proof that the descendant
+                # was discovered: show that this fixture would open unsafely.
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE epoch SET state='sealed'")
+                self.assertEqual(guard(), "OPEN")
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE epoch SET state='unsealed'")
+                    db.execute("INSERT INTO writers VALUES ('child', 'running')")
+                    # Artificially seal to exercise the independent running check.
+                    db.execute("UPDATE epoch SET state='sealed'")
+                self.assertEqual(guard(), "CLOSED")
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE writers SET state='invalid' WHERE token='child'")
+                self.assertEqual(guard(), "CLOSED")
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE writers SET state='running' WHERE token='child'")
+                parent.stdin.write("commit\n")
+                parent.stdin.flush()
+                self.assertTrue(select.select([child_handle], [], [], 5)[0])
+                with sqlite3.connect(database) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+                # Only the test supervisor asserts completion after pidfd signals.
+                with sqlite3.connect(registry) as db:
+                    db.execute("UPDATE writers SET state='done' WHERE token='child'")
+                self.assertEqual(guard(), "OPEN")
+            finally:
+                if child_handle is not None:
+                    if not select.select([child_handle], [], [], 0)[0]:
+                        signal.pidfd_send_signal(child_handle, signal.SIGKILL)
+                    os.close(child_handle)
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+
     @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
                          "Linux pidfd APIs are required")
     def test_pending_launch_refuses_incomplete_inventory_after_launcher_death(self):
@@ -1333,7 +1452,11 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "inventory_launcher":
+    if len(sys.argv) == 3 and sys.argv[1] == "registry_guard":
+        registry_guard(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "registry_crash":
+        registry_crash(sys.argv[2])
+    elif len(sys.argv) == 5 and sys.argv[1] == "inventory_launcher":
         inventory_launcher(int(sys.argv[2]), sys.argv[3], sys.argv[4])
     elif len(sys.argv) == 4 and sys.argv[1] == "inventory_writer":
         inventory_writer(int(sys.argv[2]), sys.argv[3])

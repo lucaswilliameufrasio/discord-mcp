@@ -539,6 +539,22 @@ escritores externos/descendentes, fsync do diretório, falha de armazenamento,
 rollback ou perda de energia. O guardião simplificado aceita `clean` sem prova
 independente; esse controle da fixture não é autorização de abertura real.
 
+Um protótipo separado de registro SQLite exercita estados `intent`, `running`
+e `done` e uma época `unsealed`/`sealed`. Um subprocesso é morto com atualização
+para `done` não confirmada; após reinício, a transação é revertida e a verificação
+permanece fechada. Com o pai encerrado e um descendente em transação SQLite,
+inventário não selado, registro ativo e estado inválido são recusados. Após o
+descendente confirmar, o `pidfd` sinalizar saída e o supervisor de teste registrar
+`done`, a verificação sintética retorna `OPEN`.
+
+O mesmo teste força um selo prematuro antes de registrar o descendente e observa
+`OPEN` **enquanto ele ainda escreve**. Portanto o registro, `integrity_check` e
+um selo gravado não provam completude: são necessários controle verificável de
+todos os lançamentos e descendentes e custódia confiável dos handles. O selo e as
+conclusões são controlados pelo teste; não há autenticação, protocolo de produção,
+reabertura real, garantia contra rollback, perda de energia ou escritores externos.
+Este resultado demonstra explicitamente uma falsa abertura, não uma solução.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
