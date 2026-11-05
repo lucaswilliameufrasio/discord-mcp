@@ -115,10 +115,21 @@ O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin
 refs/heads/main` retornou `25e2bd16d99aa005b6c0fead064773a0aee5dd1a`; o
-`origin/main` local correspondente expõe `snapshot`, mas não `sync_to_s3`,
-`restore_from_s3` ou `capture_once`. Portanto, fixar hoje a revisão local como
+`origin/main` local correspondente expõe `snapshot`, mas não expõe publicamente
+`sync_to_s3`, `restore_from_s3` ou `capture_once`. Há uma função interna
+`pub(crate) capture_once`; ela não é API pública. Portanto, fixar a revisão local como
 dependência Git não produziria um build reproduzível a partir do remoto.
 Não houve publicação ou modificação do checkout irmão nesta investigação.
+
+Nova consulta somente leitura em 2026-11-05: `git ls-remote --heads origin`
+mostrou `main` ainda em `25e2bd16d99aa005b6c0fead064773a0aee5dd1a` e a branch
+`fix/conformance-crc-and-cp01` em `9c9201e64c19a55f18fe4df1abe29a33a122bbc8`;
+`git ls-remote --tags origin` não retornou tags. O `lib.rs` dessas duas revisões
+publicadas mantém `capture` como `pub(crate)` e declara que a API não expõe
+replicação WAL. Não foi identificada nelas a API pública incremental/S3 usada
+pelas fixtures. O checkout irmão local ainda estava em `f5c0984f...` com
+alterações preexistentes, inclusive em código de captura; ele não foi modificado
+ou publicado. Uma revisão publicada e utilizável continua pendente.
 
 A captura incremental da biblioteca exige um write-gate para **todos** os
 escritores, um único escritor lógico coordenado, plataforma e SQLite dentro do
@@ -538,6 +549,14 @@ antigos, a fixture oferece uma variável explícita que **simula**, sem comprova
 escritores conhecidos e permite os caminhos antigos; ela não é código de
 aplicação nem autorização operacional. O teste conservador não executa captura
 ou reconciliação e não qualifica um gate real ou a biblioteca irmã.
+
+O caminho sintético `RECONCILE` também recusa com `INVENTORY_UNKNOWN` antes de
+criar staging. O teste mantém o escritor desconhecido em transação, confirma
+`SQLITE_BUSY` em `BEGIN IMMEDIATE` de outra conexão e compara bytes do WAL,
+arquivos do repositório e watermark após a recusa. Após o escritor confirmar,
+a ausência de prova continua causando recusa; `WRITE`/`OPEN` permanecem negados.
+O comando não identifica escritores nem realiza reconciliação: é apenas uma
+barreira conservadora de pesquisa.
 
 Uma ampliação acompanha múltiplos processos sintéticos por `pidfd`, incluindo
 um pai que inicia um descendente e termina enquanto o descendente permanece

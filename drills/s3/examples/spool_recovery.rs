@@ -916,6 +916,18 @@ mod tests {
                         guard.0 = true;
                         writeln!(stream, "OPENED").unwrap();
                     }
+                    "RECONCILE" => {
+                        let mut guard = state.lock().unwrap();
+                        if guard.1 {
+                            writeln!(stream, "BUSY").unwrap();
+                            return;
+                        }
+                        guard.0 = false;
+                        guard.2 = false;
+                        // Neither process exit nor a marker proves that every
+                        // writer is known. Never stage offline reconciliation.
+                        writeln!(stream, "INVENTORY_UNKNOWN").unwrap();
+                    }
                     "CAPTURE" | "CAPTURE_FAULT" | "CAPTURE_INVENTORY" => {
                         {
                             let mut guard = state.lock().unwrap();
@@ -1381,6 +1393,14 @@ mod tests {
         authority.wait().await.unwrap();
         fs::remove_file(dir.path().join("authority.sock")).unwrap();
         let mut restarted = start_continuity_authority_mode(dir.path(), false).await;
+        assert!(writer.try_wait().unwrap().is_none());
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let busy = db.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            busy.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let active_wal = fs::read(dir.path().join("source.db-wal")).unwrap();
         for inventory in [
             None,
             Some(b"incomplete\n".as_slice()),
@@ -1389,7 +1409,7 @@ mod tests {
             if let Some(value) = inventory {
                 fs::write(dir.path().join("inventory.txt"), value).unwrap();
             }
-            for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+            for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY", "RECONCILE"] {
                 assert_eq!(
                     authority_line(&mut authority_command(dir.path(), command).await).await,
                     "INVENTORY_UNKNOWN"
@@ -1405,6 +1425,11 @@ mod tests {
             );
             assert_eq!(files(&repository), before);
             assert_eq!(read_watermark(&repository).unwrap(), watermark);
+            assert_eq!(
+                fs::read(dir.path().join("source.db-wal")).unwrap(),
+                active_wal
+            );
+            assert!(!dir.path().join("isolated-reconciliation").exists());
         }
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM records", [], |row| row
@@ -1433,7 +1458,7 @@ mod tests {
             2
         );
         let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
-        for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+        for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY", "RECONCILE"] {
             assert_eq!(
                 authority_line(&mut authority_command(dir.path(), command).await).await,
                 "INVENTORY_UNKNOWN"
