@@ -1,6 +1,7 @@
 use std::{io::Read, path::PathBuf};
 
 mod local_web;
+mod server;
 
 use discord_mcp::{
     bot::BotClient,
@@ -159,10 +160,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = StorageConfig::from_environment()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
+            println!(
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|show-permissions CHANNEL]"
+            );
+            println!("Server configuration and security requirements: see README.md.");
+            return Ok(());
+        }
         let storage = storage.ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY")?;
         if args.as_slice() == ["web"] {
             storage.open()?;
             return local_web::run(storage).await;
+        }
+        if args.as_slice() == ["serve"] {
+            return server::run(storage).await;
         }
         let db = storage.open()?;
         match args.as_slice() {
@@ -183,7 +194,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{name}");
                 }
             }
-            _ => return Err("usage: discord-mcp [web|add-channel NAME|list-channels]".into()),
+            [command, user, channel, permission] if command == "set-permission" => {
+                let (read, send) = match permission.as_str() {
+                    "none" => (false, false),
+                    "read" => (true, false),
+                    "send" => (false, true),
+                    "both" => (true, true),
+                    _ => return Err("permission must be none, read, send or both".into()),
+                };
+                db.set_permissions(user, channel, read, send)?;
+                eprintln!("Channel permissions updated.");
+            }
+            [command, channel] if command == "show-permissions" => {
+                for entry in db.list_permissions(channel)? {
+                    println!(
+                        "{}\tread={}\tsend={}",
+                        entry.user_id, entry.can_read, entry.can_send
+                    );
+                }
+            }
+            _ => return Err("unknown command; use --help".into()),
         }
         return Ok(());
     }

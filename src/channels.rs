@@ -24,6 +24,12 @@ pub enum ChannelAction {
     Send,
 }
 
+pub struct ChannelPermission {
+    pub user_id: String,
+    pub can_read: bool,
+    pub can_send: bool,
+}
+
 /// Inputs already validated against a registered client and a consented login.
 pub struct AuthorizationGrant<'a> {
     pub user_id: &'a str,
@@ -354,6 +360,33 @@ impl ChannelStore {
             return Ok(matches!(self.get_channel(channel)?, Channel::Bot(_)));
         }
         Ok(granted)
+    }
+
+    /// Administrative query; callers must restrict this to a trusted operator.
+    pub fn list_permissions(&self, channel: &str) -> Result<Vec<ChannelPermission>, StoreError> {
+        let exists: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM channels WHERE name=?1)",
+                [channel],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+        let mut statement = self.db.prepare("SELECT user_id, can_read, can_send FROM channel_permissions WHERE channel_name=?1 ORDER BY user_id").map_err(|_| StoreError::Storage)?;
+        let rows = statement
+            .query_map([channel], |row| {
+                Ok(ChannelPermission {
+                    user_id: row.get(0)?,
+                    can_read: row.get(1)?,
+                    can_send: row.get(2)?,
+                })
+            })
+            .map_err(|_| StoreError::Storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Storage)
     }
 
     /// Resolve authorization and the destination from the same database snapshot.

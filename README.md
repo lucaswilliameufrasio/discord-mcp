@@ -1,7 +1,7 @@
 # Discord MCP
 
-> Em desenvolvimento. Possui apenas interface local; não possui autenticação
-> multiusuário e não deve ser utilizado como serviço de produção.
+> Em desenvolvimento. O modo HTTP é experimental, não foi validado com o
+> Discord real e não deve ser utilizado como serviço de produção.
 
 Servidor MCP em Rust planejado para integrar canais do Discord por webhook ou
 bot. Webhooks permitem apenas envio; bots podem enviar e consultar mensagens
@@ -11,8 +11,8 @@ conforme as permissões concedidas no Discord.
 
 O protocolo stdio oferece envio para um webhook configurado na variável de
 ambiente `DISCORD_WEBHOOK_URL`; mensagens não permitem menções automáticas. O
-modo servidor, OAuth, controle de acesso, gestão guiada de segredos e
-interface administrativa compartilhada ainda precisam ser implementados.
+modo servidor HTTP possui OAuth e controle de acesso experimentais; gestão
+guiada de segredos e interface administrativa compartilhada ainda faltam.
 
 Também é possível cadastrar múltiplos webhooks em SQLite local e selecionar o
 canal pelo nome no argumento `channel` da ferramenta `send_message`. Configure
@@ -44,6 +44,45 @@ SameSite estrito e não exibe webhooks já cadastrados. É uma interface local,
 não um servidor acessível remotamente. Ela roda em processo separado do MCP
 stdio e utiliza o mesmo banco. Não protege contra outro processo com os mesmos
 privilégios do usuário que consiga ler a chave ou controlar o navegador.
+
+### Servidor HTTP experimental
+
+O comando `discord-mcp serve` inicia OAuth e MCP HTTP usando o mesmo banco de
+canais. O processo só aceita escutar em endereço de loopback; não o exponha
+diretamente em uma interface pública. O servidor ainda não foi validado com o
+Discord real nem preparado para produção. Para acesso remoto é necessário um
+proxy HTTPS configurado pelo operador, que preserve o `Host` público correto e
+proteja logs de URLs de callback, códigos OAuth, cookies e cabeçalhos de
+autorização. O proxy e sua configuração não são fornecidos aqui.
+
+Além de `DISCORD_MCP_DB` e `DISCORD_MCP_KEY`, configure:
+
+| Variável | Finalidade |
+| --- | --- |
+| `DISCORD_MCP_LISTEN` | Endereço de loopback; padrão `127.0.0.1:8000`. |
+| `DISCORD_MCP_PUBLIC_ORIGIN` | Origem pública HTTPS, sem caminho; HTTP só em loopback na porta do listener. |
+| `DISCORD_MCP_DISCORD_CLIENT_ID` | ID da aplicação OAuth Discord. |
+| `DISCORD_MCP_DISCORD_CLIENT_SECRET` | Segredo OAuth Discord, fornecido por mecanismo de segredos. |
+| `DISCORD_MCP_CLIENT_ID` | ID de um cliente MCP previamente registrado pelo operador. |
+| `DISCORD_MCP_CLIENT_NAME` | Nome do cliente mostrado no consentimento. |
+| `DISCORD_MCP_CLIENT_REDIRECT` | URI de retorno exata desse cliente. |
+
+Registre no Discord a URI de callback formada por sua origem pública e
+`/oauth/discord/callback`. O recurso MCP será a origem seguida de `/mcp`.
+Esta versão aceita apenas **um cliente MCP pré-registrado**; registro dinâmico,
+documentos de metadados de cliente e painel administrativo compartilhado ainda
+não estão disponíveis.
+
+O operador local define permissões com
+`discord-mcp set-permission ID_DISCORD CANAL read|send|both|none` e consulta
+com `discord-mcp show-permissions CANAL`. O ID é o identificador numérico da
+conta Discord, não o nome exibido. Não há concessão automática no login. A
+substituição ou exclusão do canal revoga suas permissões; webhooks não aceitam
+permissão de leitura. Os comandos exigem acesso local ao banco e à chave.
+
+Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
+segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;
+isso não garante entrega de mensagens ou recuperação após interrupção forçada.
 
 ### Canais com bot
 

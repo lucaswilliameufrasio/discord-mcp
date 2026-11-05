@@ -1,0 +1,90 @@
+//! CLI server bootstrap. Always listens on loopback; use a TLS reverse proxy remotely.
+use std::{net::SocketAddr, time::Duration};
+
+use discord_mcp::{
+    discord_login::DiscordLoginClient, http_auth::AuthState, http_mcp, oauth_web::OAuthWebConfig,
+};
+
+use crate::StorageConfig;
+
+fn required(name: &'static str) -> Result<String, Box<dyn std::error::Error>> {
+    std::env::var(name).map_err(|_| format!("missing or invalid {name}").into())
+}
+
+pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let listen: SocketAddr = std::env::var("DISCORD_MCP_LISTEN")
+        .unwrap_or_else(|_| "127.0.0.1:8000".into())
+        .parse()
+        .map_err(|_| "invalid DISCORD_MCP_LISTEN")?;
+    if !listen.ip().is_loopback() {
+        return Err("DISCORD_MCP_LISTEN must be a loopback address".into());
+    }
+    let origin = required("DISCORD_MCP_PUBLIC_ORIGIN")?;
+    let url = reqwest::Url::parse(&origin).map_err(|_| "invalid DISCORD_MCP_PUBLIC_ORIGIN")?;
+    if url.scheme() == "http" {
+        let local = matches!(
+            url.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+        );
+        if !local || url.port_or_known_default() != Some(listen.port()) || listen.port() == 0 {
+            return Err("HTTP public origin must be loopback and use the listener port".into());
+        }
+    }
+    let discord_id = required("DISCORD_MCP_DISCORD_CLIENT_ID")?;
+    let discord_secret = required("DISCORD_MCP_DISCORD_CLIENT_SECRET")?;
+    let discord = DiscordLoginClient::new(
+        &discord_id,
+        &discord_secret,
+        &format!("{origin}/oauth/discord/callback"),
+    )?;
+    let config = OAuthWebConfig {
+        auth: AuthState {
+            database_path: storage.path.clone(),
+            encryption_key: storage.key,
+            resource: format!("{origin}/mcp"),
+        },
+        public_origin: origin,
+        client_id: required("DISCORD_MCP_CLIENT_ID")?,
+        client_name: required("DISCORD_MCP_CLIENT_NAME")?,
+        redirect_uri: required("DISCORD_MCP_CLIENT_REDIRECT")?,
+        discord,
+    };
+    storage.open()?;
+    let router = http_mcp::router(config)?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    eprintln!(
+        "MCP HTTP listening on {} (loopback only)",
+        listener.local_addr()?
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    tokio::select! {
+        result = &mut task => { result??; }
+        signal = shutdown_signal() => {
+            if signal.is_err() { task.abort(); return Err("unable to install shutdown signal handler".into()); }
+            let _ = stop.send(());
+            match tokio::time::timeout(Duration::from_secs(15), &mut task).await {
+                Ok(result) => { result??; }
+                Err(_) => { task.abort(); return Err("shutdown timed out; in-flight requests may be incomplete".into()); }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! { result = tokio::signal::ctrl_c() => result, _ = term.recv() => Ok(()) }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}

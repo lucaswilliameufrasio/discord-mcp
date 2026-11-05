@@ -43,8 +43,10 @@ recurso configurados. Atualmente há apenas um cliente pré-registrado na
 configuração; o transporte MCP HTTP sem sessões já está composto com esse
 roteador e verifica o token em cada requisição e as permissões em cada operação.
 Ainda faltam gestão de clientes, administração compartilhada de permissões,
-validação com Discord real e preparação operacional. O roteador integrado ainda
-não é exposto por um comando de servidor. Nenhum endpoint remoto de produção deve ser
+validação com Discord real e preparação operacional. O comando `serve` inicia o
+roteador integrado exclusivamente em loopback; acesso remoto exige proxy HTTPS
+configurado pelo operador. A CLI local permite conceder e revogar permissões.
+Nenhum endpoint remoto de produção deve ser
 habilitado até que essas partes sejam implementadas e testadas.
 Cada operação deverá verificar o token em toda requisição e obter o usuário do
 contexto autenticado, nunca de argumentos fornecidos pelo cliente.
