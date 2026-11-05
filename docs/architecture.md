@@ -61,6 +61,9 @@ acesso limitado ao contexto e às permissões de cada pessoa:
 * **Visão geral:** dashboard com um resumo de canais e integrações, atividade
   recente, resultados de operações e problemas que necessitam atenção. Cada
   indicador informa o período e leva ao contexto detalhado correspondente.
+  Implementação atual: contagens instantâneas de canais, usuários com concessão,
+  concessões por ação e tokens não expirados, apenas para administradores;
+  atividade, resultados e alertas ainda não são coletados.
 * **Monitoramento e observabilidade:** investigação da saúde do serviço e das
   integrações, volume e falhas de operações, latência e limites do Discord,
   conforme dados efetivamente coletados. Deve diferenciar indisponibilidade de

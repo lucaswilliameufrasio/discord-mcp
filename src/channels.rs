@@ -30,6 +30,16 @@ pub struct ChannelPermission {
     pub can_send: bool,
 }
 
+/// Point-in-time database counts; not a measure of live connections or delivery health.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Overview {
+    pub channels: i64,
+    pub permitted_users: i64,
+    pub read_grants: i64,
+    pub send_grants: i64,
+    pub unexpired_tokens: i64,
+}
+
 /// Inputs already validated against a registered client and a consented login.
 pub struct AuthorizationGrant<'a> {
     pub user_id: &'a str,
@@ -386,6 +396,32 @@ impl ChannelStore {
             })
             .map_err(|_| StoreError::Storage)?;
         rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Storage)
+    }
+
+    /// One SQLite statement provides a consistent point-in-time view.
+    pub fn overview(&self, now: i64) -> Result<Overview, StoreError> {
+        if now < 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        self.db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM channels),
+                    (SELECT COUNT(DISTINCT user_id) FROM channel_permissions),
+                    (SELECT COUNT(*) FROM channel_permissions WHERE can_read=1),
+                    (SELECT COUNT(*) FROM channel_permissions WHERE can_send=1),
+                    (SELECT COUNT(*) FROM mcp_access_tokens WHERE expires_at>?1)",
+                [now],
+                |row| {
+                    Ok(Overview {
+                        channels: row.get(0)?,
+                        permitted_users: row.get(1)?,
+                        read_grants: row.get(2)?,
+                        send_grants: row.get(3)?,
+                        unexpired_tokens: row.get(4)?,
+                    })
+                },
+            )
             .map_err(|_| StoreError::Storage)
     }
 

@@ -58,6 +58,7 @@ pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
     });
     Ok(Router::new()
         .route("/admin", get(home))
+        .route("/admin/channels", get(channels))
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -251,6 +252,42 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
     if !authorized(&app, &headers) {
         return page("<h1>Administração</h1><p>Entre com a conta Discord configurada como administradora.</p><p><a href=\"/admin/login\">Entrar com Discord</a></p>".into());
     }
+    let now = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_secs()).ok())
+    {
+        Some(now) => now,
+        None => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let Some(timestamp) = chrono::DateTime::from_timestamp(now, 0) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let metrics = match store(&app).and_then(|store| store.overview(now)) {
+        Ok(metrics) => metrics,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let timestamp_iso = timestamp.to_rfc3339();
+    let timestamp = timestamp.format("%Y-%m-%d %H:%M:%S UTC");
+    let empty = if metrics.channels == 0 {
+        "<p>Nenhum canal cadastrado. Use a interface local para adicionar o primeiro canal.</p>"
+    } else {
+        ""
+    };
+    page(format!(
+        r#"<header><p>Discord MCP / Administração</p><h1>Visão geral</h1><p>Resumo do cadastro e dos acessos. Atualizado em <time datetime="{timestamp_iso}">{timestamp}</time>; recarregue para atualizar.</p></header><section aria-labelledby="summary"><h2 id="summary">Configuração e acesso</h2><dl class="metrics"><div><dt>Canais cadastrados</dt><dd>{}</dd></div><div><dt>Usuários com permissões</dt><dd>{}</dd></div><div><dt>Concessões de leitura</dt><dd>{}</dd></div><div><dt>Concessões de envio</dt><dd>{}</dd></div><div><dt>Tokens MCP não expirados</dt><dd>{}</dd></div></dl>{empty}<p>Usuários são distintos; concessões contam pares de usuário e canal. Tokens não expirados não indicam conexões ativas.</p><p><a href="/admin/channels">Gerenciar permissões dos canais</a></p></section><section aria-labelledby="monitor"><h2 id="monitor">Monitoramento e auditoria</h2><p>Dados de tráfego, falhas, saúde do Discord e histórico de auditoria ainda não são coletados. Nenhum estado de saúde é inferido a partir desta visão.</p></section><form method="post" action="/admin/logout"><button>Sair</button></form>"#,
+        metrics.channels,
+        metrics.permitted_users,
+        metrics.read_grants,
+        metrics.send_grants,
+        metrics.unexpired_tokens
+    ))
+}
+
+async fn channels(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if !authorized(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
     let names = match store(&app).and_then(|store| store.list()) {
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
@@ -267,7 +304,7 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
         rows.push_str("<li>Nenhum canal cadastrado.</li>");
     }
     page(format!(
-        "<h1>Permissões de canais</h1><p>Selecione um canal para consultar e alterar o acesso por usuário.</p><ul>{rows}</ul><form method=\"post\" action=\"/admin/logout\"><button>Sair</button></form>"
+        "<p><a href=\"/admin\">Voltar à visão geral</a></p><h1>Permissões de canais</h1><p>Selecione um canal para consultar e alterar o acesso por usuário.</p><ul>{rows}</ul>"
     ))
 }
 
@@ -303,7 +340,7 @@ async fn channel(
         rows.push_str("<tr><td colspan=\"3\">Nenhuma permissão concedida.</td></tr>");
     }
     page(format!(
-        "<p><a href=\"/admin\">Voltar aos canais</a></p><h1>Canal: {name}</h1><table><thead><tr><th>Usuário Discord</th><th>Leitura</th><th>Envio</th></tr></thead><tbody>{rows}</tbody></table><h2>Alterar permissão</h2><p>Use o ID numérico do usuário Discord. A nova escolha substitui as permissões anteriores.</p><form method=\"post\" action=\"/admin/permissions\"><input type=\"hidden\" name=\"channel\" value=\"{name}\"><label for=\"user_id\">ID do usuário Discord</label><input id=\"user_id\" name=\"user_id\" inputmode=\"numeric\" pattern=\"[0-9]+\" maxlength=\"20\" required><label for=\"permission\">Permissão</label><select id=\"permission\" name=\"permission\"><option value=\"none\">Nenhuma</option><option value=\"read\">Leitura</option><option value=\"send\">Envio</option><option value=\"both\">Leitura e envio</option></select><button>Salvar permissão</button></form>"
+        "<p><a href=\"/admin/channels\">Voltar aos canais</a></p><h1>Canal: {name}</h1><table><thead><tr><th>Usuário Discord</th><th>Leitura</th><th>Envio</th></tr></thead><tbody>{rows}</tbody></table><h2>Alterar permissão</h2><p>Use o ID numérico do usuário Discord. A nova escolha substitui as permissões anteriores.</p><form method=\"post\" action=\"/admin/permissions\"><input type=\"hidden\" name=\"channel\" value=\"{name}\"><label for=\"user_id\">ID do usuário Discord</label><input id=\"user_id\" name=\"user_id\" inputmode=\"numeric\" pattern=\"[0-9]+\" maxlength=\"20\" required><label for=\"permission\">Permissão</label><select id=\"permission\" name=\"permission\"><option value=\"none\">Nenhuma</option><option value=\"read\">Leitura</option><option value=\"send\">Envio</option><option value=\"both\">Leitura e envio</option></select><button>Salvar permissão</button></form>"
     ))
 }
 
@@ -392,7 +429,7 @@ fn headers(response: &mut Response) {
 
 fn page(body: String) -> Response {
     let html = format!(
-        "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Discord MCP · Administração</title><style>body{{font:16px system-ui;background:#101a2d;color:#edf3ff;max-width:860px;margin:2rem auto;padding:0 1rem}}p{{line-height:1.6}}a{{color:#bdd2ff}}label{{display:block;margin:1rem 0 .4rem}}input,select,button{{padding:.7rem;font:inherit}}button{{margin-top:1rem}}td,th{{padding:.5rem;text-align:left}}:focus-visible{{outline:3px solid #fbd279}}</style></head><body><main>{body}</main></body></html>"
+        "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Discord MCP · Administração</title><style>body{{font:16px system-ui;background:#101a2d;color:#edf3ff;max-width:860px;margin:2rem auto;padding:0 1rem}}p{{line-height:1.6}}a{{color:#bdd2ff}}label{{display:block;margin:1rem 0 .4rem}}input,select,button{{padding:.7rem;font:inherit}}button{{margin-top:1rem}}td,th{{padding:.5rem;text-align:left}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));gap:1rem}}.metrics div{{padding:1rem;border:1px solid #52637e;border-radius:.4rem;background:#1c2b43}}.metrics dt{{line-height:1.4}}.metrics dd{{margin:.5rem 0 0;font-size:2rem;font-weight:700}}:focus-visible{{outline:3px solid #fbd279}}</style></head><body><main>{body}</main></body></html>"
     );
     let mut response = Html(html).into_response();
     headers(&mut response);
@@ -508,6 +545,25 @@ mod tests {
             .build()
             .unwrap();
         let channel = format!("{origin}/admin/channel?name=alerts");
+        let overview_url = format!("{origin}/admin");
+        let guest = client
+            .get(&overview_url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!guest.contains("Canais cadastrados"));
+        assert_eq!(
+            client
+                .get(format!("{origin}/admin/channels"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             client.get(&channel).send().await.unwrap().status(),
             StatusCode::FORBIDDEN
@@ -635,6 +691,21 @@ mod tests {
                 .is_permitted("456", "alerts", ChannelAction::Send)
                 .unwrap()
         );
+        let response = client
+            .get(&overview_url)
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let overview = response.text().await.unwrap();
+        assert!(overview.contains("<dt>Canais cadastrados</dt><dd>1</dd>"));
+        assert!(overview.contains("<dt>Usuários com permissões</dt><dd>1</dd>"));
+        assert!(overview.contains("<dt>Concessões de leitura</dt><dd>1</dd>"));
+        assert!(overview.contains("<dt>Concessões de envio</dt><dd>0</dd>"));
+        assert!(overview.contains("Tokens não expirados não indicam conexões ativas"));
+        assert!(!overview.contains("synthetic-bot-token"));
+        assert!(overview.contains("Dados de tráfego, falhas, saúde do Discord"));
         let page = client
             .get(&channel)
             .header(header::COOKIE, &session)

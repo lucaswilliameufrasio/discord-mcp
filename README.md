@@ -85,7 +85,11 @@ A área `/admin` permite à conta Discord cujo ID corresponde a
 `DISCORD_MCP_ADMIN_ID` consultar e alterar permissões por canal. O login de
 qualquer outra conta não concede administração. A sessão administrativa expira
 após 30 minutos e termina ao reiniciar o servidor ou sair; mudanças exigem uma
-requisição da mesma origem. A criação de canais ainda é feita na interface local.
+requisição da mesma origem. A visão geral apresenta contagens reais do banco no
+momento da consulta: canais, usuários com concessões, permissões de leitura e
+envio e tokens MCP não expirados. Tokens não expirados não são conexões ativas;
+tráfego, falhas, saúde e auditoria ainda não são coletados. A criação de canais
+ainda é feita na interface local.
 
 Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
 segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;
