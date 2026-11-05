@@ -1,5 +1,7 @@
 use std::{io::Read, path::PathBuf};
 
+mod local_web;
+
 use discord_mcp::{
     channels::ChannelStore,
     webhook::{WebhookClient, WebhookUrl},
@@ -105,6 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         let storage = storage.ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY")?;
+        if args.as_slice() == ["web"] {
+            storage.open()?;
+            return local_web::run(storage).await;
+        }
         let db = storage.open()?;
         match args.as_slice() {
             [command, name] if command == "add-channel" => {
@@ -124,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{name}");
                 }
             }
-            _ => return Err("usage: discord-mcp [add-channel NAME|list-channels]".into()),
+            _ => return Err("usage: discord-mcp [web|add-channel NAME|list-channels]".into()),
         }
         return Ok(());
     }

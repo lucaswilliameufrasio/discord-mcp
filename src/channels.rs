@@ -167,4 +167,15 @@ impl ChannelStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| StoreError::Storage)
     }
+
+    pub fn delete(&self, name: &str) -> Result<(), StoreError> {
+        let count = self
+            .db
+            .execute("DELETE FROM channels WHERE name = ?1", [name])
+            .map_err(|_| StoreError::Storage)?;
+        if count == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
 }

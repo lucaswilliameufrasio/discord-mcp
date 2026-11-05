@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.8.9", features = ["form"] }
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
@@ -11,7 +12,8 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
+subtle = "2.6.1"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "signal", "net"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
