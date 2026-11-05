@@ -524,6 +524,34 @@ aplicação. Para evitar a janela é necessário vincular verificação e captur
 uma exclusão que cubra todos os escritores e a mesma identidade da origem; o
 fixture não oferece essa garantia e não deve ser integrado à aplicação.
 
+#### Barreira cooperativa durante verificação e captura
+
+Três testes do exemplo de spool usam um subprocesso que mantém um lock
+consultivo exclusivo desde antes da cópia consistente e comparação da evidência
+até `capture_once` retornar. Um escritor SQLite em outra thread tenta obter o
+mesmo lock em modo compartilhado: o teste observa a tentativa bloqueada,
+executa a captura, e só depois o escritor confirma sua transação. A cópia
+restaurada do TXID capturado contém a linha anterior; a fonte contém também a
+linha confirmada depois da liberação. A sincronização usa mensagens, não uma
+espera de duração presumida. O gate passado à biblioteca é sem bloqueio porque
+o lock externo é mantido pelo subprocesso durante toda a chamada.
+
+Na falha sintética de diretório de staging, a captura retorna erro e o lock é
+liberado; o teste confirma que snapshot e watermark não mudaram, repara somente
+o diretório temporário do teste e repete a captura com sucesso. Em outro caso,
+o subprocesso é morto após verificar a evidência: seu lock é liberado, uma
+escrita cooperativa consegue entrar e o processo reiniciado recusa a evidência
+agora desatualizada sem avançar o spool. **Não há fail-closed durante a ausência
+do processo**: a escrita após a morte é uma limitação demonstrada, não garantia
+de recuperação segura. A falha de staging não simula queda após publicação.
+
+O experimento não coordena processos reais da aplicação, não autentica usuários,
+não protege contra escritor não cooperativo ou troca dos arquivos de lock e
+origem, nem testa rede, perda de energia, evidência forjada ou continuidade após
+falha parcial de publicação. A evidência continua uma tupla não criptográfica,
+de frescor e custódia não qualificados. Esses resultados não autorizam integrar
+o protótipo ao gate real ou habilitar replicação operacional.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

@@ -490,6 +490,280 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn continuity_barrier_worker() {
+        use rusqlite::Connection;
+        use sqlite_replication_core::capture_once;
+        let Some(dir) = std::env::var_os("CONTINUITY_FIXTURE_DIR") else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("writers.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let db = Connection::open(dir.join("source.db")).unwrap();
+        let image = tempfile::Builder::new()
+            .prefix("worker-image-")
+            .tempfile_in(dir)
+            .unwrap();
+        let actual = image_state(&db, image.path());
+        let witness = fs::read_to_string(dir.join("witness.txt")).unwrap();
+        if format!("{actual:?}") != witness {
+            eprintln!("MARK mismatch");
+            return;
+        }
+        eprintln!("MARK verified");
+        let mut command = String::new();
+        std::io::stdin().read_line(&mut command).unwrap();
+        assert_eq!(command.trim(), "capture");
+        let result =
+            capture_once(dir.join("source.db"), dir.join("repository"), &IsolatedGate).unwrap();
+        assert_eq!(result.txid, 1);
+        eprintln!("MARK captured");
+        drop(db);
+        drop(lock);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn barrier_worker(
+        dir: &Path,
+    ) -> (
+        tokio::process::Child,
+        tokio::io::BufReader<tokio::process::ChildStderr>,
+    ) {
+        use std::process::Stdio;
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("CONTINUITY_FIXTURE_DIR", dir)
+            .args(["--exact", "tests::continuity_barrier_worker", "--nocapture"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+        (child, stderr)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn barrier_marker(
+        stderr: &mut tokio::io::BufReader<tokio::process::ChildStderr>,
+        marker: &str,
+    ) {
+        use tokio::{
+            io::AsyncBufReadExt,
+            time::{Duration, timeout},
+        };
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), stderr.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.trim(), format!("MARK {marker}"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn barrier_fixture() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let db = rusqlite::Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        sqlite_replication_core::snapshot(&source, dir.path().join("repository")).unwrap();
+        recover(&dir.path().join("repository"), &[]).unwrap();
+        fs::write(dir.path().join("writers.lock"), []).unwrap();
+        let witness = image_state(&db, &dir.path().join("witness.db"));
+        fs::write(dir.path().join("witness.txt"), format!("{witness:?}")).unwrap();
+        (dir, db)
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn barrier_blocks_cooperative_writer_through_verification_and_capture() {
+        use tokio::{
+            io::AsyncWriteExt,
+            sync::oneshot,
+            time::{Duration, timeout},
+        };
+        let (dir, db) = barrier_fixture();
+        let (mut child, mut stderr) = barrier_worker(dir.path()).await;
+        barrier_marker(&mut stderr, "verified").await;
+        let path = dir.path().to_path_buf();
+        let (blocked_tx, blocked_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let writer = std::thread::spawn(move || {
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join("writers.lock"))
+                .unwrap();
+            assert!(lock.try_lock_shared().is_err());
+            blocked_tx.send(()).unwrap();
+            lock.lock_shared().unwrap();
+            let writer_db = rusqlite::Connection::open(path.join("source.db")).unwrap();
+            writer_db
+                .execute("INSERT INTO records VALUES(2, 'after-capture')", [])
+                .unwrap();
+            drop(writer_db);
+            drop(lock);
+            done_tx.send(()).unwrap();
+        });
+        timeout(Duration::from_secs(5), blocked_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"capture\n")
+            .await
+            .unwrap();
+        barrier_marker(&mut stderr, "captured").await;
+        assert!(
+            timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let restored = dir.path().join("restored.db");
+        sqlite_replication_core::restore_to_target(
+            dir.path().join("repository"),
+            &restored,
+            sqlite_replication_core::RestoreTarget::Txid(1),
+        )
+        .unwrap();
+        let result = rusqlite::Connection::open(restored).unwrap();
+        assert_eq!(
+            result
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn barrier_process_death_releases_lock_and_restart_rejects_stale_witness() {
+        use tokio::time::{Duration, timeout};
+        let (dir, db) = barrier_fixture();
+        let watermark = read_watermark(&dir.path().join("repository")).unwrap();
+        let (mut child, mut stderr) = barrier_worker(dir.path()).await;
+        barrier_marker(&mut stderr, "verified").await;
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        // This intentionally demonstrates that process death releases the lock:
+        // the fixture has no fail-closed authority while it is down.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("writers.lock"))
+            .unwrap();
+        lock.try_lock_shared().unwrap();
+        db.execute("INSERT INTO records VALUES(2, 'after-crash')", [])
+            .unwrap();
+        drop(lock);
+        let (mut restarted, mut stderr) = barrier_worker(dir.path()).await;
+        barrier_marker(&mut stderr, "mismatch").await;
+        assert!(
+            timeout(Duration::from_secs(5), restarted.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            read_watermark(&dir.path().join("repository")).unwrap(),
+            watermark
+        );
+        assert!(!ltx_path(&dir.path().join("repository"), 2, 2).exists());
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn barrier_capture_failure_releases_lock_and_can_retry_after_repair() {
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+        let (dir, _db) = barrier_fixture();
+        let repository = dir.path().join("repository");
+        let watermark = read_watermark(&repository).unwrap();
+        let snapshot = fs::read(ltx_path(&repository, 1, 1)).unwrap();
+        let staging = repository.join(".staging");
+        let saved = repository.join(".staging-saved");
+        fs::rename(&staging, &saved).unwrap();
+        fs::write(&staging, b"synthetic directory failure").unwrap();
+        let (mut child, mut stderr) = barrier_worker(dir.path()).await;
+        barrier_marker(&mut stderr, "verified").await;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"capture\n")
+            .await
+            .unwrap();
+        assert!(
+            !timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("writers.lock"))
+            .unwrap();
+        lock.try_lock_shared().unwrap();
+        drop(lock);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        assert_eq!(fs::read(ltx_path(&repository, 1, 1)).unwrap(), snapshot);
+        fs::remove_file(&staging).unwrap();
+        fs::rename(&saved, &staging).unwrap();
+        let (mut retry, mut stderr) = barrier_worker(dir.path()).await;
+        barrier_marker(&mut stderr, "verified").await;
+        retry
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"capture\n")
+            .await
+            .unwrap();
+        barrier_marker(&mut stderr, "captured").await;
+        assert!(
+            timeout(Duration::from_secs(5), retry.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+    }
+
+    #[test]
     fn real_sqlite_wal_reconciles_published_delta_and_restores_rows() {
         use rusqlite::Connection;
         use sqlite_replication_core::{RestoreTarget, restore_to_target, snapshot};
