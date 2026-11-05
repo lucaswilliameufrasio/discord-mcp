@@ -600,6 +600,21 @@ controlador; não foram simuladas perda do escopo/host, falha de persistência,
 transação SQLite ou integração com escritores reais. A evidência não qualifica
 essa fronteira para produção.
 
+A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
+ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
+inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela
+ainda não está visível. O controlador é morto com essa transação aberta; o
+observador retorna `populated=1 decision=closed`, a migração para o escopo pai
+é negada, e o descendente confirma o commit. Outra conexão verifica uma linha;
+o observador permanece fechado com o processo vivo e também após sua saída.
+O banco fica em diretório temporário próprio do teste, removido ao final.
+
+O observador ainda recusa incondicionalmente: não verifica recuperação de WAL,
+continuidade incremental, integridade do inventário ou segurança para reabrir.
+O escopo e o processo de teste sobrevivem; não há perda de host, falha de disco,
+escritores externos ou acesso a dados reais. A configuração e as limitações de
+contenção anteriores continuam aplicáveis; não integrar essa fixture ao gate.
+
 Uma fixture de inventário investiga a janela entre lançar e registrar um
 escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
 subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de

@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 
 
 def populated(path):
@@ -14,12 +15,25 @@ def populated(path):
 
 
 IDENTITY_WORKER = r'''
-import os, socket, sys
+import os, socket, sqlite3, sys
 sock = socket.socket(fileno=int(sys.argv[2]))
 sock.settimeout(5)
 if os.fork():
     os._exit(0)
 os.setsid()
+connection = None
+if sys.argv[3] != "-":
+    database = os.path.join(sys.argv[3], "synthetic.db")
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    reader = sqlite3.connect(database, timeout=5)
+    if reader.execute("SELECT COUNT(*) FROM writes").fetchone()[0] != 0:
+        raise RuntimeError("uncommitted write became visible")
+    reader.close()
 sock.sendall(f"READY {os.getpid()}".encode())
 if sock.recv(1) != b"M":
     raise SystemExit(2)
@@ -36,12 +50,21 @@ except PermissionError:
 else:
     result = "MOVED"
 sock.sendall(f"{result} {int(regained)}".encode())
+if connection is not None:
+    if sock.recv(1) != b"C":
+        raise SystemExit(4)
+    connection.commit()
+    reader = sqlite3.connect(database, timeout=5)
+    count = reader.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+    reader.close()
+    connection.close()
+    sock.sendall(f"COMMITTED {count}".encode())
 if sock.recv(1) != b"Q":
     raise SystemExit(3)
 '''
 
 
-def worker(leaf, scope, socket_fd, separate_identity=False):
+def worker(leaf, scope, socket_fd, separate_identity=False, database_dir="-"):
     sock = socket.socket(fileno=socket_fd)
     sock.settimeout(5)
     with open(os.path.join(leaf, "cgroup.procs"), "w", encoding="ascii") as target:
@@ -55,7 +78,7 @@ def worker(leaf, scope, socket_fd, separate_identity=False):
         os.execv("/usr/bin/unshare", [
             "/usr/bin/unshare", "--user", "--map-auto", "--map-root-user",
             "--setgid", "1", "--setuid", "1", "/usr/bin/python3", "-c",
-            IDENTITY_WORKER, scope, str(sock.fileno()),
+            IDENTITY_WORKER, scope, str(sock.fileno()), database_dir,
         ])
     sock.sendall(f"READY {os.getpid()}".encode())
     if sock.recv(1) != b"M":
@@ -75,9 +98,9 @@ def worker(leaf, scope, socket_fd, separate_identity=False):
     os._exit(0)
 
 
-def controller(leaf, scope, socket_fd):
+def controller(leaf, scope, socket_fd, database_dir="-"):
     process = subprocess.Popen(
-        [sys.executable, __file__, "worker", leaf, scope, str(socket_fd), "identity"],
+        [sys.executable, __file__, "worker", leaf, scope, str(socket_fd), "identity", database_dir],
         pass_fds=(socket_fd,), stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env={"PATH": "/usr/bin:/bin"},
@@ -94,7 +117,7 @@ def recovery(leaf):
     print(f"populated={int(populated(leaf))} decision=closed", flush=True)
 
 
-def run(separate_identity=False, controller_crash=False):
+def run(separate_identity=False, controller_crash=False, sqlite_transaction=False):
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise RuntimeError("Linux pidfd APIs required")
     with open("/proc/self/cgroup", encoding="ascii") as source:
@@ -106,6 +129,12 @@ def run(separate_identity=False, controller_crash=False):
     if not name.startswith("discord-mcp-cgroup-drill-") or not name.endswith(".scope"):
         raise RuntimeError("requires an owned discord-mcp-cgroup-drill transient scope")
     scope = os.path.join("/sys/fs/cgroup", relative.lstrip("/"))
+    scratch = None
+    if sqlite_transaction:
+        scratch = tempfile.TemporaryDirectory(prefix="cgroup-sqlite-", dir="/tmp/opencode")
+        # Only the owning test process can list the directory; the subordinate
+        # identity may create its known synthetic SQLite file inside it.
+        os.chmod(scratch.name, 0o733)
     leaf = os.path.join(scope, f"fixture-{os.getpid()}")
     os.mkdir(leaf)
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -117,6 +146,8 @@ def run(separate_identity=False, controller_crash=False):
         args = [sys.executable, __file__, role, leaf, scope, str(child.fileno())]
         if separate_identity and not controller_crash:
             args.append("identity")
+        if sqlite_transaction:
+            args.append(scratch.name)
         process = subprocess.Popen(
             args, pass_fds=(child.fileno(),),
             stdin=subprocess.PIPE if controller_crash else subprocess.DEVNULL,
@@ -176,6 +207,21 @@ def run(separate_identity=False, controller_crash=False):
         else:
             raise RuntimeError("invalid migration response")
         print("admission_decision=closed_unqualified_boundary", flush=True)
+        if sqlite_transaction:
+            parent.sendall(b"C")
+            if parent.recv(128) != b"COMMITTED 1":
+                raise RuntimeError("synthetic transaction was not committed")
+            if not populated(leaf):
+                raise RuntimeError("writer disappeared after commit")
+            observed = subprocess.run(
+                [sys.executable, __file__, "recovery", leaf],
+                capture_output=True, text=True, timeout=5, check=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            if observed.stdout.strip() != "populated=1 decision=closed":
+                raise RuntimeError("recovery did not stay closed after commit")
+            print("sqlite_commit_after_controller_death=verified", flush=True)
+            print("recovery_after_sqlite_commit=populated_closed", flush=True)
         parent.sendall(b"Q")
         if not select.select([pidfd], [], [], 5)[0]:
             raise TimeoutError("descendant did not exit")
@@ -204,22 +250,29 @@ def run(separate_identity=False, controller_crash=False):
                 select.select([pidfd], [], [], 5)
             os.close(pidfd)
         os.rmdir(leaf)
+        if scratch is not None:
+            scratch.cleanup()
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "controller":
         controller(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    elif len(sys.argv) == 6 and sys.argv[1] == "controller":
+        controller(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
     elif len(sys.argv) == 3 and sys.argv[1] == "recovery":
         recovery(sys.argv[2])
     elif len(sys.argv) == 5 and sys.argv[1] == "worker":
         worker(sys.argv[2], sys.argv[3], int(sys.argv[4]))
-    elif len(sys.argv) == 6 and sys.argv[1] == "worker" and sys.argv[5] == "identity":
-        worker(sys.argv[2], sys.argv[3], int(sys.argv[4]), separate_identity=True)
+    elif len(sys.argv) in (6, 7) and sys.argv[1] == "worker" and sys.argv[5] == "identity":
+        worker(sys.argv[2], sys.argv[3], int(sys.argv[4]), separate_identity=True,
+               database_dir=sys.argv[6] if len(sys.argv) == 7 else "-")
     elif len(sys.argv) == 1:
         run()
     elif len(sys.argv) == 2 and sys.argv[1] == "--identity":
         run(separate_identity=True)
     elif len(sys.argv) == 2 and sys.argv[1] == "--controller-crash":
         run(separate_identity=True, controller_crash=True)
+    elif len(sys.argv) == 2 and sys.argv[1] == "--sqlite-controller-crash":
+        run(separate_identity=True, controller_crash=True, sqlite_transaction=True)
     else:
         raise SystemExit("invalid fixture arguments")
