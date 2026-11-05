@@ -93,7 +93,11 @@ fn serve_client(
         }
         "RETRY_DRAIN" => {
             let mut state = mutex.lock().unwrap();
-            if !state.capturing || state.drained || state.active != 0 {
+            if !state.capturing || state.drained {
+                writeln!(socket, "NOT_DRAINED")?;
+            } else if persist_closed(&marker, false).is_err() {
+                writeln!(socket, "PERSIST_FAILED")?;
+            } else if state.active != 0 {
                 writeln!(socket, "NOT_DRAINED")?;
             } else {
                 let file = OpenOptions::new().read(true).write(true).open(&barrier)?;
@@ -288,13 +292,64 @@ async fn previous_writer_death_releases_barrier_and_rolls_back() {
 }
 
 #[tokio::test]
-async fn retry_after_failed_close_exposes_missing_persistence_check() {
+async fn retry_after_failed_close_requires_successful_persistence() {
     let fixture = Fixture::start().await;
     assert_eq!(fixture.command("OPEN").await, "OPENED");
     assert_eq!(fixture.command("CLOSE_FAIL").await, "PERSIST_FAILED");
     assert_eq!(fixture.command("WRITE").await, "DENIED");
-    // This deliberately demonstrates that retry currently skips persistence.
+    std::fs::remove_file(fixture.dir.path().join("closed-marker")).unwrap();
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "PERSIST_FAILED");
+    assert_eq!(fixture.command("FINISH").await, "NOT_DRAINED");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    std::fs::write(fixture.dir.path().join("closed-marker"), b"closed\n").unwrap();
     assert_eq!(fixture.command("RETRY_DRAIN").await, "DRAINED");
+    assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+}
+
+#[tokio::test]
+async fn failed_close_retry_and_restart_preserve_barrier_for_active_writer() {
+    let mut fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut writer = start_writer(fixture.dir.path()).await;
+    assert_eq!(fixture.command("CLOSE_FAIL").await, "PERSIST_FAILED");
+    std::fs::remove_file(fixture.dir.path().join("closed-marker")).unwrap();
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "PERSIST_FAILED");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    assert_eq!(fixture.command("FINISH").await, "NOT_DRAINED");
+    std::fs::write(fixture.dir.path().join("closed-marker"), b"closed\n").unwrap();
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "NOT_DRAINED");
+    fixture.restart().await;
+    assert_eq!(fixture.command("OPEN").await, "BARRIER_BUSY");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    let mut capture = fixture.connect("CLOSE").await;
+    assert_eq!(line(&mut capture).await, "CLOSED");
+    assert_eq!(line(&mut capture).await, "BARRIER_BUSY");
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "BARRIER_BUSY");
+    writer
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"commit\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), writer.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "DRAINED");
+    assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let db = rusqlite::Connection::open(fixture.dir.path().join("writer.db")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM writes", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 struct Fixture {

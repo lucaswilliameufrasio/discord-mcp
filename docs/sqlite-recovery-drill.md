@@ -262,11 +262,16 @@ de arquivos remotos ou perda de energia. Um escritor que obtém o lock antes de
 ser admitido pode bloquear temporariamente a reabertura. Não há integração com
 captura real, autenticação, deadlines nem política de recuperação de processos.
 
-**Falha adicional demonstrada:** `RETRY_DRAIN` aceita drenagem após
-`CLOSE_FAIL` sem repetir a persistência que falhou. A admissão continua fechada
-no teste, mas a captura não pode ser considerada autorizada com persistência
-comprovada. O teste registra essa deficiência em vez de validá-la como segura;
-o protocolo continua inadequado para produção.
+**Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
+drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
+sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
+se a persistência falhar, retorna `PERSIST_FAILED` sem declarar drenagem. O teste
+de regressão primeiro reproduziu a resposta incorreta `DRAINED` com o marcador
+ausente e passou após a correção. Outro teste mantém escritor cooperativo ativo,
+induz falha de persistência, verifica recusa, recupera o marcador e reinicia a
+autoridade; a barreira permanece ocupada até o commit do escritor anterior.
+Essas falhas são sintéticas ou de arquivo ausente, não prova de durabilidade
+em caso de perda de energia. O protocolo continua inadequado para produção.
 
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
