@@ -833,7 +833,12 @@ mod tests {
         };
         let db = rusqlite::Connection::open(Path::new(&dir).join("source.db")).unwrap();
         // Deliberately omits the advisory lock and inventory registration.
-        db.execute_batch("BEGIN IMMEDIATE; INSERT INTO records VALUES(2, 'unknown');")
+        let id = std::env::var("CONTINUITY_UNKNOWN_ID")
+            .unwrap_or_else(|_| "2".to_owned())
+            .parse::<i64>()
+            .unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        db.execute("INSERT INTO records VALUES(?1, 'unknown')", [id])
             .unwrap();
         eprintln!("MARK transaction");
         let mut command = String::new();
@@ -1868,6 +1873,142 @@ connection.close()
             authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
             "OPENED"
         );
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn partial_ltx_and_unknown_writer_refuse_reconciliation() {
+        use std::{path::PathBuf, process::Stdio};
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+
+        fn files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            fn collect(root: &Path, path: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        collect(root, &path, output);
+                    } else {
+                        output.push((
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            fs::read(&path).unwrap(),
+                        ));
+                    }
+                }
+            }
+            let mut output = Vec::new();
+            collect(root, root, &mut output);
+            output.sort();
+            output
+        }
+
+        let (dir, db) = barrier_fixture();
+        let repository = dir.path().join("repository");
+        db.execute("INSERT INTO records VALUES(2, 'pending-publication')", [])
+            .unwrap();
+        let witness = image_state(&db, &dir.path().join("partial-witness.db"));
+        fs::write(dir.path().join("witness.txt"), format!("{witness:?}")).unwrap();
+        // This earlier fixture mode assumes known writers only until the
+        // deliberately interrupted publication has been produced.
+        let mut authority = start_continuity_authority(dir.path()).await;
+        let mut capture = authority_command(dir.path(), "CAPTURE_FAULT").await;
+        assert_eq!(authority_line(&mut capture).await, "VERIFIED");
+        capture.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut capture).await, "PUBLISHED");
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let original = files(&repository);
+        let watermark = read_watermark(&repository).unwrap();
+        assert_eq!(watermark.txid, 1);
+        assert!(ltx_path(&repository, 2, 2).is_file());
+
+        let mut writer = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("CONTINUITY_UNKNOWN_WRITER_DIR", dir.path())
+            .env("CONTINUITY_UNKNOWN_ID", "3")
+            .args([
+                "--exact",
+                "tests::continuity_unknown_writer_worker",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stderr = tokio::io::BufReader::new(writer.stderr.take().unwrap());
+        barrier_marker(&mut stderr, "transaction").await;
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let error = db.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let active_wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        let mut restarted = start_continuity_authority_mode(dir.path(), false).await;
+        for command in ["RECONCILE", "CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), command).await).await,
+                "INVENTORY_UNKNOWN"
+            );
+            assert_eq!(files(&repository), original);
+            assert_eq!(read_watermark(&repository).unwrap(), watermark);
+            assert_eq!(
+                fs::read(dir.path().join("source.db-wal")).unwrap(),
+                active_wal
+            );
+        }
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        assert!(writer.try_wait().unwrap().is_none());
+        writer
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"commit\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), writer.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let committed_wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        assert_ne!(committed_wal, active_wal);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "RECONCILE").await).await,
+            "INVENTORY_UNKNOWN"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("source.db-wal")).unwrap(),
+            committed_wal
+        );
+        assert_eq!(files(&repository), original);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
         restarted.kill().await.unwrap();
         timeout(Duration::from_secs(5), restarted.wait())
             .await

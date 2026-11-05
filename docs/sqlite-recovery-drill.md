@@ -558,6 +558,16 @@ a ausência de prova continua causando recusa; `WRITE`/`OPEN` permanecem negados
 O comando não identifica escritores nem realiza reconciliação: é apenas uma
 barreira conservadora de pesquisa.
 
+Um cenário adicional interrompe a publicação após gravar o LTX de TXID 2,
+com watermark ainda em TXID 1, mata a autoridade e inicia um escritor
+desconhecido em transação. Após reinício conservador, `RECONCILE` e os três
+caminhos de captura recusam a operação; os nomes e bytes de todos os arquivos
+do repositório, o watermark e o WAL permanecem iguais durante as tentativas.
+Após o commit do escritor, a reconciliação continua recusada e o repositório e
+watermark permanecem iguais. A publicação parcial usa o modo de escritores
+conhecidos simulado; a recusa posterior é incondicional e não recupera o spool
+nem comprova exclusividade operacional.
+
 Uma ampliação acompanha múltiplos processos sintéticos por `pidfd`, incluindo
 um pai que inicia um descendente e termina enquanto o descendente permanece
 ativo. Após a morte do supervisor e o término dos processos inicialmente
