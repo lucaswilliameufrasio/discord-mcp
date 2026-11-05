@@ -523,18 +523,21 @@ prova de continuidade operacional, restauração de host ou permissão para reab
 
 Outro cenário de spool inicia um subprocesso escritor desconhecido que mantém
 uma transação SQLite sem adquirir o lock consultivo nem se registrar. Depois da
-morte e reinício da autoridade, um novo comando **somente experimental**
-`CAPTURE_INVENTORY` retorna `INVENTORY_UNKNOWN` para inventário ausente,
-incompleto ou mesmo um marcador que afirma estar completo. `WRITE` e `OPEN`
+morte e reinício da autoridade, os comandos **somente experimentais**
+`CAPTURE`, `CAPTURE_FAULT` e `CAPTURE_INVENTORY` retornam `INVENTORY_UNKNOWN`
+para inventário ausente, incompleto ou mesmo um marcador que afirma estar completo. `WRITE` e `OPEN`
 continuam negados. Antes e depois das tentativas, o teste compara nomes e bytes
 de todos os arquivos do repositório e o watermark; após o commit do escritor,
 repete a recusa e verifica também que o WAL não mudou durante a tentativa.
 
-A recusa é incondicional nesse comando porque a fixture não dispõe de prova
-confiável de completude; não é descoberta automática de escritores. Os comandos
-experimentais anteriores `CAPTURE` e `CAPTURE_FAULT` não usam essa verificação,
-logo ela não protege a autoridade inteira. O teste não executa captura nem
-reconciliação nesse caminho e não qualifica um gate real ou a biblioteca irmã.
+A recusa é incondicional na variante conservadora porque a fixture não dispõe de
+prova confiável de completude; não é descoberta automática de escritores. O teste
+de regressão primeiro observou `VERIFIED` indevidamente em `CAPTURE` e depois
+confirmou a recusa uniforme nos três comandos. Para preservar os experimentos
+antigos, a fixture oferece uma variável explícita que **simula**, sem comprovar,
+escritores conhecidos e permite os caminhos antigos; ela não é código de
+aplicação nem autorização operacional. O teste conservador não executa captura
+ou reconciliação e não qualifica um gate real ou a biblioteca irmã.
 
 Uma ampliação acompanha múltiplos processos sintéticos por `pidfd`, incluindo
 um pai que inicia um descendente e termina enquanto o descendente permanece

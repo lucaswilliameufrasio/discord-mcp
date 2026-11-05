@@ -877,6 +877,9 @@ mod tests {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
+        // Older experiments explicitly simulate complete writer knowledge.
+        // This switch is not evidence and is never used by application code.
+        let simulated_known_writers = std::env::var_os("CONTINUITY_SIMULATED_KNOWN").is_some();
         let listener = UnixListener::bind(dir.join("authority.sock")).unwrap();
         // (open, capture-running, capture-completed); every process starts closed.
         let state = Arc::new(Mutex::new((false, false, false)));
@@ -924,9 +927,9 @@ mod tests {
                             guard.1 = true;
                             guard.2 = false;
                         }
-                        // This experiment has no trusted proof of inventory
-                        // completeness, even if a marker claims otherwise.
-                        if command.trim() == "CAPTURE_INVENTORY" {
+                        // Without the explicit legacy simulation, no capture
+                        // command has trusted proof of inventory completeness.
+                        if !simulated_known_writers || command.trim() == "CAPTURE_INVENTORY" {
                             state.lock().unwrap().1 = false;
                             writeln!(stream, "INVENTORY_UNKNOWN").unwrap();
                             return;
@@ -1038,10 +1041,21 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     async fn start_continuity_authority(dir: &Path) -> tokio::process::Child {
+        start_continuity_authority_mode(dir, true).await
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn start_continuity_authority_mode(
+        dir: &Path,
+        simulated_known: bool,
+    ) -> tokio::process::Child {
         use std::process::Stdio;
-        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .env_clear()
-            .env("CONTINUITY_AUTHORITY_DIR", dir)
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env("CONTINUITY_AUTHORITY_DIR", dir);
+        if simulated_known {
+            command.env("CONTINUITY_SIMULATED_KNOWN", "1");
+        }
+        let mut child = command
             .args([
                 "--exact",
                 "tests::continuity_authority_worker",
@@ -1346,7 +1360,7 @@ mod tests {
         let repository = dir.path().join("repository");
         let before = files(&repository);
         let watermark = read_watermark(&repository).unwrap();
-        let mut authority = start_continuity_authority(dir.path()).await;
+        let mut authority = start_continuity_authority_mode(dir.path(), false).await;
         let mut writer = tokio::process::Command::new(std::env::current_exe().unwrap())
             .env_clear()
             .env("CONTINUITY_UNKNOWN_WRITER_DIR", dir.path())
@@ -1366,7 +1380,7 @@ mod tests {
         authority.kill().await.unwrap();
         authority.wait().await.unwrap();
         fs::remove_file(dir.path().join("authority.sock")).unwrap();
-        let mut restarted = start_continuity_authority(dir.path()).await;
+        let mut restarted = start_continuity_authority_mode(dir.path(), false).await;
         for inventory in [
             None,
             Some(b"incomplete\n".as_slice()),
@@ -1375,10 +1389,12 @@ mod tests {
             if let Some(value) = inventory {
                 fs::write(dir.path().join("inventory.txt"), value).unwrap();
             }
-            assert_eq!(
-                authority_line(&mut authority_command(dir.path(), "CAPTURE_INVENTORY").await).await,
-                "INVENTORY_UNKNOWN"
-            );
+            for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+                assert_eq!(
+                    authority_line(&mut authority_command(dir.path(), command).await).await,
+                    "INVENTORY_UNKNOWN"
+                );
+            }
             assert_eq!(
                 authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
                 "DENIED"
@@ -1417,10 +1433,12 @@ mod tests {
             2
         );
         let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
-        assert_eq!(
-            authority_line(&mut authority_command(dir.path(), "CAPTURE_INVENTORY").await).await,
-            "INVENTORY_UNKNOWN"
-        );
+        for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), command).await).await,
+                "INVENTORY_UNKNOWN"
+            );
+        }
         assert_eq!(fs::read(dir.path().join("source.db-wal")).unwrap(), wal);
         assert_eq!(files(&repository), before);
         assert_eq!(read_watermark(&repository).unwrap(), watermark);
