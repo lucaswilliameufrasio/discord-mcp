@@ -67,6 +67,7 @@ Além de `DISCORD_MCP_DB` e `DISCORD_MCP_KEY`, configure:
 | `DISCORD_MCP_CLIENT_ID` | ID de um cliente MCP previamente registrado pelo operador. |
 | `DISCORD_MCP_CLIENT_NAME` | Nome do cliente mostrado no consentimento. |
 | `DISCORD_MCP_CLIENT_REDIRECT` | URI de retorno exata desse cliente. |
+| `DISCORD_MCP_METRICS_RETENTION_DAYS` | Retenção de métricas, entre 1 e 365 dias; padrão 30. |
 
 Registre no Discord as URIs de callback formadas por sua origem pública e
 `/oauth/discord/callback` e `/admin/discord/callback`. O recurso MCP será a
@@ -87,9 +88,25 @@ qualquer outra conta não concede administração. A sessão administrativa expi
 após 30 minutos e termina ao reiniciar o servidor ou sair; mudanças exigem uma
 requisição da mesma origem. A visão geral apresenta contagens reais do banco no
 momento da consulta: canais, usuários com concessões, permissões de leitura e
-envio e tokens MCP não expirados. Tokens não expirados não são conexões ativas;
-tráfego, falhas, saúde e auditoria ainda não são coletados. A criação de canais
-ainda é feita na interface local.
+envio e tokens MCP não expirados. Tokens não expirados não são conexões ativas.
+A criação de canais ainda é feita na interface local.
+
+Em `/admin/observability`, a conta administradora pode consultar as últimas 24
+horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
+envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,
+sem conteúdo, credenciais ou identificadores de usuário e canal. As falhas das
+ferramentas incluem negação de acesso, validação e erros do Discord; não são
+equivalentes a falhas HTTP. O tempo médio é medido até a produção da resposta
+HTTP estar pronta, antes da gravação da própria métrica e não até o término da
+transmissão do corpo; cada amostra é limitada a 10 minutos.
+
+A coleta é de melhor esforço e pode omitir operações canceladas ou gravações
+que falharam. Um aviso aparece se uma falha de gravação for detectada durante a
+execução atual; ele não sobrevive ao reinício. A limpeza da retenção ocorre na
+inicialização e quando um novo evento é gravado: dados antigos podem permanecer
+em um servidor ocioso até o próximo evento ou reinício. A coleta não cobre stdio,
+OAuth, interface administrativa nem a saúde do Discord. Auditoria ainda não está
+implementada.
 
 Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
 segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;

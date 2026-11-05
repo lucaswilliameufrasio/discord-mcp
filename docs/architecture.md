@@ -68,6 +68,9 @@ acesso limitado ao contexto e às permissões de cada pessoa:
   integrações, volume e falhas de operações, latência e limites do Discord,
   conforme dados efetivamente coletados. Deve diferenciar indisponibilidade de
   dados de ausência de erros e permitir filtrar por período e integração.
+  A implementação atual agrega por minuto apenas requisições MCP HTTP e
+  resultados das ferramentas; apresenta as últimas 24 horas, de melhor esforço.
+  Não coleta saúde, limites Discord, tráfego stdio/OAuth nem filtros avançados.
 * **Auditoria:** histórico consultável de ações relevantes, como configuração
   de canais, mudanças de permissões, logins e tentativas de acesso ou operação.
   Os registros devem identificar ator, ação, alvo, horário e resultado quando

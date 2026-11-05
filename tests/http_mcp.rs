@@ -38,6 +38,7 @@ async fn streamable_http_authenticates_each_call_and_enforces_user_channel_actio
             database_path: db,
             encryption_key: key,
             resource: resource.clone(),
+            metrics: discord_mcp::http_auth::MetricsState::default(),
         },
         public_origin: origin.clone(),
         client_id: "client".into(),
@@ -214,5 +215,11 @@ async fn streamable_http_authenticates_each_call_and_enforces_user_channel_actio
         .status(),
         401
     );
+    let summary = store
+        .operational_summary(now.saturating_sub(60), now + 60)
+        .unwrap();
+    assert_eq!((summary.http_requests, summary.http_failures), (10, 4));
+    assert_eq!((summary.send_completed, summary.send_failures), (2, 2));
+    assert_eq!((summary.read_completed, summary.read_failures), (4, 4));
     server.abort();
 }

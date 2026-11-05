@@ -46,10 +46,19 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         &discord_secret,
         &format!("{origin}/admin/discord/callback"),
     )?;
+    let retention_days = match std::env::var("DISCORD_MCP_METRICS_RETENTION_DAYS") {
+        Ok(value) => value
+            .parse::<u16>()
+            .map_err(|_| "invalid metrics retention")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(_) => return Err("invalid metrics retention".into()),
+    };
+    let metrics = discord_mcp::http_auth::MetricsState::new(retention_days)?;
     let auth = AuthState {
         database_path: storage.path.clone(),
         encryption_key: storage.key,
         resource: format!("{origin}/mcp"),
+        metrics,
     };
     let admin = AdminConfig {
         auth: auth.clone(),
@@ -65,7 +74,14 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         redirect_uri: required("DISCORD_MCP_CLIENT_REDIRECT")?,
         discord,
     };
-    storage.open()?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )?;
+    storage
+        .open()?
+        .prune_operational_metrics(now, retention_days)?;
     let router = http_mcp::router(config)?.merge(admin_web::router(admin)?);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!(

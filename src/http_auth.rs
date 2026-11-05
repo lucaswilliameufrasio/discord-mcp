@@ -2,7 +2,11 @@
 //! No network listener or OAuth endpoints are enabled by this module.
 use std::{
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -12,7 +16,55 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::channels::{Channel, ChannelAction, ChannelStore, StoreError, valid_resource};
+use crate::channels::{
+    Channel, ChannelAction, ChannelStore, OperationalEvent, StoreError, valid_resource,
+};
+
+#[derive(Clone)]
+pub struct MetricsState {
+    retention_days: u16,
+    degraded: Arc<AtomicBool>,
+}
+
+impl Default for MetricsState {
+    fn default() -> Self {
+        Self {
+            retention_days: 30,
+            degraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl MetricsState {
+    pub fn new(retention_days: u16) -> Result<Self, &'static str> {
+        if !(1..=365).contains(&retention_days) {
+            return Err("metrics retention must be between 1 and 365 days");
+        }
+        Ok(Self {
+            retention_days,
+            degraded: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    pub fn record(&self, auth: &AuthState, event: OperationalEvent) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|v| i64::try_from(v.as_secs()).ok());
+        let result =
+            now.ok_or(StoreError::Storage).and_then(|now| {
+                ChannelStore::open(&auth.database_path, &auth.encryption_key)?
+                    .record_operational_event(now, self.retention_days, event)
+            });
+        if result.is_err() {
+            self.degraded.store(true, Ordering::Relaxed);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -20,6 +72,7 @@ pub struct AuthState {
     pub encryption_key: [u8; 32],
     /// The fixed resource identifier configured by the server operator.
     pub resource: String,
+    pub metrics: MetricsState,
 }
 
 #[derive(Clone)]
@@ -45,9 +98,24 @@ impl AuthenticatedUser {
 
 pub async fn authenticate(
     State(state): State<AuthState>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
+    let start = Instant::now();
+    let response = authenticate_inner(&state, request, next).await;
+    let failed = response.status().is_client_error() || response.status().is_server_error();
+    let response_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    state.metrics.record(
+        &state,
+        OperationalEvent::Http {
+            failed,
+            response_ms,
+        },
+    );
+    response
+}
+
+async fn authenticate_inner(state: &AuthState, mut request: Request, next: Next) -> Response {
     if request
         .headers()
         .get_all(header::AUTHORIZATION)

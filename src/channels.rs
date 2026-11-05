@@ -40,6 +40,25 @@ pub struct Overview {
     pub unexpired_tokens: i64,
 }
 
+/// Fixed aggregate types. No caller-supplied labels or payloads are stored.
+pub enum OperationalEvent {
+    Http { failed: bool, response_ms: u64 },
+    Send { failed: bool },
+    Read { failed: bool },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OperationalSummary {
+    pub buckets: i64,
+    pub http_requests: i64,
+    pub http_failures: i64,
+    pub response_ms_sum: i64,
+    pub send_completed: i64,
+    pub send_failures: i64,
+    pub read_completed: i64,
+    pub read_failures: i64,
+}
+
 /// Inputs already validated against a registered client and a consented login.
 pub struct AuthorizationGrant<'a> {
     pub user_id: &'a str,
@@ -161,6 +180,21 @@ impl ChannelStore {
             can_read INTEGER NOT NULL CHECK(can_read IN (0, 1)),
             can_send INTEGER NOT NULL CHECK(can_send IN (0, 1)),
             PRIMARY KEY (user_id, channel_name)
+        );",
+            )
+            .map_err(|_| StoreError::Storage)?;
+        store
+            .db
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS operational_metrics (
+            minute INTEGER PRIMARY KEY NOT NULL,
+            http_requests INTEGER NOT NULL DEFAULT 0,
+            http_failures INTEGER NOT NULL DEFAULT 0,
+            response_ms_sum INTEGER NOT NULL DEFAULT 0,
+            send_completed INTEGER NOT NULL DEFAULT 0,
+            send_failures INTEGER NOT NULL DEFAULT 0,
+            read_completed INTEGER NOT NULL DEFAULT 0,
+            read_failures INTEGER NOT NULL DEFAULT 0
         );",
             )
             .map_err(|_| StoreError::Storage)?;
@@ -423,6 +457,80 @@ impl ChannelStore {
                 },
             )
             .map_err(|_| StoreError::Storage)
+    }
+
+    /// Aggregates only fixed counters and response-header latency, never request content.
+    pub fn record_operational_event(
+        &self,
+        now: i64,
+        retention_days: u16,
+        event: OperationalEvent,
+    ) -> Result<(), StoreError> {
+        if now < 0 || !(1..=365).contains(&retention_days) {
+            return Err(StoreError::InvalidInput);
+        }
+        let minute = now / 60;
+        let cutoff = now.saturating_sub(i64::from(retention_days) * 86400) / 60;
+        let (requests, failures, latency, sends, send_failures, reads, read_failures) = match event
+        {
+            OperationalEvent::Http {
+                failed,
+                response_ms,
+            } => (
+                1,
+                i64::from(failed),
+                i64::try_from(response_ms.min(600_000)).map_err(|_| StoreError::InvalidInput)?,
+                0,
+                0,
+                0,
+                0,
+            ),
+            OperationalEvent::Send { failed } => (0, 0, 0, 1, i64::from(failed), 0, 0),
+            OperationalEvent::Read { failed } => (0, 0, 0, 0, 0, 1, i64::from(failed)),
+        };
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        transaction.execute("INSERT INTO operational_metrics(minute,http_requests,http_failures,response_ms_sum,send_completed,send_failures,read_completed,read_failures) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+            ON CONFLICT(minute) DO UPDATE SET http_requests=http_requests+excluded.http_requests,http_failures=http_failures+excluded.http_failures,response_ms_sum=response_ms_sum+excluded.response_ms_sum,send_completed=send_completed+excluded.send_completed,send_failures=send_failures+excluded.send_failures,read_completed=read_completed+excluded.read_completed,read_failures=read_failures+excluded.read_failures", params![minute,requests,failures,latency,sends,send_failures,reads,read_failures]).map_err(|_| StoreError::Storage)?;
+        transaction
+            .execute(
+                "DELETE FROM operational_metrics WHERE minute < ?1",
+                [cutoff],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    /// The requested range is rounded down to minute buckets.
+    pub fn operational_summary(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<OperationalSummary, StoreError> {
+        if start < 0 || end < start {
+            return Err(StoreError::InvalidInput);
+        }
+        self.db.query_row("SELECT COUNT(*),COALESCE(SUM(http_requests),0),COALESCE(SUM(http_failures),0),COALESCE(SUM(response_ms_sum),0),COALESCE(SUM(send_completed),0),COALESCE(SUM(send_failures),0),COALESCE(SUM(read_completed),0),COALESCE(SUM(read_failures),0) FROM operational_metrics WHERE minute>=?1 AND minute<=?2", params![start / 60,end / 60], |row| Ok(OperationalSummary { buckets: row.get(0)?, http_requests: row.get(1)?, http_failures: row.get(2)?, response_ms_sum: row.get(3)?, send_completed: row.get(4)?, send_failures: row.get(5)?, read_completed: row.get(6)?, read_failures: row.get(7)? })).map_err(|_| StoreError::Storage)
+    }
+
+    pub fn prune_operational_metrics(
+        &self,
+        now: i64,
+        retention_days: u16,
+    ) -> Result<(), StoreError> {
+        if now < 0 || !(1..=365).contains(&retention_days) {
+            return Err(StoreError::InvalidInput);
+        }
+        let cutoff = now.saturating_sub(i64::from(retention_days) * 86400) / 60;
+        self.db
+            .execute(
+                "DELETE FROM operational_metrics WHERE minute < ?1",
+                [cutoff],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        Ok(())
     }
 
     /// Resolve authorization and the destination from the same database snapshot.

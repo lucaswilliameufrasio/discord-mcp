@@ -16,7 +16,7 @@ use rmcp::{
 
 use crate::{
     bot::BotClient,
-    channels::{Channel, ChannelAction},
+    channels::{Channel, ChannelAction, OperationalEvent},
     http_auth::{AuthState, AuthenticatedUser, authenticate},
     oauth_web::{OAuthWebConfig, router as oauth_router},
     webhook::WebhookClient,
@@ -69,30 +69,40 @@ impl HttpMcp {
         Parameters(input): Parameters<SendMessage>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Some(user) = Self::identity(&context) else {
-            return Self::denied();
-        };
-        let channel = match user.authorized_channel(&self.auth, &input.channel, ChannelAction::Send)
-        {
-            Ok(channel) => channel,
-            Err(_) => return Self::denied(),
-        };
-        let result = match channel {
-            Channel::Webhook(webhook) => self
-                .webhook
-                .send(&webhook, &input.content)
-                .await
-                .map_err(|error| error.to_string()),
-            Channel::Bot(bot) => self
-                .bot
-                .send(&bot, &input.content)
-                .await
-                .map_err(|error| error.to_string()),
-        };
-        match result {
-            Ok(()) => CallToolResult::success(vec![ContentBlock::text("Message sent.")]),
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(error)]),
+        let response = async {
+            let Some(user) = Self::identity(&context) else {
+                return Self::denied();
+            };
+            let channel =
+                match user.authorized_channel(&self.auth, &input.channel, ChannelAction::Send) {
+                    Ok(channel) => channel,
+                    Err(_) => return Self::denied(),
+                };
+            let result = match channel {
+                Channel::Webhook(webhook) => self
+                    .webhook
+                    .send(&webhook, &input.content)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Channel::Bot(bot) => self
+                    .bot
+                    .send(&bot, &input.content)
+                    .await
+                    .map_err(|error| error.to_string()),
+            };
+            match result {
+                Ok(()) => CallToolResult::success(vec![ContentBlock::text("Message sent.")]),
+                Err(error) => CallToolResult::error(vec![ContentBlock::text(error)]),
+            }
         }
+        .await;
+        self.auth.metrics.record(
+            &self.auth,
+            OperationalEvent::Send {
+                failed: response.is_error.unwrap_or(false),
+            },
+        );
+        response
     }
 
     #[tool(description = "Read recent messages from an authorized Discord bot channel")]
@@ -101,26 +111,36 @@ impl HttpMcp {
         Parameters(input): Parameters<ReadMessages>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Some(user) = Self::identity(&context) else {
-            return Self::denied();
-        };
-        let channel = match user.authorized_channel(&self.auth, &input.channel, ChannelAction::Read)
-        {
-            Ok(channel) => channel,
-            Err(_) => return Self::denied(),
-        };
-        let Channel::Bot(bot) = channel else {
-            return Self::denied();
-        };
-        match self.bot.read(&bot, input.limit.unwrap_or(10)).await {
-            Ok(messages) => match rmcp::serde_json::to_string(&messages) {
-                Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
-                Err(_) => {
-                    CallToolResult::error(vec![ContentBlock::text("Unable to encode messages.")])
-                }
-            },
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+        let response = async {
+            let Some(user) = Self::identity(&context) else {
+                return Self::denied();
+            };
+            let channel =
+                match user.authorized_channel(&self.auth, &input.channel, ChannelAction::Read) {
+                    Ok(channel) => channel,
+                    Err(_) => return Self::denied(),
+                };
+            let Channel::Bot(bot) = channel else {
+                return Self::denied();
+            };
+            match self.bot.read(&bot, input.limit.unwrap_or(10)).await {
+                Ok(messages) => match rmcp::serde_json::to_string(&messages) {
+                    Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+                    Err(_) => CallToolResult::error(vec![ContentBlock::text(
+                        "Unable to encode messages.",
+                    )]),
+                },
+                Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+            }
         }
+        .await;
+        self.auth.metrics.record(
+            &self.auth,
+            OperationalEvent::Read {
+                failed: response.is_error.unwrap_or(false),
+            },
+        );
+        response
     }
 }
 

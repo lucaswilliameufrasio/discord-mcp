@@ -59,6 +59,7 @@ pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
     Ok(Router::new()
         .route("/admin", get(home))
         .route("/admin/channels", get(channels))
+        .route("/admin/observability", get(observability))
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -275,12 +276,56 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
         ""
     };
     page(format!(
-        r#"<header><p>Discord MCP / Administração</p><h1>Visão geral</h1><p>Resumo do cadastro e dos acessos. Atualizado em <time datetime="{timestamp_iso}">{timestamp}</time>; recarregue para atualizar.</p></header><section aria-labelledby="summary"><h2 id="summary">Configuração e acesso</h2><dl class="metrics"><div><dt>Canais cadastrados</dt><dd>{}</dd></div><div><dt>Usuários com permissões</dt><dd>{}</dd></div><div><dt>Concessões de leitura</dt><dd>{}</dd></div><div><dt>Concessões de envio</dt><dd>{}</dd></div><div><dt>Tokens MCP não expirados</dt><dd>{}</dd></div></dl>{empty}<p>Usuários são distintos; concessões contam pares de usuário e canal. Tokens não expirados não indicam conexões ativas.</p><p><a href="/admin/channels">Gerenciar permissões dos canais</a></p></section><section aria-labelledby="monitor"><h2 id="monitor">Monitoramento e auditoria</h2><p>Dados de tráfego, falhas, saúde do Discord e histórico de auditoria ainda não são coletados. Nenhum estado de saúde é inferido a partir desta visão.</p></section><form method="post" action="/admin/logout"><button>Sair</button></form>"#,
+        r#"<header><p>Discord MCP / Administração</p><h1>Visão geral</h1><p>Resumo do cadastro e dos acessos. Atualizado em <time datetime="{timestamp_iso}">{timestamp}</time>; recarregue para atualizar.</p></header><section aria-labelledby="summary"><h2 id="summary">Configuração e acesso</h2><dl class="metrics"><div><dt>Canais cadastrados</dt><dd>{}</dd></div><div><dt>Usuários com permissões</dt><dd>{}</dd></div><div><dt>Concessões de leitura</dt><dd>{}</dd></div><div><dt>Concessões de envio</dt><dd>{}</dd></div><div><dt>Tokens MCP não expirados</dt><dd>{}</dd></div></dl>{empty}<p>Usuários são distintos; concessões contam pares de usuário e canal. Tokens não expirados não indicam conexões ativas.</p><p><a href="/admin/channels">Gerenciar permissões dos canais</a></p></section><section aria-labelledby="monitor"><h2 id="monitor">Monitoramento e auditoria</h2><p><a href="/admin/observability">Consultar tráfego e falhas MCP HTTP</a></p><p>A saúde do Discord e o histórico de auditoria ainda não são coletados. Nenhum estado de saúde é inferido a partir desta visão.</p></section><form method="post" action="/admin/logout"><button>Sair</button></form>"#,
         metrics.channels,
         metrics.permitted_users,
         metrics.read_grants,
         metrics.send_grants,
         metrics.unexpired_tokens
+    ))
+}
+
+async fn observability(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if !authorized(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    let now = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|v| i64::try_from(v.as_secs()).ok())
+    {
+        Some(now) => now,
+        None => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let summary = match store(&app)
+        .and_then(|store| store.operational_summary(now.saturating_sub(86_400).max(0), now))
+    {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let warning = if app.config.auth.metrics.is_degraded() {
+        "<p role=\"alert\">A coleta falhou nesta execução; os dados podem estar incompletos.</p>"
+    } else {
+        ""
+    };
+    if summary.buckets == 0 {
+        return page(format!(
+            "<p><a href=\"/admin\">Voltar à visão geral</a></p><h1>Monitoramento</h1>{warning}<p>Nenhum dado de MCP HTTP registrado no intervalo. A ausência de dados não comprova ausência de tráfego.</p>"
+        ));
+    }
+    let average = if summary.http_requests > 0 {
+        format!("{} ms", summary.response_ms_sum / summary.http_requests)
+    } else {
+        "Indisponível".into()
+    };
+    page(format!(
+        r#"<p><a href="/admin">Voltar à visão geral</a></p><h1>Monitoramento</h1>{warning}<p>Últimas 24 horas, agrupadas por minuto e atualizadas ao recarregar. Coleta de melhor esforço: dados anteriores ao início da coleta, operações canceladas e falhas de gravação podem estar ausentes.</p><dl class="metrics"><div><dt>Requisições MCP HTTP concluídas</dt><dd>{}</dd></div><div><dt>Respostas HTTP 4xx/5xx</dt><dd>{}</dd></div><div><dt>Tempo médio até resposta HTTP</dt><dd>{average}</dd></div><div><dt>Envios concluídos</dt><dd>{}</dd></div><div><dt>Falhas de envio</dt><dd>{}</dd></div><div><dt>Leituras concluídas</dt><dd>{}</dd></div><div><dt>Falhas de leitura</dt><dd>{}</dd></div></dl><p>Requisições cobrem apenas o endpoint MCP HTTP. Falhas HTTP incluem autenticação e protocolo; falhas das ferramentas incluem negação, validação e erros do Discord. Tempo é medido até a resposta HTTP, não até o fim do corpo, limitado a 10 minutos por requisição. Não contém conteúdo, credenciais ou identificação de usuários e canais.</p>"#,
+        summary.http_requests,
+        summary.http_failures,
+        summary.send_completed,
+        summary.send_failures,
+        summary.read_completed,
+        summary.read_failures
     ))
 }
 
@@ -530,6 +575,7 @@ mod tests {
                 database_path: db,
                 encryption_key: key,
                 resource: format!("{origin}/mcp"),
+                metrics: crate::http_auth::MetricsState::default(),
             },
             public_origin: origin.clone(),
             admin_user_id: "123".into(),
@@ -546,6 +592,11 @@ mod tests {
             .unwrap();
         let channel = format!("{origin}/admin/channel?name=alerts");
         let overview_url = format!("{origin}/admin");
+        let metrics_url = format!("{origin}/admin/observability");
+        assert_eq!(
+            client.get(&metrics_url).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
         let guest = client
             .get(&overview_url)
             .send()
@@ -640,6 +691,53 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        let empty = client
+            .get(&metrics_url)
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(empty.contains("Nenhum dado de MCP HTTP registrado"));
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        store
+            .record_operational_event(
+                now,
+                30,
+                crate::channels::OperationalEvent::Http {
+                    failed: true,
+                    response_ms: 12,
+                },
+            )
+            .unwrap();
+        store
+            .record_operational_event(
+                now,
+                30,
+                crate::channels::OperationalEvent::Send { failed: true },
+            )
+            .unwrap();
+        let metrics = client
+            .get(&metrics_url)
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(metrics.contains("<dt>Requisições MCP HTTP concluídas</dt><dd>1</dd>"));
+        assert!(metrics.contains("<dt>Respostas HTTP 4xx/5xx</dt><dd>1</dd>"));
+        assert!(metrics.contains("<dt>Falhas de envio</dt><dd>1</dd>"));
+        assert!(!metrics.contains("synthetic-bot-token"));
         let endpoint = format!("{origin}/admin/permissions");
         let post = || {
             client
@@ -705,7 +803,7 @@ mod tests {
         assert!(overview.contains("<dt>Concessões de envio</dt><dd>0</dd>"));
         assert!(overview.contains("Tokens não expirados não indicam conexões ativas"));
         assert!(!overview.contains("synthetic-bot-token"));
-        assert!(overview.contains("Dados de tráfego, falhas, saúde do Discord"));
+        assert!(overview.contains("/admin/observability"));
         let page = client
             .get(&channel)
             .header(header::COOKIE, &session)
