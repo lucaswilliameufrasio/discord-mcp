@@ -622,6 +622,23 @@ no repositório corrompido nem um procedimento aprovado de reparo. O teste não
 modifica ou remove o delta corrompido original. A morte continua no hook da
 API de spool direta, não no hook interno de `capture_once`.
 
+Um teste separado cria snapshot TXID 1 e deltas TXID 2 e 3 a partir de SQLite
+real com linhas sintéticas; após truncar apenas o delta 3, o restore direto de
+TXID 2 do mesmo repositório falha sem criar destino. O teste copia os arquivos
+conhecidos do prefixo 1–2 para um repositório temporário novo e pede à biblioteca
+o restore de TXID 2: as duas linhas esperadas e `integrity_check` são verificados.
+Truncar então o delta **na cópia isolada** faz o restore falhar sem publicar
+destino. O teste compara snapshot, delta anterior, delta corrompido, watermark e
+WAL originais antes e depois e confirma as três linhas na fonte.
+
+A seleção do prefixo é conhecida antecipadamente pelo teste; não há descoberta
+automática do último ponto íntegro, nem prova de que seja o ponto mais recente
+ou autorizado. O watermark original permanece em TXID 3 e não é reparado. A
+cópia e o restore isolados são experimento sintético, não runbook para spool
+real, não qualificam cadeia parcial arbitrária, recursos limitados, metadados,
+identidade, credenciais ou recuperação de host. Nenhum arquivo do repositório
+corrompido é removido para obter esse resultado.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

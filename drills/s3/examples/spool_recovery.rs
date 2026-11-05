@@ -336,6 +336,95 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn isolated_verified_prefix_recovers_earlier_txid_without_modifying_corrupt_spool() {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let repository = dir.path().join("repository");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &repository).unwrap();
+        db.execute("INSERT INTO records VALUES(2, 'earlier')", [])
+            .unwrap();
+        assert_eq!(
+            capture_once(&source, &repository, &IsolatedGate)
+                .unwrap()
+                .txid,
+            2
+        );
+        db.execute("INSERT INTO records VALUES(3, 'later')", [])
+            .unwrap();
+        assert_eq!(
+            capture_once(&source, &repository, &IsolatedGate)
+                .unwrap()
+                .txid,
+            3
+        );
+        let snapshot_path = ltx_path(&repository, 1, 1);
+        let earlier_path = ltx_path(&repository, 2, 2);
+        let later_path = ltx_path(&repository, 3, 3);
+        let snapshot_bytes = fs::read(&snapshot_path).unwrap();
+        let earlier_bytes = fs::read(&earlier_path).unwrap();
+        let later_bytes = fs::read(&later_path).unwrap();
+        assert!(later_bytes.len() > 1);
+        fs::write(&later_path, &later_bytes[..later_bytes.len() / 2]).unwrap();
+        let corrupted_bytes = fs::read(&later_path).unwrap();
+        let watermark = read_watermark(&repository).unwrap();
+        assert_eq!(watermark.txid, 3);
+        let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        let blocked = dir.path().join("blocked.db");
+        assert!(restore_to_target(&repository, &blocked, RestoreTarget::Txid(2)).is_err());
+        assert!(!blocked.exists());
+
+        // Only the known test fixture's prefix is copied. The original spool
+        // is never edited as a means of choosing an earlier point.
+        let isolated = dir.path().join("isolated-prefix");
+        ensure_repository(&isolated).unwrap();
+        for (txid, bytes) in [(1, &snapshot_bytes), (2, &earlier_bytes)] {
+            let path = ltx_path(&isolated, txid, txid);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let restored = dir.path().join("restored-earlier.db");
+        restore_to_target(&isolated, &restored, RestoreTarget::Txid(2)).unwrap();
+        let restored_db = Connection::open(&restored).unwrap();
+        let rows: Vec<(i64, String)> = restored_db
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, "base".to_string()), (2, "earlier".to_string())]
+        );
+        let integrity: String = restored_db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let isolated_delta = ltx_path(&isolated, 2, 2);
+        fs::write(&isolated_delta, &earlier_bytes[..earlier_bytes.len() / 2]).unwrap();
+        let bad_prefix_output = dir.path().join("bad-prefix.db");
+        assert!(restore_to_target(&isolated, &bad_prefix_output, RestoreTarget::Txid(2)).is_err());
+        assert!(!bad_prefix_output.exists());
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_bytes);
+        assert_eq!(fs::read(&earlier_path).unwrap(), earlier_bytes);
+        assert_eq!(fs::read(&later_path).unwrap(), corrupted_bytes);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        assert_eq!(fs::read(dir.path().join("source.db-wal")).unwrap(), wal);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn independent_image_witness_blocks_stale_source_before_spool_mutation() {
         use rusqlite::Connection;
         use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
