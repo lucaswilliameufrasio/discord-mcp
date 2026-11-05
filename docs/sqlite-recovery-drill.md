@@ -523,6 +523,22 @@ como completa continua inseguro. O caso cobre apenas uma árvore sintética e
 depende de `pidfd_open` e `pidfd_send_signal`; não constitui fencing, controle
 de processos externos ou reconciliação operacional.
 
+Uma fixture de inventário investiga a janela entre lançar e registrar um
+escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
+subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de
+registrá-lo. O escritor continua com transação aberta, enquanto uma verificação
+sintética recusa abertura por causa da intenção pendente. Após o commit e a
+saída do escritor, o marcador continua pendente e a verificação segue fechada.
+Uma interrupção injetada antes do `fsync` também não lança escritor na fixture.
+
+Isso demonstra recusa para uma janela específica, **não prova completude**:
+o teste pressupõe um lançador único que controla todos os escritores, marcador
+pré-existente e íntegro e sucesso de `fsync` antes do lançamento. Não há
+protocolo de registro/conclusão ou reconstrução após reinício, proteção contra
+escritores externos/descendentes, fsync do diretório, falha de armazenamento,
+rollback ou perda de energia. O guardião simplificado aceita `clean` sem prova
+independente; esse controle da fixture não é autorização de abertura real.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;

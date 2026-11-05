@@ -169,6 +169,46 @@ def descendant_writer(database):
     connection.close()
 
 
+def inventory_writer(socket_fd, database):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    sock.sendall(b"T")
+    if sock.recv(1) != b"C":
+        raise RuntimeError("expected commit")
+    connection.commit()
+    connection.close()
+    sock.close()
+
+
+def inventory_launcher(socket_fd, directory, mode):
+    # This fixture assumes this file was initialized previously and that this
+    # launcher is the only entity permitted to start or admit writers.
+    state_path = os.path.join(directory, "inventory-state")
+    with open(state_path, "r+b", buffering=0) as state:
+        state.seek(0)
+        state.write(b"launching\n")
+        state.truncate()
+        if mode == "before_sync":
+            print("NO_LAUNCH", flush=True)
+            return
+        os.fsync(state.fileno())
+        print("INTENT_SYNCED", flush=True)
+        if sys.stdin.readline().strip() != "spawn":
+            raise RuntimeError("expected spawn")
+        worker = subprocess.Popen(
+            [sys.executable, __file__, "inventory_writer", str(socket_fd),
+             os.path.join(directory, "synthetic.db")],
+            pass_fds=(socket_fd,), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print(f"SPAWNED {worker.pid}", flush=True)
+        # Deliberately stop before persisting a writer registration.
+        sys.stdin.readline()
+
+
 def admitted_sqlite_writer(fd, socket_fd, database):
     sock = socket.socket(fileno=socket_fd)
     sock.settimeout(5)
@@ -296,6 +336,84 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+                         "Linux pidfd APIs are required")
+    def test_pending_launch_refuses_incomplete_inventory_after_launcher_death(self):
+        for mode in ("before_sync", "after_spawn"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                state_path = os.path.join(directory, "inventory-state")
+                database = os.path.join(directory, "synthetic.db")
+                with open(state_path, "wb") as state:
+                    state.write(b"clean\n")
+                    state.flush()
+                    os.fsync(state.fileno())
+                with sqlite3.connect(database) as db:
+                    db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+                client, peer = socket.socketpair()
+                client.settimeout(5)
+                launcher = subprocess.Popen(
+                    [sys.executable, __file__, "inventory_launcher", str(peer.fileno()), directory, mode],
+                    pass_fds=(peer.fileno(),), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                )
+                peer.close()
+                writer_handle = None
+                try:
+                    if mode == "before_sync":
+                        self.assertEqual(line(launcher.stdout), "NO_LAUNCH")
+                        self.assertEqual(launcher.wait(timeout=5), 0)
+                        self.assertEqual(client.recv(1), b"")
+                    else:
+                        self.assertEqual(line(launcher.stdout), "INTENT_SYNCED")
+                        launcher.stdin.write("spawn\n")
+                        launcher.stdin.flush()
+                        announcement = line(launcher.stdout).split()
+                        self.assertEqual(announcement[0], "SPAWNED")
+                        writer_handle = os.pidfd_open(int(announcement[1]))
+                        self.assertEqual(client.recv(1), b"T")
+                        launcher.kill()
+                        launcher.wait(timeout=5)
+                    # No registration or safe completion was ever recorded.
+                    with open(state_path, "rb") as state:
+                        self.assertEqual(state.read(), b"launching\n")
+                    state_fd = os.open(state_path, os.O_RDONLY)
+                    try:
+                        guard = subprocess.run(
+                            [sys.executable, __file__, "guard", str(state_fd)],
+                            pass_fds=(state_fd,), capture_output=True, text=True,
+                            timeout=5, check=True,
+                        )
+                    finally:
+                        os.close(state_fd)
+                    self.assertEqual(guard.stdout.strip(), "CLOSED")
+                    if writer_handle is not None:
+                        self.assertFalse(select.select([writer_handle], [], [], 0)[0])
+                        client.sendall(b"C")
+                        self.assertTrue(select.select([writer_handle], [], [], 5)[0])
+                        with sqlite3.connect(database) as db:
+                            self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+                        with open(state_path, "rb") as state:
+                            self.assertEqual(state.read(), b"launching\n")
+                        state_fd = os.open(state_path, os.O_RDONLY)
+                        try:
+                            guard = subprocess.run(
+                                [sys.executable, __file__, "guard", str(state_fd)],
+                                pass_fds=(state_fd,), capture_output=True, text=True,
+                                timeout=5, check=True,
+                            )
+                        finally:
+                            os.close(state_fd)
+                        self.assertEqual(guard.stdout.strip(), "CLOSED")
+                finally:
+                    client.close()
+                    if launcher.poll() is None:
+                        launcher.kill()
+                    launcher.communicate(timeout=5)
+                    if writer_handle is not None:
+                        if not select.select([writer_handle], [], [], 0)[0]:
+                            signal.pidfd_send_signal(writer_handle, signal.SIGKILL)
+                        os.close(writer_handle)
+
     @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
                          "Linux pidfd APIs are required")
     def test_multiple_writers_and_unknown_descendant_fail_closed(self):
@@ -1215,7 +1333,11 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 7 and sys.argv[1] == "multi_transition":
+    if len(sys.argv) == 5 and sys.argv[1] == "inventory_launcher":
+        inventory_launcher(int(sys.argv[2]), sys.argv[3], sys.argv[4])
+    elif len(sys.argv) == 4 and sys.argv[1] == "inventory_writer":
+        inventory_writer(int(sys.argv[2]), sys.argv[3])
+    elif len(sys.argv) >= 7 and sys.argv[1] == "multi_transition":
         transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
                              [int(value) for value in sys.argv[7:]], sys.argv[6] == "1")
     elif len(sys.argv) == 3 and sys.argv[1] == "spawn_descendant":
