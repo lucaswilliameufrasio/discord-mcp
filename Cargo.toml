@@ -1,0 +1,8 @@
+[package]
+name = "discord-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
