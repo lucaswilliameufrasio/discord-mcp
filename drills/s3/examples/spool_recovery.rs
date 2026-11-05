@@ -237,6 +237,88 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn missing_uncheckpointed_wal_can_reconcile_to_stale_image() {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
+        use sqlite_replication_wal::translate::translate_wal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let stale = dir.path().join("incomplete-copy.db");
+        let repository = dir.path().join("repository");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &repository).unwrap();
+        let base = recover(&repository, &[]).unwrap();
+        db.execute("INSERT INTO records VALUES(2, 'committed-in-wal')", [])
+            .unwrap();
+        let wal_path = dir.path().join("source.db-wal");
+        let wal = fs::read(&wal_path).unwrap();
+        assert!(wal.len() > 32);
+        let (transactions, state) = translate_wal(&wal, &base, 200).unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert!(
+            publish_transactions(&repository, &transactions, &state, |point, _| {
+                if point == FaultPoint::AfterLtxPublish {
+                    return Err(io::Error::other("synthetic interruption"));
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+        let published = fs::read(ltx_path(&repository, 2, 2)).unwrap();
+        let source_before: i64 = db
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_before, 2);
+        // Deliberately incomplete copy to model a lost WAL. Never modify the
+        // original source or its live WAL and never use this as a backup method.
+        fs::copy(&source, &stale).unwrap();
+        assert!(!dir.path().join("incomplete-copy.db-wal").exists());
+        let stale_db = Connection::open(&stale).unwrap();
+        let stale_count: i64 = stale_db
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stale_count, 1);
+        drop(stale_db);
+        let capture = capture_once(&stale, &repository, &IsolatedGate).unwrap();
+        // A successful reconciliation to the stale image does not detect loss.
+        assert_eq!(capture.txid, 3);
+        assert_eq!(read_watermark(&repository).unwrap().txid, 3);
+        assert_eq!(fs::read(ltx_path(&repository, 2, 2)).unwrap(), published);
+        let retained = dir.path().join("retained-txid-2.db");
+        restore_to_target(&repository, &retained, RestoreTarget::Txid(2)).unwrap();
+        let retained_db = Connection::open(&retained).unwrap();
+        assert_eq!(
+            retained_db
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let restored = dir.path().join("restored.db");
+        restore_to_target(&repository, &restored, RestoreTarget::Txid(capture.txid)).unwrap();
+        let result = Connection::open(&restored).unwrap();
+        let restored_count: i64 = result
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = result
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(restored_count, 1);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            source_before
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), wal);
+    }
+
+    #[test]
     fn real_sqlite_wal_reconciles_published_delta_and_restores_rows() {
         use rusqlite::Connection;
         use sqlite_replication_core::{RestoreTarget, restore_to_target, snapshot};

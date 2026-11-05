@@ -460,6 +460,28 @@ checkpoint foi bem-sucedido e o gate é o fixture de escritor único, sem
 concorrência. Não há teste de perda de commits não checkpointados nem garantia
 para queda de energia, armazenamento remoto ou banco de aplicação.
 
+#### Perda simulada de WAL com commit não checkpointado
+
+Em um diretório temporário, o teste mantém uma conexão SQLite sintética aberta
+com uma segunda linha confirmada apenas no WAL. Publica no spool o delta TXID 2
+e injeta falha antes de avançar o watermark. Para simular uma visão sem WAL,
+copia somente o arquivo principal para outro caminho novo; não remove nem altera
+o WAL da fonte. A fonte enxerga duas linhas e a cópia incompleta apenas uma.
+
+Na revisão local testada, `capture_once` **retorna sucesso** ao usar a cópia
+incompleta como origem: reconcilia o spool para o estado antigo e avança o
+watermark a TXID 3. O restore TXID 3 passa `integrity_check`, mas contém somente
+uma linha. O LTX TXID 2 permaneceu inalterado e seu restore ainda contém duas
+linhas. O teste compara também a contagem da fonte e os bytes do WAL original,
+que permanecem inalterados. Portanto, essa API não detectou a perda sem evidência
+externa: integridade estrutural e sucesso da captura não comprovam que os commits
+foram preservados. Não usar a cópia incompleta como origem operacional; preservar
+e avaliar pontos anteriores antes de qualquer reconciliação real.
+
+O exercício é uma simulação deliberada com arquivos próprios, não uma perda
+real, nem prova de comportamento sob falha física, execução concorrente ou em
+outras revisões da biblioteca. O gate continua sendo um fixture sem bloqueio.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
