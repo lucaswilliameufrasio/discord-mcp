@@ -423,6 +423,178 @@ mod tests {
         );
     }
 
+    // Research fixture for small, offline synthetic repositories only. It
+    // supports snapshot 1 and single-TXID deltas, not arbitrary LTX layouts.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn inspect_synthetic_prefix(root: &Path) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, restore_to_target};
+        let ltx_dir = root.join("ltx/0");
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(ltx_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("non-UTF8 name"))?;
+            if !name.ends_with(".ltx") {
+                continue;
+            }
+            if !entry.file_type()?.is_file() || ids.len() >= 16 {
+                return Err(io::Error::other("unsupported entry or limit"));
+            }
+            let stem = name.strip_suffix(".ltx").unwrap();
+            let (first, last) = stem
+                .split_once('-')
+                .ok_or_else(|| io::Error::other("invalid name"))?;
+            if first.len() != 16 || first != last {
+                return Err(io::Error::other("unsupported range"));
+            }
+            let id = u64::from_str_radix(first, 16).map_err(io::Error::other)?;
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        if ids.first() != Some(&1) {
+            return Err(io::Error::other("snapshot missing"));
+        }
+        let staging = tempfile::tempdir()?;
+        let staged_repo = staging.path().join("repo");
+        ensure_repository(&staged_repo)?;
+        let mut verified = Vec::new();
+        for id in ids {
+            if id != verified.len() as u64 + 1 {
+                break;
+            }
+            let source = ltx_path(root, id, id);
+            if fs::metadata(&source)?.len() > 16 * 1024 * 1024 {
+                return Err(io::Error::other("fixture file exceeds limit"));
+            }
+            let bytes = fs::read(source)?;
+            let target = ltx_path(&staged_repo, id, id);
+            fs::create_dir_all(target.parent().unwrap())?;
+            fs::write(&target, &bytes)?;
+            let output = staging.path().join(format!("candidate-{id}.db"));
+            if restore_to_target(&staged_repo, &output, RestoreTarget::Txid(id)).is_err() {
+                break;
+            }
+            let db = Connection::open(&output).map_err(io::Error::other)?;
+            let check: String = db
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(io::Error::other)?;
+            if check != "ok" {
+                break;
+            }
+            verified.push((id, bytes));
+        }
+        if verified.is_empty() {
+            return Err(io::Error::other("snapshot is invalid"));
+        }
+        Ok(verified)
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn discover_synthetic_valid_prefix_stops_at_corruption_or_gap() {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let healthy = dir.path().join("healthy");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &healthy).unwrap();
+        for id in 2..=3 {
+            db.execute(
+                "INSERT INTO records(id,value) VALUES(?1,?2)",
+                rusqlite::params![i64::try_from(id).unwrap(), format!("row-{id}")],
+            )
+            .unwrap();
+            assert_eq!(
+                capture_once(&source, &healthy, &IsolatedGate).unwrap().txid,
+                id
+            );
+        }
+        let original: Vec<Vec<u8>> = (1..=3)
+            .map(|id| fs::read(ltx_path(&healthy, id, id)).unwrap())
+            .collect();
+        let watermark = read_watermark(&healthy).unwrap();
+        let source_wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        for (name, expected, mode) in [
+            ("valid", 3, 0),
+            ("corrupt-last", 2, 1),
+            ("corrupt-middle", 1, 2),
+            ("gap-middle", 1, 3),
+            ("corrupt-snapshot", 0, 4),
+        ] {
+            let input = dir.path().join(name);
+            ensure_repository(&input).unwrap();
+            for id in 1..=3 {
+                if mode == 3 && id == 2 {
+                    continue;
+                }
+                let path = ltx_path(&input, id, id);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let mut bytes = original[(id - 1) as usize].clone();
+                if (mode == 1 && id == 3) || (mode == 2 && id == 2) || (mode == 4 && id == 1) {
+                    bytes.truncate(bytes.len() / 2);
+                }
+                fs::write(path, bytes).unwrap();
+            }
+            let before: Vec<Option<Vec<u8>>> = (1..=3)
+                .map(|id| fs::read(ltx_path(&input, id, id)).ok())
+                .collect();
+            let result = inspect_synthetic_prefix(&input);
+            if expected == 0 {
+                assert!(result.is_err());
+                let after: Vec<Option<Vec<u8>>> = (1..=3)
+                    .map(|id| fs::read(ltx_path(&input, id, id)).ok())
+                    .collect();
+                assert_eq!(before, after);
+                continue;
+            }
+            let prefix = result.unwrap();
+            assert_eq!(prefix.last().unwrap().0, expected);
+            let copy = dir.path().join(format!("copy-{name}"));
+            ensure_repository(&copy).unwrap();
+            for (id, bytes) in &prefix {
+                let target = ltx_path(&copy, *id, *id);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(target, bytes).unwrap();
+            }
+            let output = dir.path().join(format!("restored-{name}.db"));
+            restore_to_target(&copy, &output, RestoreTarget::Txid(expected)).unwrap();
+            let restored = Connection::open(output).unwrap();
+            assert_eq!(
+                restored
+                    .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                expected as i64
+            );
+            let after: Vec<Option<Vec<u8>>> = (1..=3)
+                .map(|id| fs::read(ltx_path(&input, id, id)).ok())
+                .collect();
+            assert_eq!(before, after);
+        }
+        for id in 1..=3 {
+            assert_eq!(
+                fs::read(ltx_path(&healthy, id, id)).unwrap(),
+                original[(id - 1) as usize]
+            );
+        }
+        assert_eq!(read_watermark(&healthy).unwrap(), watermark);
+        assert_eq!(
+            fs::read(dir.path().join("source.db-wal")).unwrap(),
+            source_wal
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn independent_image_witness_blocks_stale_source_before_spool_mutation() {

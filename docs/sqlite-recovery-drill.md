@@ -639,6 +639,26 @@ real, não qualificam cadeia parcial arbitrária, recursos limitados, metadados,
 identidade, credenciais ou recuperação de host. Nenhum arquivo do repositório
 corrompido é removido para obter esse resultado.
 
+Uma varredura **somente no fixture de teste** investiga a seleção automática de
+um prefixo: enumera snapshot TXID 1 e deltas de um único TXID, copia cada
+prefixo candidato para diretório temporário externo ao spool e usa restore da
+biblioteca mais `integrity_check` para validá-lo; para na primeira lacuna ou
+falha. Em cadeias sintéticas de três posições, identifica 3 quando íntegra, 2
+com delta 3 truncado e 1 com delta 2 truncado ou ausente. Snapshot truncado é
+recusado. Cada prefixo identificado é restaurado em outro arquivo novo e suas
+linhas são verificadas; os arquivos LTX de entrada e o spool/fonte originais
+são comparados antes e depois.
+
+Esse algoritmo não é ferramenta de produção nem descobre necessariamente o
+último ponto recuperável de um repositório geral: aceita somente snapshot TXID 1
+e arquivos com um TXID por delta, até 16 objetos e 16 MiB por arquivo. Não
+interpreta compactações, múltiplas gerações ou metadados remotos, nem protege
+contra alteração concorrente, TOCTOU, substituição de diretórios, armazenamento
+hostil ou expansão descomprimida; limites de entrada não são limites completos
+de recursos. A integridade estrutural não prova identidade, autorização, frescor
+ou completude do negócio. O teste não altera o watermark nem habilita uso de um
+spool real, e não estabelece um procedimento de reparo ou recuperação de host.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
