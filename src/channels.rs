@@ -463,17 +463,22 @@ impl ChannelStore {
     }
 
     pub fn get_channel(&self, name: &str) -> Result<Channel, StoreError> {
-        self.require_recovery_active()?;
-        let record: Option<(Vec<u8>, Vec<u8>)> = self
+        let (nonce, ciphertext, quarantined): (Option<Vec<u8>>, Option<Vec<u8>>, bool) = self
             .db
             .query_row(
-                "SELECT nonce, ciphertext FROM channels WHERE name = ?1",
+                "SELECT nonce, ciphertext, COALESCE((SELECT quarantined FROM recovery_control WHERE id=1), 0) FROM (SELECT 1) LEFT JOIN channels ON channels.name = ?1",
                 [name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()
             .map_err(|_| StoreError::Storage)?;
-        let (nonce, ciphertext) = record.ok_or(StoreError::NotFound)?;
+        if quarantined {
+            return Err(StoreError::RecoveryPending);
+        }
+        let (nonce, ciphertext) = match (nonce, ciphertext) {
+            (Some(nonce), Some(ciphertext)) => (nonce, ciphertext),
+            (None, None) => return Err(StoreError::NotFound),
+            _ => return Err(StoreError::Storage),
+        };
         let nonce: &[u8; 24] = nonce
             .as_slice()
             .try_into()
@@ -1178,6 +1183,7 @@ mod token_snapshot_tests {
     struct TraceBarrier {
         entered: mpsc::Sender<()>,
         resume: mpsc::Receiver<()>,
+        prefix: &'static [u8],
     }
 
     // SQLite invokes this synchronously immediately before stepping a statement.
@@ -1193,15 +1199,10 @@ mod token_snapshot_tests {
         // SAFETY: SQLite supplies a valid NUL-terminated SQL string for this
         // event, and the context remains alive until tracing is unregistered.
         let text = unsafe { CStr::from_ptr(sql.cast()) };
-        if text
-            .to_bytes()
-            .starts_with(b"SELECT user_id FROM mcp_access_tokens")
-        {
-            // SAFETY: context points to the live TraceBarrier in the caller.
-            let barrier = unsafe { &*context.cast::<TraceBarrier>() };
-            if barrier.entered.send(()).is_ok() {
-                let _ = barrier.resume.recv_timeout(Duration::from_secs(5));
-            }
+        // SAFETY: context points to the live TraceBarrier in the caller.
+        let barrier = unsafe { &*context.cast::<TraceBarrier>() };
+        if text.to_bytes().starts_with(barrier.prefix) && barrier.entered.send(()).is_ok() {
+            let _ = barrier.resume.recv_timeout(Duration::from_secs(5));
         }
         0
     }
@@ -1219,6 +1220,7 @@ mod token_snapshot_tests {
             let mut barrier = Box::new(TraceBarrier {
                 entered: entered_tx,
                 resume: resume_rx,
+                prefix: b"SELECT user_id FROM mcp_access_tokens",
             });
             // SAFETY: the connection is used only on this thread; the callback
             // context outlives tracing and is unregistered before it is freed.
@@ -1249,5 +1251,60 @@ mod token_snapshot_tests {
             .unwrap();
         resume_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap().unwrap(), None);
+    }
+
+    #[test]
+    fn quarantine_committed_before_channel_statement_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.db");
+        let store = ChannelStore::open(&path, &[134; 32]).unwrap();
+        store.put_bot("alerts", "123", "synthetic-token").unwrap();
+        assert!(matches!(
+            store.get_channel("missing"),
+            Err(super::StoreError::NotFound)
+        ));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut barrier = Box::new(TraceBarrier {
+                entered: entered_tx,
+                resume: resume_rx,
+                prefix: b"SELECT nonce, ciphertext",
+            });
+            // SAFETY: this thread exclusively owns the connection and the
+            // callback context until tracing is unregistered.
+            let handle = unsafe { store.db.handle() };
+            let registered = unsafe {
+                ffi::sqlite3_trace_v2(
+                    handle,
+                    ffi::SQLITE_TRACE_STMT,
+                    Some(pause_token_statement),
+                    (&mut *barrier as *mut TraceBarrier).cast(),
+                )
+            };
+            assert_eq!(registered, ffi::SQLITE_OK);
+            let result = store.get_channel("alerts");
+            let removed = unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+            assert_eq!(removed, ffi::SQLITE_OK);
+            result
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute(
+                "INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+                [],
+            )
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(super::StoreError::RecoveryPending)
+        ));
+        let store = ChannelStore::open(&path, &[134; 32]).unwrap();
+        assert!(matches!(
+            store.get_channel("missing"),
+            Err(super::StoreError::RecoveryPending)
+        ));
     }
 }

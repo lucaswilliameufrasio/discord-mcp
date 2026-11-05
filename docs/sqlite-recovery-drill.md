@@ -182,6 +182,17 @@ para injetar o estado inconsistente, não para simular a quarentena normal. A
 suíte principal foi executada em namespace de rede separado com loopback próprio,
 sem acesso à rede externa; o exercício filesystem opt-in permaneceu ignorado.
 
+`get_channel` também consultava a quarentena e depois o segredo em instruções
+separadas. Um teste pausa a consulta real do canal, confirma a quarentena em
+outra conexão e demonstra que a versão anterior ainda retornava o canal. A
+consulta agora obtém quarentena e registro no mesmo snapshot e mantém a
+precedência de `RecoveryPending` mesmo quando o canal não existe. Na aplicação,
+`authorized_channel` já resolve permissão e destino numa transação de leitura;
+um snapshot iniciado antes de outra transação confirmar quarentena pode concluir
+com o estado anterior. O fluxo de preparação normal exige cópia privada: esse
+ensaio concorrente não demonstra publicação simultânea suportada nem revogação
+de operações já autorizadas, e não qualifica captura ou recuperação operacional.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin
