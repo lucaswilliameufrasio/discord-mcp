@@ -111,6 +111,23 @@ brusca, restart do Floci, falhas reais de rede, perda de host ou provedores reai
 
 ### Investigação da integração operacional — 2026-11-05
 
+#### Requisitos de execução esclarecidos pelo usuário
+
+- No modo remoto, um serviço dedicado deve ser o único responsável pelo banco;
+  CLI e outros processos devem se comunicar com ele, em vez de acessar esse
+  SQLite diretamente.
+- No modo stdio, a execução é local e deve permitir várias instâncias. Não se
+  pode exigir instância única como solução para coordenação ou recuperação.
+
+Esses são requisitos de destino, **não garantias já implementadas**. Atualmente
+há aberturas de `ChannelStore` em `src/main.rs`, `src/admin_web.rs`,
+`src/oauth_web.rs` e `src/http_auth.rs`. É necessário identificar e coordenar
+todos os acessos, definir e verificar a fronteira do serviço remoto e resolver a
+coordenação entre processos locais no stdio. A possibilidade de processos fora
+do protocolo acessarem o mesmo arquivo continua exigindo um modelo de confiança
+e evidência adequados. O gate experimental e a captura incremental não estão
+integrados; não liberar reconciliação operacional apenas com esses requisitos.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin
