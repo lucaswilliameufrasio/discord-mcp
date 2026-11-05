@@ -359,6 +359,22 @@ diretório, rollback do armazenamento, adulteração do marcador, concorrência 
 autoridades ou perda de energia. O escritor mantém somente um lock sintético,
 não uma transação SQLite; a fixture testa recusa, não recuperação operacional.
 
+A mesma fixture agora injeta interrupções por retorno do publicador antes de
+escrever o marcador e depois da escrita, antes de `fsync`: em ambos os casos o
+socket fecha sem entregar descritor. Num terceiro caso, o primeiro `fsync`
+termina, um descritor é enviado via `SCM_RIGHTS` a um escritor que mantém lock,
+e uma falha simulada antes do segundo `fsync` interrompe a distribuição sem
+entregar outro descritor. Um subprocesso de reinício permanece fechado nos três
+casos, inclusive quando o marcador ainda diz `clean`; o primeiro escritor do
+terceiro cenário continua vivo até ser liberado explicitamente.
+
+O processo de reinício dessa pesquisa **sempre começa fechado**, sem tentar
+reconciliar ou confiar no marcador. A falha é um retorno injetado, não erro real
+de `write`/`fsync`, SIGKILL, queda de energia ou rollback de disco; os bytes
+observados em cache não provam durabilidade. Não há prova de exclusão entre
+autoridades, publicação segura em diretório, confirmação de transferência,
+autenticação nem caminho de reabertura. Nenhum escritor real utiliza o protocolo.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
