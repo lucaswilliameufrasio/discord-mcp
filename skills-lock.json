@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "backpressure-and-admission-control": {
+      "source": "lucaswilliameufrasio/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/backpressure-and-admission-control/SKILL.md",
+      "computedHash": "bfa42766fbc61ec0d329b27884fa284fa748670dbde3c83ca0918b52daa9701d"
+    },
+    "performance-benchmarking-and-load-testing": {
+      "source": "lucaswilliameufrasio/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/performance-benchmarking-and-load-testing/SKILL.md",
+      "computedHash": "f858c4902a68476f3f03325a3bc619caf4187cabb4b9186ff101669aa6827a7f"
+    },
+    "performance-optimization": {
+      "source": "lucaswilliameufrasio/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/performance-optimization/SKILL.md",
+      "computedHash": "4db91c2f4725c6ef64d2a9c25e0355423f0ab2699a26ec2d09575b22150c7bc6"
+    },
+    "secrets-safety": {
+      "source": "lucaswilliameufrasio/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/secrets-safety/SKILL.md",
+      "computedHash": "f842eeba8c088d1b78d87ef6952587dd6711680588ae436aafb2b648e179644c"
+    },
+    "testing-standard": {
+      "source": "lucaswilliameufrasio/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/testing-standard/SKILL.md",
+      "computedHash": "8f868270cee13808e5ef1ffaaf95b8c439468cd53c117368be58e5d423381a64"
+    }
+  }
+}

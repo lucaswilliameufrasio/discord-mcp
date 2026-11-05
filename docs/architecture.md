@@ -10,6 +10,10 @@ Esta é uma direção de implementação, não uma descrição de recursos pront
   e permissões; cada pessoa autentica-se com Discord e autoriza seu cliente MCP.
 * Cada operação verifica a capacidade do canal e, no servidor, a autorização do
   usuário para a ação e o canal, negando acesso por padrão.
+* A primeira conta administradora é estabelecida por uma configuração inicial
+  controlada pelo operador: ID Discord informado pela CLI ou página de setup
+  protegida por código de uso único. A escolha da experiência ainda deve ser
+  feita antes da implementação; não promover automaticamente o primeiro login.
 
 ## Limites
 
@@ -42,13 +46,25 @@ acesso limitado ao contexto e às permissões de cada pessoa:
 * **Canais e integrações:** cadastro e manutenção de conexões webhook e bot,
   mostrando as capacidades e o estado de cada uma.
 * **Usuários e permissões:** no modo compartilhado, administração de acesso por
-  usuário, canal e operação. Não confundir permissões locais com as do Discord.
+  usuário, canal e operação. Leitura e envio são permissões independentes,
+  negadas por padrão. Não confundir permissões locais com as do Discord.
 
 O dashboard é uma síntese, não um substituto dos módulos especializados. As
 agregações devem respeitar a autorização do usuário e não inventar números;
 mostrar estados de carregamento, vazio, erro e dados indisponíveis. A definição
-de retenção, armazenamento e política de acesso de métricas e auditoria ainda
-precisa ser resolvida antes da implementação desses recursos.
+inicial de retenção é de 30 dias para métricas e 90 dias para eventos de
+auditoria, configuráveis. Armazenamento e política de acesso ainda precisam ser
+resolvidos antes da implementação desses recursos.
+
+## Implantação e desempenho
+
+O alvo inicial é uma única máquina ou VPS self-hosted. SQLite é candidato à
+persistência inicial, sem presumir capacidade ou escala específicas. Benchmarks
+devem medir cargas representativas de leitura e escrita, concorrência,
+latências, erros, CPU e memória, incluindo gargalos das integrações externas;
+registrar ambiente, versão, duração e metodologia. Resultados locais não provam
+capacidade em produção. Testes de carga usam recursos isolados e não devem atingir
+Discord nem infraestrutura de produção sem autorização explícita.
 
 ## Etapas
 

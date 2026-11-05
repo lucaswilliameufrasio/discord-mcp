@@ -1,0 +1,17 @@
+{
+  "skill_name": "performance-benchmarking-and-load-testing",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Build a repeatable capacity test for our HTTP API. We care about sustainable RPS below p99 100 ms and 1% errors, and want the result to be comparable after optimization.",
+      "expected_output": "Defines open-loop offered load and threshold semantics; records environment/commit/tool versions and repeats; measures offered/delivered rate, percentiles, errors and resources; reports last healthy and first failing step without claiming production capacity from localhost.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Can I run k6, oha, and the soak test at the same time to finish faster? They all target localhost.",
+      "expected_output": "Explains interference and generator/target contention invalidate comparable measurements; recommends exclusive or deliberately isolated runs, records topology, and validates the load generator's capacity.",
+      "files": []
+    }
+  ]
+}

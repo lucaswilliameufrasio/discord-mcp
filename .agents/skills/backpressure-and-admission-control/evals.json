@@ -1,0 +1,17 @@
+{
+  "skill_name": "backpressure-and-admission-control",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Our API puts jobs in a Rust Tokio channel, but we still see memory grow during bursts. The worker count is fixed. Diagnose likely hidden queues and propose bounded admission behavior without changing the public API blindly.",
+      "expected_output": "Traces all waiting/in-flight boundaries including spawned tasks and downstream work, distinguishes queue capacity from worker/downstream concurrency, and asks or preserves API semantics before recommending early rejection or backpressure.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Add per-tenant overload protection to a Node service. A busy tenant must not prevent another tenant from submitting work; accepted jobs currently live only in memory.",
+      "expected_output": "Recommends atomic outstanding-work quotas and tests tenant isolation/release on all paths; clarifies quota is not a fair scheduler; explicitly warns that in-memory acceptance is volatile and proposes durable persistence if restart survival is required.",
+      "files": []
+    }
+  ]
+}

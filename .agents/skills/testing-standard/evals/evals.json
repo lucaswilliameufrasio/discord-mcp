@@ -1,0 +1,23 @@
+{
+  "skill_name": "testing-standard",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I changed a repository handler and repository method. Plan the tests I should add and the quality checks to run. Use the repo's real test setup; don't substitute an in-memory database for integration coverage.",
+      "expected_output": "The response distinguishes unit and integration coverage, uses the real router and local datastore for integration tests, verifies persisted state, and identifies the full repository quality gate from actual project instructions.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "This bug only happens when two workers claim the same job at once. Add regression coverage for the fix, and tell me how to verify it safely without touching shared or production services.",
+      "expected_output": "The response calls for a regression test that reproduces the race and asserts the single-winner invariant, uses only local/test infrastructure, and avoids production or shared environments.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Run the quality gate for my change. Unit tests passed from yesterday; can we call it done? The full test run reports two pre-existing failures.",
+      "expected_output": "The response rejects stale/cached evidence as proof of completion, asks for fresh whole-repository checks from project instructions, and reports pre-existing failures transparently rather than claiming all green.",
+      "files": []
+    }
+  ]
+}

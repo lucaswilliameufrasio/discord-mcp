@@ -1,0 +1,17 @@
+{
+  "skill_name": "performance-optimization",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Our Rust API is slow. Can you replace the hash map and add caching? We have no profile or baseline yet.",
+      "expected_output": "Defines the desired metric and reproduces/measures first; inspects existing project evidence; avoids speculative data-structure/caching changes; proposes a falsifiable profiling/benchmark plan before implementation.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "After optimizing the handler, throughput rose 20%, but p99 doubled and queue depth keeps growing. Is that a performance win?",
+      "expected_output": "Treats the change as a trade-off/regression until objectives are met; analyzes offered vs delivered load, tail latency and queue stability; compares equivalent runs and recommends keep/revise based on explicit guardrails.",
+      "files": []
+    }
+  ]
+}
