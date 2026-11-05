@@ -123,6 +123,10 @@ Validar recuperação em destino isolado com dados sintéticos, sem sobrescrever
 banco ativo nem acionar integrações Discord; verificar integridade e fluxos da
 aplicação. Definir RPO, RTO, destino e custódia de chaves com o operador antes
 de alegar uma garantia. Replicação ou upload bem-sucedido não prova recuperação.
+Um teste opt-in executa snapshot e restore locais com dados sintéticos por meio
+do exemplo do projeto irmão; detalhes e limitações estão em
+[sqlite-recovery-drill.md](sqlite-recovery-drill.md). Não existe ainda integração
+operacional de replicação ou recuperação de host neste projeto.
 
 ## Etapas
 

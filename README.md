@@ -153,3 +153,7 @@ Verificações: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
 `cargo build` e `cargo test`.
 
 Nunca registre tokens de bot, URLs de webhook ou segredos OAuth no repositório.
+
+Para o exercício opt-in de snapshot e restauração com dados sintéticos usando o
+projeto irmão, consulte [docs/sqlite-recovery-drill.md](docs/sqlite-recovery-drill.md).
+O exercício não configura recuperação de desastre em produção.
