@@ -633,6 +633,24 @@ controlador; não foram simuladas perda do escopo/host, falha de persistência,
 transação SQLite ou integração com escritores reais. A evidência não qualifica
 essa fronteira para produção.
 
+A variante opt-in `--inventory` inicia dois descendentes de identidade separada
+no mesmo subgrupo e mata seus dois controladores. Em uma observação controlada,
+os PIDs em `cgroup.procs` coincidem com os dois processos sintéticos conhecidos;
+`populated` permanece 1 após a saída do primeiro e passa a 0 após a saída do
+segundo. Ambas as tentativas de migrar ao escopo pai são negadas. Um observador
+novo permanece fechado com dois, um ou zero processos e quando a evidência está
+ausente. Como contraprova, o teste inicia uma transação SQLite sintética fora do
+subgrupo: o subgrupo permanece vazio enquanto esse escritor está ativo, e a
+decisão continua fechada.
+
+O kernel informa somente o conteúdo do subgrupo observado; as leituras de
+`cgroup.events` e `cgroup.procs` não formam snapshot atômico. O teste controla a
+criação e os handles dos dois descendentes, mas não prova que todos os escritores
+da aplicação nasceram no subgrupo nem garante que ele não seja alterado. A
+observação não verifica inventário, continuidade ou recuperação de host e não é
+autorização para reabrir. A execução cria e remove apenas escopo/subgrupo e banco
+sintético próprios, seguindo o comando anterior com `--inventory`.
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela

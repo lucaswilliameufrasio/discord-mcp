@@ -124,6 +124,142 @@ def recovery(leaf):
     print(f"populated={int(populated(leaf))} decision=closed", flush=True)
 
 
+def inventory_recovery(leaf):
+    # Neither a process list nor an empty cgroup proves that all application
+    # writers were confined to this particular leaf.
+    try:
+        active = populated(leaf)
+        with open(os.path.join(leaf, "cgroup.procs"), encoding="ascii") as source:
+            count = sum(1 for line in source if line.strip())
+        print(f"populated={int(active)} count={count} decision=closed", flush=True)
+    except (OSError, KeyError, ValueError):
+        print("evidence=unavailable decision=closed", flush=True)
+
+
+def run_inventory():
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("Linux pidfd APIs required")
+    with open("/proc/self/cgroup", encoding="ascii") as source:
+        lines = source.read().splitlines()
+    if len(lines) != 1 or not lines[0].startswith("0::/"):
+        raise RuntimeError("expected a unified cgroup v2 hierarchy")
+    relative = lines[0][3:]
+    name = os.path.basename(relative)
+    if not name.startswith("discord-mcp-cgroup-drill-") or not name.endswith(".scope"):
+        raise RuntimeError("requires an owned discord-mcp-cgroup-drill transient scope")
+    scope = os.path.join("/sys/fs/cgroup", relative.lstrip("/"))
+    leaf = os.path.join(scope, f"inventory-{os.getpid()}")
+    os.mkdir(leaf)
+    workers = []
+    controllers = []
+
+    def observe(path):
+        result = subprocess.run(
+            [sys.executable, __file__, "inventory-recovery", path],
+            capture_output=True, text=True, timeout=5, check=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        return result.stdout.strip()
+
+    try:
+        for _ in range(2):
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            parent.settimeout(5)
+            process = subprocess.Popen(
+                [sys.executable, __file__, "controller", leaf, scope, str(child.fileno())],
+                pass_fds=(child.fileno(),), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin"},
+            )
+            controllers.append(process)
+            child.close()
+            message = parent.recv(128).decode().split()
+            if len(message) != 2 or message[0] != "READY":
+                parent.close()
+                raise RuntimeError("inventory descendant did not become ready")
+            pid = int(message[1])
+            pidfd = os.pidfd_open(pid)
+            workers.append((parent, pid, pidfd))
+            with open(f"/proc/{pid}/status", encoding="ascii") as status:
+                fields = dict(line.rstrip().split(":", 1) for line in status if ":" in line)
+            if int(fields["Uid"].split()[1]) == os.geteuid() or int(fields["CapEff"].strip(), 16) != 0:
+                raise RuntimeError("worker identity/capabilities were not separated")
+            if not select.select([process.stdout], [], [], 5)[0] or process.stdout.readline().strip() != b"CONTROLLER_READY":
+                raise RuntimeError("controller did not become ready")
+        for process in controllers:
+            process.kill()
+            process.wait(timeout=5)
+        with open(os.path.join(leaf, "cgroup.procs"), encoding="ascii") as source:
+            observed = {int(line) for line in source if line.strip()}
+        if observed != {pid for _, pid, _ in workers}:
+            raise RuntimeError("kernel membership differs from known fixture descendants")
+        if observe(leaf) != "populated=1 count=2 decision=closed":
+            raise RuntimeError("two-worker observation did not remain closed")
+        print("after_controller_deaths=two_members_closed", flush=True)
+        for sock, _, _ in workers:
+            sock.sendall(b"M")
+            if sock.recv(128) != b"DENIED 0":
+                raise RuntimeError("descendant migration or uid recovery was not denied")
+        first, second = workers
+        first[0].sendall(b"Q")
+        if not select.select([first[2]], [], [], 5)[0]:
+            raise TimeoutError("first descendant did not exit")
+        if observe(leaf) != "populated=1 count=1 decision=closed":
+            raise RuntimeError("one-worker observation did not remain closed")
+        print("after_first_exit=one_member_closed", flush=True)
+        second[0].sendall(b"Q")
+        if not select.select([second[2]], [], [], 5)[0]:
+            raise TimeoutError("second descendant did not exit")
+        if observe(leaf) != "populated=0 count=0 decision=closed":
+            raise RuntimeError("empty observation did not remain closed")
+        print("after_second_exit=empty_closed", flush=True)
+        if observe(os.path.join(leaf, "missing")) != "evidence=unavailable decision=closed":
+            raise RuntimeError("missing evidence did not remain closed")
+        print("missing_evidence=unavailable_closed", flush=True)
+        # Controlled counterexample: an untracked writer outside this leaf
+        # remains active even though the kernel reports the leaf as empty.
+        with tempfile.TemporaryDirectory(prefix="cgroup-outside-", dir="/tmp/opencode") as temp:
+            code = (
+                "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); "
+                "db.execute('CREATE TABLE writes(value INTEGER)'); "
+                "db.execute('BEGIN IMMEDIATE'); db.execute('INSERT INTO writes VALUES (1)'); "
+                "print('WRITING',flush=True); sys.stdin.readline(); db.commit(); db.close()"
+            )
+            outside = subprocess.Popen(
+                [sys.executable, "-c", code, os.path.join(temp, "synthetic.db")],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            try:
+                if not select.select([outside.stdout], [], [], 5)[0] or outside.stdout.readline().strip() != b"WRITING":
+                    raise RuntimeError("outside writer did not start")
+                if observe(leaf) != "populated=0 count=0 decision=closed" or outside.poll() is not None:
+                    raise RuntimeError("outside writer counterexample did not remain closed")
+                print("empty_leaf_with_outside_sqlite_writer=closed", flush=True)
+                outside.stdin.write(b"commit\n")
+                outside.stdin.flush()
+                if outside.wait(timeout=5) != 0:
+                    raise RuntimeError("outside writer failed")
+                with sqlite3.connect(os.path.join(temp, "synthetic.db")) as db:
+                    if db.execute("SELECT COUNT(*) FROM writes").fetchone() != (1,):
+                        raise RuntimeError("outside writer commit missing")
+            finally:
+                if outside.poll() is None:
+                    outside.kill()
+                outside.communicate(timeout=5)
+    finally:
+        for sock, _, pidfd in workers:
+            sock.close()
+            if not select.select([pidfd], [], [], 0)[0]:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                select.select([pidfd], [], [], 5)
+            os.close(pidfd)
+        for process in controllers:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        os.rmdir(leaf)
+
+
 def continuity_recovery(database_dir, snapshot_name):
     """Compare only the controlled synthetic fixture, never authorize admission."""
     paths = [os.path.join(database_dir, "synthetic.db"), os.path.join(database_dir, snapshot_name)]
@@ -312,6 +448,8 @@ if __name__ == "__main__":
         controller(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
     elif len(sys.argv) == 3 and sys.argv[1] == "recovery":
         recovery(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "inventory-recovery":
+        inventory_recovery(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "continuity":
         continuity_recovery(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 5 and sys.argv[1] == "worker":
@@ -327,5 +465,7 @@ if __name__ == "__main__":
         run(separate_identity=True, controller_crash=True)
     elif len(sys.argv) == 2 and sys.argv[1] == "--sqlite-controller-crash":
         run(separate_identity=True, controller_crash=True, sqlite_transaction=True)
+    elif len(sys.argv) == 2 and sys.argv[1] == "--inventory":
+        run_inventory()
     else:
         raise SystemExit("invalid fixture arguments")
