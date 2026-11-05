@@ -1,12 +1,14 @@
 //! Local channel storage: SQLite metadata and authenticated-encrypted webhooks.
 use std::{fmt, path::Path, time::Duration};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305,
     aead::{Aead, Payload},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::{bot::BotChannel, webhook::WebhookUrl};
 
@@ -22,6 +24,23 @@ pub enum ChannelAction {
     Send,
 }
 
+/// Inputs already validated against a registered client and a consented login.
+pub struct AuthorizationGrant<'a> {
+    pub user_id: &'a str,
+    pub client_id: &'a str,
+    pub redirect_uri: &'a str,
+    pub resource: &'a str,
+    pub code_challenge: &'a str,
+}
+
+pub struct AuthorizationExchange<'a> {
+    pub code: &'a str,
+    pub client_id: &'a str,
+    pub redirect_uri: &'a str,
+    pub resource: &'a str,
+    pub code_verifier: &'a str,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     InvalidInput,
@@ -29,6 +48,7 @@ pub enum StoreError {
     Storage,
     Decryption,
     PermissionDenied,
+    AuthorizationDenied,
 }
 
 impl fmt::Display for StoreError {
@@ -39,6 +59,7 @@ impl fmt::Display for StoreError {
             Self::Storage => "channel storage error",
             Self::Decryption => "unable to decrypt channel credential",
             Self::PermissionDenied => "channel access denied",
+            Self::AuthorizationDenied => "authorization code invalid or expired",
         })
     }
 }
@@ -134,6 +155,21 @@ impl ChannelStore {
             token_hash BLOB PRIMARY KEY NOT NULL,
             user_id TEXT NOT NULL,
             resource TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        );",
+            )
+            .map_err(|_| StoreError::Storage)?;
+        store
+            .db
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mcp_authorization_codes (
+            code_hash BLOB PRIMARY KEY NOT NULL,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            challenge TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL
         );",
             )
@@ -394,6 +430,76 @@ impl ChannelStore {
             .map_err(|_| StoreError::Storage)?;
         Ok(())
     }
+
+    /// Only call after authenticating the user, validating the registered client
+    /// and exact redirect, and receiving explicit consent for this transaction.
+    pub fn issue_authorization_code(
+        &self,
+        grant: &AuthorizationGrant<'_>,
+        now: i64,
+    ) -> Result<String, StoreError> {
+        if now < 0
+            || !valid_user_id(grant.user_id)
+            || !valid_client_id(grant.client_id)
+            || !valid_redirect(grant.redirect_uri)
+            || !valid_resource(grant.resource)
+            || !valid_challenge(grant.code_challenge)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let expires_at = now.checked_add(300).ok_or(StoreError::InvalidInput)?;
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(|_| StoreError::Storage)?;
+        let code = hex::encode(random);
+        let hash = Sha256::digest(code.as_bytes());
+        self.db.execute("INSERT INTO mcp_authorization_codes(code_hash,client_id,redirect_uri,resource,user_id,challenge,created_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![hash.as_slice(),grant.client_id,grant.redirect_uri,grant.resource,grant.user_id,grant.code_challenge,now,expires_at]).map_err(|_| StoreError::Storage)?;
+        Ok(code)
+    }
+
+    /// Exchange and token issuance commit atomically; failed validation issues nothing.
+    pub fn exchange_authorization_code(
+        &self,
+        exchange: &AuthorizationExchange<'_>,
+        now: i64,
+    ) -> Result<String, StoreError> {
+        if now < 0
+            || !valid_token(exchange.code)
+            || !valid_client_id(exchange.client_id)
+            || !valid_redirect(exchange.redirect_uri)
+            || !valid_resource(exchange.resource)
+            || !valid_verifier(exchange.code_verifier)
+        {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        let hash = Sha256::digest(exchange.code.as_bytes());
+        let record: Option<(String, String)> = transaction.query_row(
+            "SELECT user_id, challenge FROM mcp_authorization_codes WHERE code_hash=?1 AND client_id=?2 AND redirect_uri=?3 AND resource=?4 AND created_at<=?5 AND expires_at>?5",
+            params![hash.as_slice(), exchange.client_id, exchange.redirect_uri, exchange.resource, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|_| StoreError::Storage)?;
+        let (user_id, challenge) = record.ok_or(StoreError::AuthorizationDenied)?;
+        let calculated = URL_SAFE_NO_PAD.encode(Sha256::digest(exchange.code_verifier.as_bytes()));
+        if !bool::from(calculated.as_bytes().ct_eq(challenge.as_bytes())) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let changed = transaction
+            .execute(
+                "DELETE FROM mcp_authorization_codes WHERE code_hash=?1",
+                [hash.as_slice()],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let access_token = self.issue_access_token(&user_id, exchange.resource, now, 3600)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(access_token)
+    }
 }
 
 fn valid_user_id(value: &str) -> bool {
@@ -423,4 +529,42 @@ fn valid_resource(value: &str) -> bool {
         && url.query().is_none()
         && url.fragment().is_none()
         && url.as_str() == value
+}
+
+fn valid_client_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+fn valid_redirect(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let loopback = url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+        );
+    (url.scheme() == "https" || loopback)
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url.as_str() == value
+}
+
+fn valid_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+}
+
+fn valid_challenge(value: &str) -> bool {
+    if value.len() != 43 {
+        return false;
+    }
+    match URL_SAFE_NO_PAD.decode(value) {
+        Ok(bytes) => bytes.len() == 32 && URL_SAFE_NO_PAD.encode(bytes) == value,
+        Err(_) => false,
+    }
 }

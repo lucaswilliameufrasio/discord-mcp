@@ -30,8 +30,12 @@ tokens MCP. A CLI orientará o fluxo sem inserir segredos em argumentos.
 A fundação local de autorização contém tokens opacos de curta duração,
 armazenados como hashes, associados a usuário e recurso, com revogação e um
 middleware HTTP para verificá-los. Ela **não é um servidor OAuth**: ainda faltam
-login Discord, consentimento, descoberta MCP, autorização com PKCE, emissão por
-um fluxo validado e integração com o transporte MCP. Nenhum endpoint remoto de
+login Discord, consentimento, descoberta MCP, registro e validação de clientes,
+emissão por um fluxo validado e integração com o transporte MCP. A fundação já
+implementa a troca atômica de código de autorização de uso único por token,
+com PKCE S256 e vinculação exata de cliente, retorno e recurso. A emissão do
+código pressupõe que uma camada externa confiável já verificou login, cliente,
+URI de retorno e consentimento: essas verificações ainda não existem. Nenhum endpoint remoto de
 produção deve ser habilitado até que essas partes sejam implementadas e testadas.
 Cada operação deverá verificar o token em toda requisição e obter o usuário do
 contexto autenticado, nunca de argumentos fornecidos pelo cliente.
