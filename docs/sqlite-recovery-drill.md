@@ -720,6 +720,30 @@ nega mensagens: não executa captura, não identifica automaticamente processos,
 não aplica isolamento obrigatório e não protege o aplicativo real. A recusa é
 conservadora, não uma solução para o acesso concorrente.
 
+#### Exercício opt-in de restrição por processo
+
+`tests/landlock_boundary_fixture.py` usa Landlock Linux ABI 3 ou superior em
+x86-64, com `no_new_privs` aplicado **apenas ao cliente sintético**. A política
+de teste nega operações tratadas de escrita, criação, remoção e truncamento;
+não há regras de permissão. O cliente tem o mesmo UID do corretor e consegue
+ler o banco sintético, mas suas tentativas de abri-lo para escrita e removê-lo
+são negadas. Ele solicita uma transação ao corretor via socket; o teste mata o
+corretor antes do commit, confirma rollback e verifica que o cliente continua
+sem escrita direta. Um gate sintético recusa admissão e captura.
+
+Como contraprova, outro processo do mesmo UID **sem Landlock** confirma uma
+escrita diretamente no mesmo banco, enquanto o gate continua recusando. Assim,
+restringir um processo não cerca processos não controlados nem prova que todos
+os escritores herdem a política. O teste não cobre descritores abertos antes da
+restrição, outras operações de filesystem, aplicação obrigatória a todos os
+processos, autenticação de socket, captura incremental ou perda de host. Não é
+sandbox nem gate de produção. Para executá-lo, requer kernel compatível e um
+escopo transitório próprio; não instala nem altera políticas do host:
+
+```sh
+systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/landlock_boundary_fixture.py"
+```
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela
