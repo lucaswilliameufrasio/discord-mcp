@@ -410,6 +410,23 @@ autoridades, autenticação, perda de supervisor/âncora ou falhas de `fsync` re
 A âncora permanece no processo de teste. Portanto a transição é uma fixture, não
 uma garantia de continuidade ou gate operacional.
 
+O cenário de transição foi ampliado com um subprocesso escritor conhecido que
+mantém lock compartilhado e uma transação SQLite real aberta. A primeira
+autoridade morre durante a transação; após reinício, a solicitação de admissão é
+negada e a drenagem continua ocupada. O supervisor de teste aguarda o commit e
+o término do processo e confirma a linha no banco antes de pedir a drenagem. Em
+seguida, outro solicitante é recusado durante a preparação e a autoridade morre
+novamente. A terceira instância começa fechada, repete a transição e responde
+admissão; só então o supervisor inicia outro escritor SQLite e confirma duas
+linhas no banco.
+
+A ligação entre resposta de admissão e início do escritor é feita pelo próprio
+teste, não por uma credencial ou protocolo de produção. O supervisor retém a
+âncora e controla todos os processos por hipótese; a autoridade não possui uma
+lista confiável de escritores por conta própria. Não foram testados morte do
+supervisor, escritores que ignorem o lock, corrupção/persistência real ou
+captura incremental. Esta combinação permanece insuficiente para integração.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;

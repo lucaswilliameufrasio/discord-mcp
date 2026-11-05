@@ -4,6 +4,7 @@ import array
 import os
 import select
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,19 @@ def transition_contender(fd):
         print(sock.recv(1).decode(), flush=True)
 
 
+def sqlite_writer(fd, database):
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    print("TRANSACTION", flush=True)
+    if sys.stdin.readline().strip() != "commit":
+        raise RuntimeError("expected commit")
+    connection.commit()
+    connection.close()
+    os.close(fd)
+
+
 def receive_descriptor(sock):
     data, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
     if not data:
@@ -170,7 +184,7 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
-    def test_transition_holds_barrier_and_restart_stays_closed(self):
+    def test_sqlite_writer_reconciles_before_transition_and_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
             state = os.path.join(directory, "state")
@@ -179,6 +193,10 @@ class AnchorTests(unittest.TestCase):
             with open(state, "wb") as marker:
                 marker.write(b"uncertain\n")
             anchor = os.open(path, os.O_RDWR)
+            database = os.path.join(directory, "synthetic.db")
+            with sqlite3.connect(database) as db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
             processes = []
             sockets = []
 
@@ -228,12 +246,41 @@ class AnchorTests(unittest.TestCase):
                 control.sendall(value)
                 return control.recv(1)
 
-            old_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
-            fcntl.flock(old_fd, fcntl.LOCK_SH)
+            def start_sqlite_writer():
+                fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, __file__, "sqlite_writer", str(fd), database],
+                        pass_fds=(fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(fd)
+                processes.append(process)
+                self.assertEqual(line(process.stdout), "TRANSACTION")
+                return process
+
+            old_writer = start_sqlite_writer()
             authority, contender, control = start_authority()
             self.assertEqual(probe(contender), "N")
             self.assertEqual(command(control, b"D"), b"B")
-            os.close(old_fd)
+            authority.kill()
+            authority.wait(timeout=5)
+            contender.stdin.close()
+            contender.stdin = None
+            contender.wait(timeout=5)
+            authority, contender, control = start_authority()
+            self.assertEqual(probe(contender), "N")
+            self.assertIsNone(old_writer.poll())
+            self.assertEqual(command(control, b"D"), b"B")
+            old_writer.stdin.write("commit\n")
+            old_writer.stdin.flush()
+            self.assertEqual(old_writer.wait(timeout=5), 0)
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+            # The test supervisor owns the process handle; no new writer is
+            # created without its admission decision.
+            self.assertIsNotNone(old_writer.poll())
             self.assertEqual(command(control, b"D"), b"D")
             self.assertEqual(command(control, b"P"), b"P")
             self.assertEqual(probe(contender), "N")
@@ -255,6 +302,12 @@ class AnchorTests(unittest.TestCase):
             self.assertEqual(probe(later), "N")
             self.assertEqual(command(restarted_control, b"O"), b"O")
             self.assertEqual(probe(later), "Y")
+            new_writer = start_sqlite_writer()
+            new_writer.stdin.write("commit\n")
+            new_writer.stdin.flush()
+            self.assertEqual(new_writer.wait(timeout=5), 0)
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 2)
             restarted_control.close()
             restarted.wait(timeout=5)
 
@@ -540,7 +593,9 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 6 and sys.argv[1] == "transition":
+    if len(sys.argv) == 4 and sys.argv[1] == "sqlite_writer":
+        sqlite_writer(int(sys.argv[2]), sys.argv[3])
+    elif len(sys.argv) == 6 and sys.argv[1] == "transition":
         transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
     elif len(sys.argv) == 3 and sys.argv[1] == "contender":
         transition_contender(int(sys.argv[2]))
