@@ -97,6 +97,46 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     store.revoke_access_token(&token)?;
     assert_source_unchanged(&store, &token, resource);
 
+    // A second full snapshot uses a distinct repository and remote prefix.
+    // Reusing TXID 1 within the original repository would conflict with its
+    // immutable object keys; this is not incremental replication.
+    let next_repository = directory.join("repository-next");
+    let next_restored = directory.join("next-restored.db");
+    let next_prepared = directory.join("next-prepared.db");
+    snapshot(&source, &next_repository)?;
+    let next_upload = sync_to_s3(
+        &s3,
+        &next_repository,
+        "next-generation",
+        "isolated-floci-next",
+    )
+    .await?;
+    assert_eq!(next_upload.txid, 1);
+    assert!(next_upload.objects_confirmed >= 1);
+    restore_from_s3(
+        &s3,
+        "next-generation",
+        &next_restored,
+        RestoreTarget::Txid(1),
+    )
+    .await?;
+    let next_report = prepare_restored_copy(&next_restored, &next_prepared, &key, 90)?;
+    assert_eq!(
+        (
+            next_report.permissions,
+            next_report.tokens,
+            next_report.codes
+        ),
+        (0, 0, 1)
+    );
+    let next = ChannelStore::open(&next_prepared, &key)?;
+    assert!(next.recovery_quarantined()?);
+    next.activate_recovered_copy()?;
+    assert!(!next.is_permitted("101", "support", ChannelAction::Read)?);
+    assert!(next.verify_access_token(&token, resource, 1001)?.is_none());
+    assert_source_unchanged(&store, &token, resource);
+    println!("PASS second independent snapshot and remote sync preserve later revocations");
+
     // Independent prefixes contain only synthetic objects created by this run.
     let objects = client
         .list_objects_v2()

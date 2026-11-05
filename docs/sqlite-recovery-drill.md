@@ -52,6 +52,14 @@ existente deve falhar sem modificá-lo; o teste também confirma que revogaçõe
 feitas na fonte após o snapshot permanecem na fonte. O tempo exibido exclui
 build e inicialização do emulador, portanto não é RTO.
 
+O exercício também cria uma segunda geração de snapshot completo após revogar
+permissões e token na fonte. Essa geração usa outro repositório e outro prefixo
+S3: ambos os snapshots iniciais têm TXID 1, de modo que reutilizar o prefixo
+conflitaria com chaves imutáveis. A segunda cópia é restaurada e colocada em
+quarentena; suas revogações são verificadas após a ativação. O snapshot anterior
+continua restaurável e sua autoridade é invalidada pela quarentena. Isso testa
+dois snapshots independentes, **não** captura contínua ou incremental.
+
 O isolamento usa contêiner e diretório temporário próprios; interrupções abruptas
 podem deixar recursos do exercício, que devem ser identificados antes de limpar.
 O emulador local não valida IAM, criptografia de objetos, rede, consistência,
@@ -92,6 +100,39 @@ compiladas a partir de uma árvore imutável. Não houve alteração intencional
 checkout irmão. Não foram exercitados download parcial de um objeto, cancelamento
 durante publicação local, SIGKILL/crash, retomada, remoção de staging após queda
 brusca, restart do Floci, falhas reais de rede, perda de host ou provedores reais.
+
+### Investigação da integração operacional — 2026-11-05
+
+O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
+oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
+revisão não foi encontrada pela API do GitHub. `git ls-remote origin
+refs/heads/main` retornou `25e2bd16d99aa005b6c0fead064773a0aee5dd1a`; o
+`origin/main` local correspondente expõe `snapshot`, mas não `sync_to_s3`,
+`restore_from_s3` ou `capture_once`. Portanto, fixar hoje a revisão local como
+dependência Git não produziria um build reproduzível a partir do remoto.
+Não houve publicação ou modificação do checkout irmão nesta investigação.
+
+A captura incremental da biblioteca exige um write-gate para **todos** os
+escritores, um único escritor lógico coordenado, plataforma e SQLite dentro do
+escopo CP-01. O Discord MCP abre conexões SQLite em múltiplos caminhos e
+processos, inclusive CLI, servidor, métricas e auditoria; ainda não há gate
+compartilhado nem coordenação de ciclo de vida que comprovem essa precondição.
+Não conectar `capture_once` como se essas garantias já existissem.
+
+Snapshots completos isolados podem ser uma alternativa periódica, mas exigem
+projeto adicional: catálogo durável e seleção de gerações, nomes/prefixos
+únicos, retry idempotente, exclusão mútua, limite de espaço e retenção,
+proteção de metadados e credenciais, estado de sync visível, recuperação após
+interrupção e política para o intervalo sem proteção. O teste atual não fornece
+esses mecanismos nem mede RPO/RTO. Uma integração real depende de uma revisão
+publicada e fixável da biblioteca, das garantias de escrita e da definição do
+destino, custódia de chaves e política operacional pelo operador. Nenhum dos
+exercícios autoriza implantação ou acesso a um bucket real.
+
+Duas execuções do exercício ampliado de duas gerações passaram em Floci,
+respectivamente em 0,185 s e 0,181 s para o trecho sintético medido, sem build
+ou inicialização do emulador. São evidência do fluxo testado, não de durabilidade
+remota, desempenho de produção ou recuperação de host.
 
 ## Preparar uma cópia restaurada
 
