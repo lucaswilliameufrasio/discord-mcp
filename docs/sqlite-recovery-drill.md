@@ -163,6 +163,25 @@ O teste cobre token, código e troca concorrentes com quarentena, sem credenciai
 reais. Ele não comprova exclusividade de todos os escritores nem recuperação
 operacional; a captura incremental continua desabilitada.
 
+`verify_access_token` agora consulta o token e a condição de quarentena na
+mesma instrução SQLite, portanto usa um único snapshot para essa decisão. Um
+teste sintético reproduz leituras separadas que poderiam combinar o estado
+anterior da quarentena com um token ainda presente no estado posterior; em
+seguida, a validação real nega esse token. O teste retém o token artificialmente:
+a quarentena normal da aplicação também invalida as credenciais em sua própria
+transação, e não foi demonstrado bypass pelo fluxo normal. Uma validação já
+concluída antes da mudança não é revogada retroativamente; esta alteração não
+estabelece coordenação entre processos nem recuperação operacional.
+
+Um teste de unidade adicional usa o rastreamento de instruções do SQLite para
+pausar a consulta de token real imediatamente antes da execução, confirmar a
+quarentena por outra conexão e então retomá-la. A versão anterior, de consultas
+separadas, foi executada em cópia isolada e retornou o usuário; a consulta única
+retornou ausência de autorização. O token foi mantido deliberadamente no banco
+para injetar o estado inconsistente, não para simular a quarentena normal. A
+suíte principal foi executada em namespace de rede separado com loopback próprio,
+sem acesso à rede externa; o exercício filesystem opt-in permaneceu ignorado.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin

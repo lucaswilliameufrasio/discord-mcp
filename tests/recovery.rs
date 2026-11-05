@@ -6,6 +6,60 @@ use discord_mcp::{
 };
 
 #[test]
+fn token_validation_checks_quarantine_with_token_in_same_snapshot() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic.db");
+    let resource = "https://example.invalid/mcp";
+    let store = ChannelStore::open(&path, &[132; 32]).unwrap();
+    let token = store.issue_access_token("101", resource, 1000, 60).unwrap();
+    assert_eq!(
+        store
+            .verify_access_token(&token, resource, 1001)
+            .unwrap()
+            .as_deref(),
+        Some("101")
+    );
+
+    // Model the old split read with two independently committed statements.
+    let prior = store.recovery_quarantined().unwrap();
+    assert!(!prior);
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    // Deliberately retain the token to model inconsistent/untrusted restored
+    // state; normal quarantine also deletes credentials in the same transaction.
+    writer
+        .execute(
+            "INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+            [],
+        )
+        .unwrap();
+    let hash = Sha256::digest(token.as_bytes());
+    let stale_lookup: String = writer.query_row(
+        "SELECT user_id FROM mcp_access_tokens WHERE token_hash=?1 AND resource=?2 AND expires_at>?3",
+        rusqlite::params![hash.as_slice(), resource, 1001], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        stale_lookup, "101",
+        "split reads would combine incompatible states"
+    );
+    assert_eq!(
+        store.verify_access_token(&token, resource, 1001).unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .verify_access_token(&token, "https://other.invalid/mcp", 1001)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store.verify_access_token(&token, resource, 1060).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn preparation_quarantines_and_invalidates_restored_authority_before_activation() {
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]

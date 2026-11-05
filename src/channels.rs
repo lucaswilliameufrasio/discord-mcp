@@ -980,14 +980,11 @@ impl ChannelStore {
         resource: &str,
         now: i64,
     ) -> Result<Option<String>, StoreError> {
-        if self.recovery_quarantined()? {
-            return Ok(None);
-        }
         if !valid_token(token) || !valid_resource(resource) || now < 0 {
             return Ok(None);
         }
         let hash = Sha256::digest(token.as_bytes());
-        self.db.query_row("SELECT user_id FROM mcp_access_tokens WHERE token_hash=?1 AND resource=?2 AND expires_at>?3", params![hash.as_slice(), resource, now], |row| row.get(0)).optional().map_err(|_| StoreError::Storage)
+        self.db.query_row("SELECT user_id FROM mcp_access_tokens WHERE token_hash=?1 AND resource=?2 AND expires_at>?3 AND NOT EXISTS (SELECT 1 FROM recovery_control WHERE id=1 AND quarantined=1)", params![hash.as_slice(), resource, now], |row| row.get(0)).optional().map_err(|_| StoreError::Storage)
     }
 
     pub fn revoke_access_token(&self, token: &str) -> Result<(), StoreError> {
@@ -1165,5 +1162,92 @@ pub(crate) fn valid_challenge(value: &str) -> bool {
     match URL_SAFE_NO_PAD.decode(value) {
         Ok(bytes) => bytes.len() == 32 && URL_SAFE_NO_PAD.encode(bytes) == value,
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod token_snapshot_tests {
+    use super::ChannelStore;
+    use rusqlite::ffi;
+    use std::{
+        ffi::{CStr, c_int, c_uint, c_void},
+        sync::mpsc,
+        time::Duration,
+    };
+
+    struct TraceBarrier {
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    // SQLite invokes this synchronously immediately before stepping a statement.
+    unsafe extern "C" fn pause_token_statement(
+        event: c_uint,
+        context: *mut c_void,
+        _statement: *mut c_void,
+        sql: *mut c_void,
+    ) -> c_int {
+        if event != ffi::SQLITE_TRACE_STMT || context.is_null() || sql.is_null() {
+            return 0;
+        }
+        // SAFETY: SQLite supplies a valid NUL-terminated SQL string for this
+        // event, and the context remains alive until tracing is unregistered.
+        let text = unsafe { CStr::from_ptr(sql.cast()) };
+        if text
+            .to_bytes()
+            .starts_with(b"SELECT user_id FROM mcp_access_tokens")
+        {
+            // SAFETY: context points to the live TraceBarrier in the caller.
+            let barrier = unsafe { &*context.cast::<TraceBarrier>() };
+            if barrier.entered.send(()).is_ok() {
+                let _ = barrier.resume.recv_timeout(Duration::from_secs(5));
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn quarantine_committed_before_token_statement_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.db");
+        let resource = "https://example.invalid/mcp";
+        let store = ChannelStore::open(&path, &[133; 32]).unwrap();
+        let token = store.issue_access_token("101", resource, 1000, 60).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut barrier = Box::new(TraceBarrier {
+                entered: entered_tx,
+                resume: resume_rx,
+            });
+            // SAFETY: the connection is used only on this thread; the callback
+            // context outlives tracing and is unregistered before it is freed.
+            let handle = unsafe { store.db.handle() };
+            let registered = unsafe {
+                ffi::sqlite3_trace_v2(
+                    handle,
+                    ffi::SQLITE_TRACE_STMT,
+                    Some(pause_token_statement),
+                    (&mut *barrier as *mut TraceBarrier).cast(),
+                )
+            };
+            assert_eq!(registered, ffi::SQLITE_OK);
+            let result = store.verify_access_token(&token, resource, 1001);
+            let removed = unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+            assert_eq!(removed, ffi::SQLITE_OK);
+            result
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        // Fault injection: leave the token behind to test the decision itself;
+        // the normal recovery flow invalidates it atomically with quarantine.
+        writer
+            .execute(
+                "INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+                [],
+            )
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), None);
     }
 }
