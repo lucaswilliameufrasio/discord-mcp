@@ -720,6 +720,29 @@ nega mensagens: não executa captura, não identifica automaticamente processos,
 não aplica isolamento obrigatório e não protege o aplicativo real. A recusa é
 conservadora, não uma solução para o acesso concorrente.
 
+#### Exercício opt-in de corretor com UID subordinado
+
+`tests/subuid_broker_fixture.py` inicia um corretor sintético em user namespace,
+com UID subordinado e diretório SQLite próprio `0700`. No host de teste, o UID
+original não conseguiu abrir o banco diretamente; após matar o corretor com
+transação aberta, um novo corretor da mesma identidade verificou rollback e
+integridade. Entretanto, outro processo iniciado pelo mesmo usuário conseguiu
+mapear o mesmo UID subordinado, abrir o banco diretamente e confirmar uma linha.
+O gate sintético permaneceu fechado antes e depois da escrita.
+
+O ensaio usa somente banco e diretórios temporários próprios; um processo da
+identidade subordinada remove apenas os arquivos conhecidos da fixture após os
+subprocessos terminarem. O resultado depende dos mapeamentos e permissões locais:
+separar o corretor do UID original não prova exclusividade quando outros
+processos conseguem assumir a identidade subordinada. A fixture não autentica
+o corretor, não cobre todos os caminhos de acesso, captura incremental ou
+recuperação de host e não é integração operacional. Requer user namespaces,
+mapeamentos subordinados e escopo transitório próprio:
+
+```sh
+systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/subuid_broker_fixture.py"
+```
+
 #### Exercício opt-in de restrição por processo
 
 `tests/landlock_boundary_fixture.py` usa Landlock Linux ABI 3 ou superior em
