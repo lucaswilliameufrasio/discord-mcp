@@ -539,6 +539,34 @@ ou modificadas. Não foi executado teste de cgroup isolado e não se conclui que
 esse recurso esteja indisponível. A fixture continua recebendo a condição de
 inventário incompleto do teste, sem um mecanismo que a determine por si só.
 
+#### Exercício opt-in de fronteira cgroup v2
+
+`tests/cgroup_boundary_fixture.py` é uma pesquisa Linux independente da aplicação.
+Ela só aceita um escopo transitório cujo nome comece por
+`discord-mcp-cgroup-drill-`, cria um subgrupo próprio e remove somente esse
+subgrupo ao terminar. Requer systemd de usuário acessível, delegação cgroup v2,
+Python 3 com `pidfd_open`/`pidfd_send_signal` e permissão para criar o subgrupo.
+Não faz parte de `cargo test`; não execute em uma hierarquia compartilhada ou
+em um escopo que não seja criado exclusivamente para este exercício:
+
+```sh
+systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/cgroup_boundary_fixture.py"
+```
+
+Em 2026-11-05, o escopo transitório delegado permitiu observar o descendente no
+subgrupo após a saída do lançador, inclusive após `setsid`. Contudo, o próprio
+descendente conseguiu mover-se do subgrupo para o escopo pai e o subgrupo passou
+a indicar `populated 0` enquanto ele ainda vivia. A fixture manteve a decisão
+sintética fechada e confirmou que seu subgrupo estava vazio ao terminar; a
+consulta posterior não listou unidades transitórias do exercício. Portanto,
+nessa configuração de permissões, subgrupo vazio não comprova fim dos escritores.
+
+O teste move somente seu próprio subprocesso entre subgrupo e escopo transitório;
+não modifica grupos compartilhados. Ele não testa separação de identidades,
+cgroup namespaces, uma configuração endurecida, acesso a SQLite ou efeitos
+externos, nem prova resistência a todos os escapes. O sistema de produção não
+possui essa fronteira integrada ou qualificada; não reabrir com base neste ensaio.
+
 Uma fixture de inventário investiga a janela entre lançar e registrar um
 escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
 subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de
