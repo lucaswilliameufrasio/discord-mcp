@@ -490,6 +490,53 @@ async fn disconnected_cooperative_writer_blocks_drain_until_commit() {
 }
 
 #[tokio::test]
+async fn replacing_activity_lock_allows_false_drain_with_cooperative_writer() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut writer = start_writer_with_disconnect(fixture.dir.path(), true).await;
+    let mut capture = fixture.connect("CLOSE").await;
+    assert_eq!(line(&mut capture).await, "CLOSED");
+    assert_eq!(line(&mut capture).await, "BARRIER_BUSY");
+
+    let barrier = fixture.dir.path().join("activity.lock");
+    let replacement = fixture.dir.path().join("replacement.lock");
+    std::fs::write(&replacement, []).unwrap();
+    let original_inode = std::fs::metadata(&barrier).unwrap().ino();
+    assert_ne!(
+        original_inode,
+        std::fs::metadata(&replacement).unwrap().ino()
+    );
+    std::fs::rename(&replacement, &barrier).unwrap();
+    assert_ne!(original_inode, std::fs::metadata(&barrier).unwrap().ino());
+
+    // The writer still owns the old inode; the authority locks the replacement.
+    assert_eq!(fixture.command("RETRY_DRAIN").await, "DRAINED");
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    writer
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"commit\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), writer.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let db = rusqlite::Connection::open(fixture.dir.path().join("writer.db")).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM writes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
+}
+
+#[tokio::test]
 async fn previous_writer_blocks_restart_and_capture_until_commit() {
     let mut fixture = Fixture::start().await;
     assert_eq!(fixture.command("OPEN").await, "OPENED");

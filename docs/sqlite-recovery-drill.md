@@ -287,6 +287,16 @@ subprocesso, a linha aparece e uma nova tentativa retorna `DRAINED`. A conclusã
 e a reabertura continuam explícitas. Isso cobre somente esse protocolo sintético
 e não comprova cooperação de todos os escritores do aplicativo.
 
+Outro teste substitui, no diretório temporário da fixture, o arquivo de lock
+de atividade por outro inode após um escritor cooperativo perder o socket e
+enquanto mantém sua transação e seu lock originais. Antes da substituição a
+autoridade responde `BARRIER_BUSY`; depois, `RETRY_DRAIN` retorna `DRAINED`,
+e o escritor ainda consegue confirmar. O teste verifica que os inodes são
+diferentes. Essa falha pressupõe que algum processo possa substituir a entrada
+no diretório do lock; não demonstra que tal acesso exista na implantação. A
+fixture não protege a identidade do arquivo e o resultado não estabelece uma
+solução para substituição, corrida de caminhos ou filesystem hostil.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
