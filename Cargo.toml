@@ -12,6 +12,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 subtle = "2.6.1"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "signal", "net"] }
 

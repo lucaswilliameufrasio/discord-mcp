@@ -27,6 +27,15 @@ deve implementar descoberta e autorização compatíveis com MCP, com PKCE,
 validação de audiência e consentimento; não deve repassar tokens Discord como
 tokens MCP. A CLI orientará o fluxo sem inserir segredos em argumentos.
 
+A fundação local de autorização contém tokens opacos de curta duração,
+armazenados como hashes, associados a usuário e recurso, com revogação e um
+middleware HTTP para verificá-los. Ela **não é um servidor OAuth**: ainda faltam
+login Discord, consentimento, descoberta MCP, autorização com PKCE, emissão por
+um fluxo validado e integração com o transporte MCP. Nenhum endpoint remoto de
+produção deve ser habilitado até que essas partes sejam implementadas e testadas.
+Cada operação deverá verificar o token em toda requisição e obter o usuário do
+contexto autenticado, nunca de argumentos fornecidos pelo cliente.
+
 ## Interface web
 
 As interfaces local e compartilhada oferecem navegação por finalidade, com

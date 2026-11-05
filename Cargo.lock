@@ -347,6 +347,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "serde",
+ "sha2",
  "subtle",
  "tempfile",
  "tokio",

@@ -6,6 +6,7 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::{bot::BotChannel, webhook::WebhookUrl};
 
@@ -27,6 +28,7 @@ pub enum StoreError {
     NotFound,
     Storage,
     Decryption,
+    PermissionDenied,
 }
 
 impl fmt::Display for StoreError {
@@ -36,6 +38,7 @@ impl fmt::Display for StoreError {
             Self::NotFound => "channel not found",
             Self::Storage => "channel storage error",
             Self::Decryption => "unable to decrypt channel credential",
+            Self::PermissionDenied => "channel access denied",
         })
     }
 }
@@ -121,6 +124,17 @@ impl ChannelStore {
             can_read INTEGER NOT NULL CHECK(can_read IN (0, 1)),
             can_send INTEGER NOT NULL CHECK(can_send IN (0, 1)),
             PRIMARY KEY (user_id, channel_name)
+        );",
+            )
+            .map_err(|_| StoreError::Storage)?;
+        store
+            .db
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mcp_access_tokens (
+            token_hash BLOB PRIMARY KEY NOT NULL,
+            user_id TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
         );",
             )
             .map_err(|_| StoreError::Storage)?;
@@ -305,8 +319,108 @@ impl ChannelStore {
         }
         Ok(granted)
     }
+
+    /// Resolve authorization and the destination from the same database snapshot.
+    /// Identity must be established by the server, never supplied by an MCP tool.
+    pub fn authorized_channel(
+        &self,
+        user_id: &str,
+        channel: &str,
+        action: ChannelAction,
+    ) -> Result<Channel, StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        if !self.is_permitted(user_id, channel, action)? {
+            return Err(StoreError::PermissionDenied);
+        }
+        let destination = self.get_channel(channel)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(destination)
+    }
+
+    /// Issue only after identity and consent have been verified by the authorization server.
+    /// Resource must come from trusted server configuration, not directly from a request.
+    pub fn issue_access_token(
+        &self,
+        user_id: &str,
+        resource: &str,
+        now: i64,
+        lifetime_seconds: i64,
+    ) -> Result<String, StoreError> {
+        if !valid_user_id(user_id)
+            || !valid_resource(resource)
+            || now < 0
+            || !(1..=3600).contains(&lifetime_seconds)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let expires_at = now
+            .checked_add(lifetime_seconds)
+            .ok_or(StoreError::InvalidInput)?;
+        let mut token = [0u8; 32];
+        getrandom::fill(&mut token).map_err(|_| StoreError::Storage)?;
+        let encoded = hex::encode(token);
+        let hash = Sha256::digest(encoded.as_bytes());
+        self.db.execute("INSERT INTO mcp_access_tokens(token_hash,user_id,resource,expires_at) VALUES (?1,?2,?3,?4)", params![hash.as_slice(), user_id, resource, expires_at]).map_err(|_| StoreError::Storage)?;
+        Ok(encoded)
+    }
+
+    /// Validate expiry and exact intended resource on every request.
+    pub fn verify_access_token(
+        &self,
+        token: &str,
+        resource: &str,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
+        if !valid_token(token) || !valid_resource(resource) || now < 0 {
+            return Ok(None);
+        }
+        let hash = Sha256::digest(token.as_bytes());
+        self.db.query_row("SELECT user_id FROM mcp_access_tokens WHERE token_hash=?1 AND resource=?2 AND expires_at>?3", params![hash.as_slice(), resource, now], |row| row.get(0)).optional().map_err(|_| StoreError::Storage)
+    }
+
+    pub fn revoke_access_token(&self, token: &str) -> Result<(), StoreError> {
+        if !valid_token(token) {
+            return Ok(());
+        }
+        let hash = Sha256::digest(token.as_bytes());
+        self.db
+            .execute(
+                "DELETE FROM mcp_access_tokens WHERE token_hash=?1",
+                [hash.as_slice()],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        Ok(())
+    }
 }
 
 fn valid_user_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn valid_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_resource(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let local = url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+        );
+    (url.scheme() == "https" || local)
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.as_str() == value
 }
