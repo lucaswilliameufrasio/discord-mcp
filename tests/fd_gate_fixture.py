@@ -60,6 +60,8 @@ def authority(socket_fd, directory):
     capture_path = os.path.join(directory, "capture.lock")
     activity_path = os.path.join(directory, "activity.lock")
     marker_path = os.path.join(directory, "closed-marker")
+    pending_path = os.path.join(directory, "pending-marker")
+    artifact_path = os.path.join(directory, "synthetic-artifact")
     with open(marker_path, "wb") as marker:
         marker.write(b"closed\n")
         marker.flush()
@@ -75,13 +77,30 @@ def authority(socket_fd, directory):
             if fd is None:
                 sock.sendall(b"B")
             else:
-                os.close(fd)
-                opened = True
-                sock.sendall(b"O")
+                activity = try_exclusive(activity_path)
+                try:
+                    if activity is None:
+                        sock.sendall(b"B")
+                    else:
+                        with open(pending_path, "rb") as pending:
+                            clean = pending.read() == b"clean\n"
+                        if not clean:
+                            sock.sendall(b"P")
+                        else:
+                            opened = True
+                            sock.sendall(b"O")
+                finally:
+                    if activity is not None:
+                        os.close(activity)
+                    os.close(fd)
         elif command == b"W":
             sock.sendall(b"Y" if opened else b"N")
         elif command == b"C":
             opened = False
+            with open(pending_path, "rb") as pending:
+                if pending.read() != b"clean\n":
+                    sock.sendall(b"P")
+                    continue
             with open(marker_path, "wb") as marker:
                 marker.write(b"closed\n")
                 marker.flush()
@@ -96,6 +115,10 @@ def authority(socket_fd, directory):
                     sock.sendall(b"B")
                     continue
                 try:
+                    with open(pending_path, "wb") as pending:
+                        pending.write(b"pending\n")
+                        pending.flush()
+                        os.fsync(pending.fileno())
                     send_lock(sock, capture)
                 finally:
                     os.close(capture)
@@ -105,6 +128,36 @@ def authority(socket_fd, directory):
             if sock.recv(1) != b"A":
                 return
             sock.sendall(b"K")
+        elif command == b"X":
+            if opened:
+                sock.sendall(b"N")
+                continue
+            capture = try_exclusive(capture_path)
+            if capture is None:
+                sock.sendall(b"B")
+                continue
+            activity = try_exclusive(activity_path)
+            try:
+                if activity is None:
+                    sock.sendall(b"B")
+                else:
+                    try:
+                        with open(artifact_path, "rb") as artifact:
+                            valid = artifact.read() == b"synthetic-complete\n"
+                    except FileNotFoundError:
+                        valid = False
+                    if not valid:
+                        sock.sendall(b"F")
+                    else:
+                        with open(pending_path, "wb") as pending:
+                            pending.write(b"clean\n")
+                            pending.flush()
+                            os.fsync(pending.fileno())
+                        sock.sendall(b"X")
+            finally:
+                if activity is not None:
+                    os.close(activity)
+                os.close(capture)
         else:
             raise RuntimeError("unexpected fixture command")
 
@@ -126,8 +179,10 @@ class AuthorityTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        for name in ("capture.lock", "activity.lock", "closed-marker"):
+        for name in ("capture.lock", "activity.lock", "closed-marker", "pending-marker"):
             open(os.path.join(self.directory.name, name), "wb").close()
+        with open(os.path.join(self.directory.name, "pending-marker"), "wb") as pending:
+            pending.write(b"clean\n")
         self.children = []
         self.sockets = []
         self.addCleanup(self.cleanup_processes)
@@ -156,6 +211,21 @@ class AuthorityTests(unittest.TestCase):
         sock.sendall(command)
         return sock.recv(1)
 
+    def test_restart_refuses_open_with_previous_writer_still_active(self):
+        child, sock = self.start_authority()
+        self.assertEqual(self.command(sock, b"O"), b"O")
+        writer = os.open(os.path.join(self.directory.name, "activity.lock"), os.O_RDWR)
+        try:
+            fcntl.flock(writer, fcntl.LOCK_SH)
+            child.kill()
+            child.wait(timeout=5)
+            _, restarted = self.start_authority()
+            self.assertEqual(self.command(restarted, b"W"), b"N")
+            self.assertEqual(self.command(restarted, b"O"), b"B")
+        finally:
+            os.close(writer)
+        self.assertEqual(self.command(restarted, b"O"), b"O")
+
     def test_restart_keeps_admission_closed_until_transferred_lock_released(self):
         child, sock = self.start_authority()
         self.assertEqual(self.command(sock, b"O"), b"O")
@@ -171,7 +241,7 @@ class AuthorityTests(unittest.TestCase):
         os.close(os.dup(fd))  # unrelated duplicate closure does not release fd
         self.assertEqual(self.command(restarted, b"O"), b"B")
         os.close(fd)
-        self.assertEqual(self.command(restarted, b"O"), b"O")
+        self.assertEqual(self.command(restarted, b"O"), b"P")
 
     def test_lost_ack_and_drain_retry(self):
         child, sock = self.start_authority()
@@ -190,6 +260,35 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(self.command(restarted, b"O"), b"B")
         self.assertEqual(self.command(restarted, b"W"), b"N")
         os.close(fd)
+        self.assertEqual(self.command(restarted, b"O"), b"P")
+
+    def test_partial_capture_requires_reconciliation_after_restart(self):
+        child, sock = self.start_authority()
+        self.assertEqual(self.command(sock, b"O"), b"O")
+        sock.sendall(b"C")
+        fd = receive_lock(sock)
+        self.assertEqual(self.command(sock, b"A"), b"K")
+        artifact_path = os.path.join(self.directory.name, "synthetic-artifact")
+        with open(artifact_path, "wb") as artifact:
+            artifact.write(b"truncated")
+        child.kill()
+        child.wait(timeout=5)
+        _, restarted = self.start_authority()
+        self.assertEqual(self.command(restarted, b"X"), b"B")
+        os.close(fd)
+        self.assertEqual(self.command(restarted, b"O"), b"P")
+        self.assertEqual(self.command(restarted, b"C"), b"P")
+        self.assertEqual(self.command(restarted, b"X"), b"F")
+        self.assertEqual(self.command(restarted, b"W"), b"N")
+        with open(artifact_path, "wb") as artifact:
+            artifact.write(b"synthetic-complete\n")
+        writer = os.open(os.path.join(self.directory.name, "activity.lock"), os.O_RDWR)
+        try:
+            fcntl.flock(writer, fcntl.LOCK_SH)
+            self.assertEqual(self.command(restarted, b"X"), b"B")
+        finally:
+            os.close(writer)
+        self.assertEqual(self.command(restarted, b"X"), b"X")
         self.assertEqual(self.command(restarted, b"O"), b"O")
 
 

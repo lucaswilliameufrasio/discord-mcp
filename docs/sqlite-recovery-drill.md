@@ -361,12 +361,28 @@ e dados sintéticos; o cliente de captura é o próprio processo do teste.
 
 A demonstração não resolve a segurança operacional: a autoridade é uma máquina
 de estados mínima, com um único cliente, e não coordena conexões ou escritores
-da aplicação. A abertura não reconcilia escritores antigos; o lock transferido
+da aplicação. O lock transferido
 pode ser fechado ou repassado indevidamente; não há autenticação, garantia de
 captura concluída, persistência de diretório, recuperação de publicação parcial
 ou acesso real à biblioteca de captura. A posse do descritor é uma capacidade,
 não prova de identidade nem de que o trabalho terminou. Esses resultados não
 qualificam reinício de host, perda de energia ou implantação.
+
+Ampliação posterior: a abertura também exige o lock exclusivo de atividade,
+para recusar escritores sintéticos que sobreviveram ao reinício; o teste de
+regressão primeiro observou a abertura incorreta com um lock compartilhado ativo.
+Antes da transferência, o fixture sincroniza um marcador `pending`; após
+reinício, a abertura e outra captura recusam esse estado. Um comando explícito
+`X`, com ambas as barreiras livres, só limpa o marcador quando um arquivo de
+teste contém exatamente `synthetic-complete`. O teste rejeita um arquivo
+truncado e uma barreira ocupada antes de aceitar o conteúdo sintético.
+
+Essa verificação é **apenas um modelo**, não valida LTX, TXID, checksums, spool,
+publicação remota ou integridade SQLite. A substituição do conteúdo truncado é
+realizada pelo próprio teste, não por um algoritmo de recuperação; não existe
+reconciliação operacional de captura parcial. O marcador é sobrescrito em lugar,
+sem qualificação de falhas de gravação, sincronização de diretório ou perda de
+energia. A autoridade continua de cliente único e os locks são consultivos.
 
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
