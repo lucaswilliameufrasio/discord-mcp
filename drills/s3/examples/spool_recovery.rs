@@ -527,6 +527,115 @@ mod tests {
         drop(lock);
     }
 
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn continuity_authority_worker() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            os::unix::net::UnixListener,
+            sync::{Arc, Mutex},
+        };
+        let Some(dir) = std::env::var_os("CONTINUITY_AUTHORITY_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let listener = UnixListener::bind(dir.join("authority.sock")).unwrap();
+        // (open, capture-running, capture-completed); every process starts closed.
+        let state = Arc::new(Mutex::new((false, false, false)));
+        eprintln!("MARK ready");
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let state = state.clone();
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                match command.trim() {
+                    "WRITE" => {
+                        let guard = state.lock().unwrap();
+                        writeln!(stream, "{}", if guard.0 { "ADMITTED" } else { "DENIED" })
+                            .unwrap();
+                    }
+                    "OPEN" => {
+                        let mut guard = state.lock().unwrap();
+                        if guard.1 || !guard.2 {
+                            writeln!(stream, "DENIED").unwrap();
+                            return;
+                        }
+                        let lock = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(dir.join("writers.lock"))
+                            .unwrap();
+                        if lock.try_lock().is_err() {
+                            writeln!(stream, "BUSY").unwrap();
+                            return;
+                        }
+                        guard.0 = true;
+                        writeln!(stream, "OPENED").unwrap();
+                    }
+                    "CAPTURE" => {
+                        {
+                            let mut guard = state.lock().unwrap();
+                            if guard.1 {
+                                writeln!(stream, "BUSY").unwrap();
+                                return;
+                            }
+                            guard.0 = false;
+                            guard.1 = true;
+                            guard.2 = false;
+                        }
+                        let lock = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(dir.join("writers.lock"))
+                            .unwrap();
+                        if lock.try_lock().is_err() {
+                            state.lock().unwrap().1 = false;
+                            writeln!(stream, "BUSY").unwrap();
+                            return;
+                        }
+                        let db = rusqlite::Connection::open(dir.join("source.db")).unwrap();
+                        let image = tempfile::Builder::new()
+                            .prefix("authority-image-")
+                            .tempfile_in(&dir)
+                            .unwrap();
+                        let actual = image_state(&db, image.path());
+                        if format!("{actual:?}")
+                            != fs::read_to_string(dir.join("witness.txt")).unwrap()
+                        {
+                            state.lock().unwrap().1 = false;
+                            writeln!(stream, "MISMATCH").unwrap();
+                            return;
+                        }
+                        writeln!(stream, "VERIFIED").unwrap();
+                        let mut next = String::new();
+                        if reader.read_line(&mut next).is_err() || next.trim() != "GO" {
+                            state.lock().unwrap().1 = false;
+                            return;
+                        }
+                        let result = sqlite_replication_core::capture_once(
+                            dir.join("source.db"),
+                            dir.join("repository"),
+                            &IsolatedGate,
+                        );
+                        let mut guard = state.lock().unwrap();
+                        guard.1 = false;
+                        if result.is_ok() {
+                            guard.2 = true;
+                            writeln!(stream, "CAPTURED").unwrap();
+                        } else {
+                            writeln!(stream, "FAILED").unwrap();
+                        }
+                        drop(lock);
+                    }
+                    _ => {}
+                }
+            });
+        }
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     async fn barrier_worker(
         dir: &Path,
@@ -547,6 +656,157 @@ mod tests {
             .unwrap();
         let stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
         (child, stderr)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn start_continuity_authority(dir: &Path) -> tokio::process::Child {
+        use std::process::Stdio;
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("CONTINUITY_AUTHORITY_DIR", dir)
+            .args([
+                "--exact",
+                "tests::continuity_authority_worker",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+        barrier_marker(&mut stderr, "ready").await;
+        child
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn authority_command(
+        dir: &Path,
+        command: &str,
+    ) -> tokio::io::BufReader<tokio::net::UnixStream> {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::UnixStream::connect(dir.join("authority.sock"))
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::io::BufReader::new(stream)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn authority_line(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) -> String {
+        use tokio::{
+            io::AsyncBufReadExt,
+            time::{Duration, timeout},
+        };
+        let mut line = String::new();
+        let count = timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(count > 0);
+        line.trim().to_owned()
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn authority_starts_closed_survives_capture_crash_and_requires_reverification() {
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+        let (dir, db) = barrier_fixture();
+        let witness = fs::read(dir.path().join("witness.txt")).unwrap();
+        let mut authority = start_continuity_authority(dir.path()).await;
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        fs::write(dir.path().join("witness.txt"), b"invalid synthetic witness").unwrap();
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE").await).await,
+            "MISMATCH"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        fs::write(dir.path().join("witness.txt"), witness).unwrap();
+        let mut capture = authority_command(dir.path(), "CAPTURE").await;
+        assert_eq!(authority_line(&mut capture).await, "VERIFIED");
+        let writer_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("writers.lock"))
+            .unwrap();
+        assert!(writer_lock.try_lock_shared().is_err());
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        writer_lock.try_lock_shared().unwrap();
+        assert!(
+            tokio::net::UnixStream::connect(dir.path().join("authority.sock"))
+                .await
+                .is_err()
+        );
+        drop(writer_lock);
+        // Only this fixture-owned socket is removed after its process was reaped.
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let mut restarted = start_continuity_authority(dir.path()).await;
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        let mut capture = authority_command(dir.path(), "CAPTURE").await;
+        assert_eq!(authority_line(&mut capture).await, "VERIFIED");
+        capture.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut capture).await, "CAPTURED");
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "OPENED"
+        );
+        let writer_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("writers.lock"))
+            .unwrap();
+        writer_lock.lock_shared().unwrap();
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "ADMITTED"
+        );
+        db.execute("INSERT INTO records VALUES(2, 'after-open')", [])
+            .unwrap();
+        drop(writer_lock);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

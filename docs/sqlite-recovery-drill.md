@@ -552,6 +552,28 @@ falha parcial de publicação. A evidência continua uma tupla não criptográfi
 de frescor e custódia não qualificados. Esses resultados não autorizam integrar
 o protótipo ao gate real ou habilitar replicação operacional.
 
+#### Autoridade reiniciada fechada com verificação e captura
+
+Um fixture adicional do exemplo executa uma autoridade sintética em subprocesso
+com socket Unix: ela inicia fechada, mantém lock exclusivo de atividade durante
+a comparação da imagem com a evidência e a chamada `capture_once`, e permanece
+fechada até um comando explícito de abertura após sucesso. O teste verificou
+recusa com evidência inválida, lock ocupado durante a verificação, morte da
+autoridade antes da captura, falha de conexão enquanto ausente, e recusa após
+reinício até nova verificação, captura e abertura. Só então um escritor de
+teste adquire o lock compartilhado, pede admissão e grava uma linha sintética.
+O processo anterior é encerrado antes de o teste remover apenas seu socket
+temporário; não é um procedimento para sockets de produção.
+
+Este fixture não prova fail-closed para a aplicação: depende de cada escritor
+adquirir o lock e consultar a autoridade sem fallback, não autentica conexões,
+não acompanha efeitos externos ou a conclusão de escritores já admitidos,
+e não faz gestão segura de socket, inode, substituição de arquivo ou múltiplas
+autoridades. A morte foi antes de `capture_once`; perda durante publicação e
+evidência independente durável não foram testadas nesse fluxo. Não cobre
+perda de energia, rede, estado parcial nem identidade da fonte. O gate real
+continua não implementado e não deve ser inferido desses resultados.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
