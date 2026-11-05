@@ -131,9 +131,18 @@ integrados; não liberar reconciliação operacional apenas com esses requisitos
 O teste `multiple_stdio_instances_observe_shared_channel_changes`, em
 `tests/stdio.rs`, inicia dois processos stdio reais com o mesmo banco sintético,
 registra um canal após ambos inicializarem e verifica que os dois resolvem esse
-canal em requisições MCP locais. O teste não faz chamadas ao Discord. Ele prova
-somente esse compartilhamento de leitura; não verifica escritas simultâneas,
-coordenação da captura, exclusividade global ou recuperação operacional.
+canal em requisições MCP locais. O teste não faz chamadas ao Discord. Esse
+trecho verifica compartilhamento de leitura, não coordenação da captura,
+exclusividade global ou recuperação operacional.
+
+O mesmo teste também mantém as duas instâncias stdio ativas enquanto dois
+processos CLI cadastram canais distintos no mesmo banco. Ambos os cadastros
+devem terminar e os dois processos MCP devem observar os dois canais. A
+transação de cadastro usa `BEGIN IMMEDIATE` antes da verificação de quarentena,
+evitando a promoção de uma leitura diferida para escrita no WAL; a espera por
+contenção continua limitada pelo `busy_timeout` do armazenamento. Isso cobre
+cadastros concorrentes nesse cenário local, não todos os métodos de escrita nem
+fencing para captura incremental.
 
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa

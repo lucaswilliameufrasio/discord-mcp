@@ -223,6 +223,66 @@ async fn multiple_stdio_instances_observe_shared_channel_changes() {
                 .contains("limit must be")
         );
     }
+    // Two independent administrative processes write while both stdio servers
+    // remain live. SQLite serializes their separate transactions.
+    let mut writers = Vec::new();
+    for name in ["first", "second"] {
+        let mut writer = AsyncCommand::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_DB", &database)
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .args(["add-channel", name])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"https://discord.com/api/webhooks/123/synthetic\n")
+            .await
+            .unwrap();
+        writers.push(writer);
+    }
+    for writer in writers {
+        let result = timeout(Duration::from_secs(8), writer.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "administrative writer failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    for (input, output) in [
+        (&mut first_input, &mut first_output),
+        (&mut second_input, &mut second_output),
+    ] {
+        for (id, name) in [(3, "first"), (4, "second")] {
+            let response = request(
+                input,
+                output,
+                json!({
+                    "jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
+                        "name":"read_messages", "arguments":{"channel":name}
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(response["id"], id);
+            assert!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("do not support reading")
+            );
+        }
+    }
+    assert_eq!(store.list().unwrap(), vec!["first", "second", "shared"]);
     drop(first_input);
     drop(second_input);
     assert!(

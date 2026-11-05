@@ -412,10 +412,11 @@ impl ChannelStore {
                 },
             )
             .map_err(|_| StoreError::Storage)?;
-        let transaction = self
-            .db
-            .unchecked_transaction()
-            .map_err(|_| StoreError::Storage)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
         // A name can be repointed to a different Discord resource. Never carry
         // old grants over to a newly configured destination.
