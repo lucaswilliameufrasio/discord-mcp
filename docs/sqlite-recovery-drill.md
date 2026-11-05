@@ -244,6 +244,30 @@ defesa contra processos externos ou coordenação real dos módulos da aplicaç�
 Não há garantia de crash/power-loss ou de segurança em filesystem de rede.
 Nenhuma autoridade ou comando deste teste é integrado à CLI ou ao servidor.
 
+#### Barreira de atividade após reinício
+
+O mesmo fixture agora experimenta um lock compartilhado de atividade mantido
+por um subprocesso escritor desde antes da admissão até depois do commit e
+fechamento SQLite. A autoridade reiniciada tenta obter esse lock em modo
+exclusivo antes de reabrir ou declarar a drenagem. Nos testes sintéticos, uma
+transação anterior ao reinício bloqueou `OPEN` e `RETRY_DRAIN`; após commit,
+a drenagem e a reabertura explícita ocorreram. Quando o escritor foi morto, o
+lock foi liberado e o SQLite reverteu sua transação. O teste anterior que não
+usa o lock continua demonstrando que um escritor não cooperativo pode confirmar.
+
+O socket perdido não cancela por si só o escritor: a barreira depende dele
+manter o lock por toda a transação. Os locks são consultivos e não protegem
+contra escritores externos, troca de inode, symlinks, múltiplos hosts, sistemas
+de arquivos remotos ou perda de energia. Um escritor que obtém o lock antes de
+ser admitido pode bloquear temporariamente a reabertura. Não há integração com
+captura real, autenticação, deadlines nem política de recuperação de processos.
+
+**Falha adicional demonstrada:** `RETRY_DRAIN` aceita drenagem após
+`CLOSE_FAIL` sem repetir a persistência que falhou. A admissão continua fechada
+no teste, mas a captura não pode ser considerada autorizada com persistência
+comprovada. O teste registra essa deficiência em vez de validá-la como segura;
+o protocolo continua inadequado para produção.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
