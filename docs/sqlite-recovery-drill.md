@@ -252,6 +252,14 @@ defesa contra processos externos ou coordenação real dos módulos da aplicaç�
 Não há garantia de crash/power-loss ou de segurança em filesystem de rede.
 Nenhuma autoridade ou comando deste teste é integrado à CLI ou ao servidor.
 
+Um teste adicional mantém a autoridade viva e encerra somente o socket de um
+cliente admitido, deliberadamente sem lock cooperativo, enquanto sua transação
+SQLite continua aberta. A autoridade responde `CLOSED` e `DRAINED`; em seguida,
+o cliente ainda confirma a transação, embora novas admissões sejam recusadas.
+Assim, EOF no canal de controle não prova o fim da escrita, mesmo sem morte ou
+reinício da autoridade. Este cenário não contradiz a barreira cooperativa abaixo:
+ela depende de todos os escritores manterem o lock até terminarem a transação.
+
 #### Barreira de atividade após reinício
 
 O mesmo fixture agora experimenta um lock compartilhado de atividade mantido

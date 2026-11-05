@@ -763,3 +763,30 @@ async fn coordinator_death_does_not_revoke_an_existing_sqlite_transaction() {
         .unwrap();
     assert_eq!(committed, 1);
 }
+
+#[tokio::test]
+async fn disconnected_writer_can_commit_after_authority_reports_drain() {
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let mut writer = fixture.connect("WRITE").await;
+    assert_eq!(line(&mut writer).await, "ADMITTED");
+    let db = rusqlite::Connection::open(fixture.dir.path().join("disconnect.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE writes(value INTEGER); BEGIN IMMEDIATE; INSERT INTO writes VALUES (1);",
+    )
+    .unwrap();
+
+    // Losing the control connection is not proof that the transaction ended.
+    // This deliberately nonconforming client also omits the cooperative lock.
+    drop(writer);
+    let mut capture = fixture.connect("CLOSE").await;
+    assert_eq!(line(&mut capture).await, "CLOSED");
+    assert_eq!(line(&mut capture).await, "DRAINED");
+    db.execute_batch("COMMIT").unwrap();
+    let committed: i64 = db
+        .query_row("SELECT COUNT(*) FROM writes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(committed, 1);
+    assert_eq!(fixture.command("WRITE").await, "DENIED");
+    assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
+}
