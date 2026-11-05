@@ -393,6 +393,23 @@ solta o lock ao retornar e não fornece uma barreira operacional contínua; não
 deve usar seu resultado para liberar escritores reais. A falha de persistência
 é injetada, não um erro do filesystem.
 
+Um experimento adicional usa uma autoridade sintética de processo único e um
+solicitante em subprocesso, com sockets separados para controle e admissão. Um
+lock compartilhado antigo impede a drenagem; depois que ele é liberado, a
+autoridade mantém o lock exclusivo enquanto persiste `clean` e nega solicitações.
+Outra tentativa de lock compartilhado também falha nessa janela. Após matar a
+autoridade antes da abertura, outra instância começa fechada, repete drenagem e
+persistência e só admite o solicitante depois do comando explícito de abertura.
+O processamento de desbloqueio e abertura é serializado no mesmo loop de eventos.
+
+O solicitante apenas troca mensagens: não inicia transação SQLite nem mantém
+permissão de escrita após admissão. O teste não combina essa transição com a
+reconciliação de handles anterior, não cobre solicitações simultâneas em larga
+escala, morte após abertura, processos independentes não cooperativos, múltiplas
+autoridades, autenticação, perda de supervisor/âncora ou falhas de `fsync` reais.
+A âncora permanece no processo de teste. Portanto a transição é uma fixture, não
+uma garantia de continuidade ou gate operacional.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;

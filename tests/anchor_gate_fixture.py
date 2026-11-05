@@ -62,6 +62,64 @@ def publisher(sock_fd, directory, failure):
             os.close(fd)
 
 
+def transition_authority(control_fd, writer_fd, barrier_fd, state_path):
+    control = socket.socket(fileno=control_fd)
+    writer = socket.socket(fileno=writer_fd)
+    opened = False
+    held = False
+    prepared = False
+    while True:
+        ready, _, _ = select.select([control, writer], [], [], 5)
+        if not ready:
+            raise TimeoutError("transition fixture timed out")
+        if control in ready:
+            command = control.recv(1)
+            if not command:
+                return
+            if command == b"D":
+                try:
+                    fcntl.flock(barrier_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    control.sendall(b"B")
+                else:
+                    held = True
+                    control.sendall(b"D")
+            elif command == b"P" and held:
+                with open(state_path, "r+b", buffering=0) as state:
+                    state.seek(0)
+                    state.write(b"clean\n")
+                    state.truncate()
+                    os.fsync(state.fileno())
+                prepared = True
+                control.sendall(b"P")
+            elif command == b"O" and held and prepared:
+                # This single event loop cannot process writer requests between
+                # unlock and its in-memory admission transition.
+                fcntl.flock(barrier_fd, fcntl.LOCK_UN)
+                held = False
+                opened = True
+                control.sendall(b"O")
+            else:
+                control.sendall(b"N")
+        if writer in ready:
+            request = writer.recv(1)
+            if not request:
+                return
+            if request != b"W":
+                raise RuntimeError("unexpected writer request")
+            writer.sendall(b"Y" if opened else b"N")
+
+
+def transition_contender(fd):
+    sock = socket.socket(fileno=fd)
+    sock.settimeout(5)
+    for command in sys.stdin:
+        if command.strip() != "probe":
+            raise RuntimeError("unexpected contender command")
+        sock.sendall(b"W")
+        print(sock.recv(1).decode(), flush=True)
+
+
 def receive_descriptor(sock):
     data, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
     if not data:
@@ -112,6 +170,94 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_transition_holds_barrier_and_restart_stays_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            state = os.path.join(directory, "state")
+            with open(path, "wb"):
+                pass
+            with open(state, "wb") as marker:
+                marker.write(b"uncertain\n")
+            anchor = os.open(path, os.O_RDWR)
+            processes = []
+            sockets = []
+
+            def cleanup():
+                for sock in sockets:
+                    sock.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                os.close(anchor)
+
+            self.addCleanup(cleanup)
+
+            def start_authority():
+                control, control_peer = socket.socketpair()
+                writer, writer_peer = socket.socketpair()
+                control.settimeout(5)
+                barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    authority = subprocess.Popen(
+                        [sys.executable, __file__, "transition", str(control_peer.fileno()),
+                         str(writer_peer.fileno()), str(barrier), state],
+                        pass_fds=(control_peer.fileno(), writer_peer.fileno(), barrier),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                finally:
+                    control_peer.close()
+                    writer_peer.close()
+                    os.close(barrier)
+                contender = subprocess.Popen(
+                    [sys.executable, __file__, "contender", str(writer.fileno())],
+                    pass_fds=(writer.fileno(),), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                writer.close()
+                processes.extend((authority, contender))
+                sockets.append(control)
+                return authority, contender, control
+
+            def probe(contender):
+                contender.stdin.write("probe\n")
+                contender.stdin.flush()
+                return line(contender.stdout)
+
+            def command(control, value):
+                control.sendall(value)
+                return control.recv(1)
+
+            old_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            fcntl.flock(old_fd, fcntl.LOCK_SH)
+            authority, contender, control = start_authority()
+            self.assertEqual(probe(contender), "N")
+            self.assertEqual(command(control, b"D"), b"B")
+            os.close(old_fd)
+            self.assertEqual(command(control, b"D"), b"D")
+            self.assertEqual(command(control, b"P"), b"P")
+            self.assertEqual(probe(contender), "N")
+            competing = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(competing, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            finally:
+                os.close(competing)
+            authority.kill()
+            authority.wait(timeout=5)
+            contender.stdin.close()
+            contender.stdin = None
+            contender.wait(timeout=5)
+            restarted, later, restarted_control = start_authority()
+            self.assertEqual(probe(later), "N")
+            self.assertEqual(command(restarted_control, b"D"), b"D")
+            self.assertEqual(command(restarted_control, b"P"), b"P")
+            self.assertEqual(probe(later), "N")
+            self.assertEqual(command(restarted_control, b"O"), b"O")
+            self.assertEqual(probe(later), "Y")
+            restarted_control.close()
+            restarted.wait(timeout=5)
+
     def test_reconcile_tracked_writers_only_after_anchor_holder_dies(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
@@ -394,7 +540,11 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "publisher":
+    if len(sys.argv) == 6 and sys.argv[1] == "transition":
+        transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+    elif len(sys.argv) == 3 and sys.argv[1] == "contender":
+        transition_contender(int(sys.argv[2]))
+    elif len(sys.argv) == 5 and sys.argv[1] == "publisher":
         publisher(int(sys.argv[2]), sys.argv[3], sys.argv[4])
     elif len(sys.argv) == 3 and sys.argv[1] in ("writer", "authority", "keeper", "guard", "restart"):
         child(sys.argv[1], int(sys.argv[2]))
