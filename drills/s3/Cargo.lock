@@ -815,7 +815,11 @@ dependencies = [
  "aws-sdk-s3",
  "discord-mcp",
  "sqlite-replication-core",
+ "sqlite-replication-ltx",
+ "sqlite-replication-spool",
+ "sqlite-replication-storage-fs",
  "sqlite-replication-storage-s3",
+ "sqlite-replication-wal",
  "tempfile",
  "tokio",
 ]

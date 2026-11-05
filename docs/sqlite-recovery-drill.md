@@ -384,6 +384,34 @@ reconciliação operacional de captura parcial. O marcador é sobrescrito em lug
 sem qualificação de falhas de gravação, sincronização de diretório ou perda de
 energia. A autoridade continua de cliente único e os locks são consultivos.
 
+#### Reconciliação isolada de spool LTX
+
+O teste abaixo usa diretamente as bibliotecas locais de LTX, spool e filesystem
+do checkout irmão, sem Floci ou acesso a dados reais:
+
+```sh
+TMPDIR=/tmp/opencode cargo test --locked --manifest-path drills/s3/Cargo.toml --target-dir target/s3-drill --example spool_recovery
+```
+
+Ele cria em diretórios temporários uma imagem artificial de duas páginas com
+cabeçalho SQLite, um snapshot LTX TXID 1 e um delta LTX TXID 2 válido para a
+biblioteca. Após falha injetada no ponto `AfterLtxPublish`, o watermark continua
+em 1 enquanto o delta existe. `spool::recover` verifica a cadeia, atualiza o
+watermark para 2 e retorna o checksum esperado; uma segunda execução produz o
+mesmo estado. Em outro diretório, truncar o delta publicado faz a recuperação
+retornar erro sem avançar o watermark. Nos dois casos os bytes da imagem fonte
+sintética são comparados com a cópia original. Nenhuma base da aplicação é usada.
+
+Executado com checkout irmão em `f5c0984f069407913365136a10d5962f9a33930d`,
+com modificações e arquivos preexistentes, inclusive em `core/src/lib.rs` e
+`core/src/coordinator.rs`; a dependência por caminho não é fixada pelo lockfile
+e pode mudar concorrentemente. Não houve edição intencional do checkout irmão.
+A imagem artificial não comprova funcionamento de uma base SQLite real, e a
+falha é um retorno injetado, não SIGKILL nem perda de energia. O teste usa WAL
+vazio; a biblioteca exige reconciliar o estado recuperado com a base ativa quando
+a geração WAL não está disponível. Não foram testados captura real, publicação
+remota parcial, consistência com o banco da aplicação ou retomada operacional.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

@@ -14,3 +14,7 @@ aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["sigv
 aws-credential-types = "=1.3.1"
 tempfile = "3.27.0"
 tokio = { version = "=1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+sqlite-replication-spool = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/spool" }
+sqlite-replication-ltx = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/ltx" }
+sqlite-replication-wal = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/wal" }
+sqlite-replication-storage-fs = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/storage-fs" }
