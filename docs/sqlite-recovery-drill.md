@@ -651,6 +651,22 @@ observação não verifica inventário, continuidade ou recuperação de host e 
 autorização para reabrir. A execução cria e remove apenas escopo/subgrupo e banco
 sintético próprios, seguindo o comando anterior com `--inventory`.
 
+As variantes opt-in `--launch-admission` e `--launch-deny` experimentam um
+lançamento cooperativo em duas fases. O descendente de identidade restrita espera
+antes de criar o banco; o controlador de teste verifica seu UID, capacidades,
+presença no cgroup e caminho em `/proc/<pid>/cgroup`. Na primeira variante, o
+processo recebe permissão de teste, inicia a transação e o controlador é morto;
+o exercício conserva a recusa de recuperação e verifica os snapshots como acima.
+Na segunda, uma leitura de evidência deliberadamente inexistente causa recusa;
+o escritor termina sem criar o banco e captura/admissão permanecem fechadas.
+
+Essa é uma barreira **cooperativa**: o próprio código sintético espera a mensagem
+antes de acessar SQLite. Ela não impede código alternativo, outro processo com
+acesso ao banco ou uma mudança entre verificação e uso; tampouco prova que todos
+os escritores são lançados por ela. O teste não estabelece controle obrigatório,
+isolamento completo ou recuperação operacional. Não aplicar ao aplicativo como
+se fosse prova de completude.
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela

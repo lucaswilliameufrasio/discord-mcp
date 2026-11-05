@@ -22,6 +22,11 @@ sock.settimeout(5)
 if os.fork():
     os._exit(0)
 os.setsid()
+if sys.argv[4] == "gated":
+    sock.sendall(f"WAITING {os.getpid()}".encode())
+    if sock.recv(1) != b"A":
+        sock.sendall(b"LAUNCH_DENIED")
+        raise SystemExit(0)
 connection = None
 if sys.argv[3] != "-":
     database = os.path.join(sys.argv[3], "synthetic.db")
@@ -71,7 +76,7 @@ if sock.recv(1) != b"Q":
 '''
 
 
-def worker(leaf, scope, socket_fd, separate_identity=False, database_dir="-"):
+def worker(leaf, scope, socket_fd, separate_identity=False, database_dir="-", gated=False):
     sock = socket.socket(fileno=socket_fd)
     sock.settimeout(5)
     with open(os.path.join(leaf, "cgroup.procs"), "w", encoding="ascii") as target:
@@ -85,7 +90,7 @@ def worker(leaf, scope, socket_fd, separate_identity=False, database_dir="-"):
         os.execv("/usr/bin/unshare", [
             "/usr/bin/unshare", "--user", "--map-auto", "--map-root-user",
             "--setgid", "1", "--setuid", "1", "/usr/bin/python3", "-c",
-            IDENTITY_WORKER, scope, str(sock.fileno()), database_dir,
+            IDENTITY_WORKER, scope, str(sock.fileno()), database_dir, "gated" if gated else "normal",
         ])
     sock.sendall(f"READY {os.getpid()}".encode())
     if sock.recv(1) != b"M":
@@ -105,9 +110,12 @@ def worker(leaf, scope, socket_fd, separate_identity=False, database_dir="-"):
     os._exit(0)
 
 
-def controller(leaf, scope, socket_fd, database_dir="-"):
+def controller(leaf, scope, socket_fd, database_dir="-", gated=False):
+    args = [sys.executable, __file__, "worker", leaf, scope, str(socket_fd), "identity", database_dir]
+    if gated:
+        args.append("gated")
     process = subprocess.Popen(
-        [sys.executable, __file__, "worker", leaf, scope, str(socket_fd), "identity", database_dir],
+        args,
         pass_fds=(socket_fd,), stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env={"PATH": "/usr/bin:/bin"},
@@ -285,7 +293,8 @@ def continuity_recovery(database_dir, snapshot_name):
     print(f"continuity={outcome} decision=closed", flush=True)
 
 
-def run(separate_identity=False, controller_crash=False, sqlite_transaction=False):
+def run(separate_identity=False, controller_crash=False, sqlite_transaction=False,
+        launch_gate=False, reject_launch=False):
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise RuntimeError("Linux pidfd APIs required")
     with open("/proc/self/cgroup", encoding="ascii") as source:
@@ -316,6 +325,8 @@ def run(separate_identity=False, controller_crash=False, sqlite_transaction=Fals
             args.append("identity")
         if sqlite_transaction:
             args.append(scratch.name)
+        if launch_gate:
+            args.append("gated")
         process = subprocess.Popen(
             args, pass_fds=(child.fileno(),),
             stdin=subprocess.PIPE if controller_crash else subprocess.DEVNULL,
@@ -325,7 +336,7 @@ def run(separate_identity=False, controller_crash=False, sqlite_transaction=Fals
         )
         child.close()
         message = parent.recv(128).decode().split()
-        if len(message) != 2 or message[0] != "READY":
+        if len(message) != 2 or message[0] != ("WAITING" if launch_gate else "READY"):
             raise RuntimeError("descendant did not become ready")
         pidfd = os.pidfd_open(int(message[1]))
         if separate_identity:
@@ -335,6 +346,41 @@ def run(separate_identity=False, controller_crash=False, sqlite_transaction=Fals
             if effective_uid == os.geteuid() or int(fields["CapEff"].strip(), 16) != 0:
                 raise RuntimeError("worker identity/capabilities were not separated")
             print("worker_identity_separated_and_no_effective_caps=yes", flush=True)
+        if launch_gate:
+            evidence_path = f"/proc/{int(message[1])}/cgroup"
+            if reject_launch:
+                # Deliberately request a nonexistent evidence file.
+                evidence_path += "-fixture-missing"
+            try:
+                with open(evidence_path, encoding="ascii") as source:
+                    membership = source.read().strip()
+            except OSError:
+                membership = None
+            expected = "0::/" + os.path.relpath(leaf, "/sys/fs/cgroup")
+            if os.path.exists(os.path.join(scratch.name, "synthetic.db")):
+                raise RuntimeError("writer accessed SQLite before admission")
+            print("writer_waited_before_sqlite=yes", flush=True)
+            if membership != expected or not populated(leaf):
+                parent.sendall(b"X")
+                if parent.recv(128) != b"LAUNCH_DENIED":
+                    raise RuntimeError("writer did not reject launch")
+                if not select.select([pidfd], [], [], 5)[0] or populated(leaf):
+                    raise RuntimeError("denied writer did not exit")
+                if os.path.exists(os.path.join(scratch.name, "synthetic.db")):
+                    raise RuntimeError("denied writer created SQLite database")
+                print("unproven_launch=denied_without_sqlite", flush=True)
+                print("capture_and_admission=closed", flush=True)
+                if not reject_launch:
+                    raise RuntimeError("launch placement was not verified")
+                return
+            if reject_launch:
+                raise RuntimeError("missing evidence unexpectedly verified")
+            print("writer_placement_verified=yes", flush=True)
+            parent.sendall(b"A")
+            ready = parent.recv(128).decode().split()
+            if ready != ["READY", message[1]]:
+                raise RuntimeError("admitted writer did not become ready")
+            print("verified_writer_started_sqlite=yes", flush=True)
         if controller_crash:
             if not select.select([process.stdout], [], [], 5)[0]:
                 raise TimeoutError("controller did not become ready")
@@ -446,6 +492,8 @@ if __name__ == "__main__":
         controller(sys.argv[2], sys.argv[3], int(sys.argv[4]))
     elif len(sys.argv) == 6 and sys.argv[1] == "controller":
         controller(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
+    elif len(sys.argv) == 7 and sys.argv[1] == "controller" and sys.argv[6] == "gated":
+        controller(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], gated=True)
     elif len(sys.argv) == 3 and sys.argv[1] == "recovery":
         recovery(sys.argv[2])
     elif len(sys.argv) == 3 and sys.argv[1] == "inventory-recovery":
@@ -454,9 +502,10 @@ if __name__ == "__main__":
         continuity_recovery(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 5 and sys.argv[1] == "worker":
         worker(sys.argv[2], sys.argv[3], int(sys.argv[4]))
-    elif len(sys.argv) in (6, 7) and sys.argv[1] == "worker" and sys.argv[5] == "identity":
+    elif len(sys.argv) in (6, 7, 8) and sys.argv[1] == "worker" and sys.argv[5] == "identity":
         worker(sys.argv[2], sys.argv[3], int(sys.argv[4]), separate_identity=True,
-               database_dir=sys.argv[6] if len(sys.argv) == 7 else "-")
+               database_dir=sys.argv[6] if len(sys.argv) >= 7 else "-",
+               gated=len(sys.argv) == 8 and sys.argv[7] == "gated")
     elif len(sys.argv) == 1:
         run()
     elif len(sys.argv) == 2 and sys.argv[1] == "--identity":
@@ -467,5 +516,10 @@ if __name__ == "__main__":
         run(separate_identity=True, controller_crash=True, sqlite_transaction=True)
     elif len(sys.argv) == 2 and sys.argv[1] == "--inventory":
         run_inventory()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--launch-admission":
+        run(separate_identity=True, controller_crash=True, sqlite_transaction=True, launch_gate=True)
+    elif len(sys.argv) == 2 and sys.argv[1] == "--launch-deny":
+        run(separate_identity=True, controller_crash=True, sqlite_transaction=True,
+            launch_gate=True, reject_launch=True)
     else:
         raise SystemExit("invalid fixture arguments")
