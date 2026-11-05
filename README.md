@@ -11,8 +11,8 @@ conforme as permissões concedidas no Discord.
 
 O protocolo stdio oferece envio para um webhook configurado na variável de
 ambiente `DISCORD_WEBHOOK_URL`; mensagens não permitem menções automáticas. O
-modo servidor HTTP possui OAuth e controle de acesso experimentais; gestão
-guiada de segredos e interface administrativa compartilhada ainda faltam.
+modo servidor HTTP possui OAuth e controle de acesso experimentais; a gestão
+guiada de segredos ainda falta.
 
 Também é possível cadastrar múltiplos webhooks em SQLite local e selecionar o
 canal pelo nome no argumento `channel` da ferramenta `send_message`. Configure
@@ -63,15 +63,16 @@ Além de `DISCORD_MCP_DB` e `DISCORD_MCP_KEY`, configure:
 | `DISCORD_MCP_PUBLIC_ORIGIN` | Origem pública HTTPS, sem caminho; HTTP só em loopback na porta do listener. |
 | `DISCORD_MCP_DISCORD_CLIENT_ID` | ID da aplicação OAuth Discord. |
 | `DISCORD_MCP_DISCORD_CLIENT_SECRET` | Segredo OAuth Discord, fornecido por mecanismo de segredos. |
+| `DISCORD_MCP_ADMIN_ID` | ID numérico da conta Discord autorizada a administrar permissões. |
 | `DISCORD_MCP_CLIENT_ID` | ID de um cliente MCP previamente registrado pelo operador. |
 | `DISCORD_MCP_CLIENT_NAME` | Nome do cliente mostrado no consentimento. |
 | `DISCORD_MCP_CLIENT_REDIRECT` | URI de retorno exata desse cliente. |
 
-Registre no Discord a URI de callback formada por sua origem pública e
-`/oauth/discord/callback`. O recurso MCP será a origem seguida de `/mcp`.
+Registre no Discord as URIs de callback formadas por sua origem pública e
+`/oauth/discord/callback` e `/admin/discord/callback`. O recurso MCP será a
+origem seguida de `/mcp`.
 Esta versão aceita apenas **um cliente MCP pré-registrado**; registro dinâmico,
-documentos de metadados de cliente e painel administrativo compartilhado ainda
-não estão disponíveis.
+documentos de metadados de cliente ainda não estão disponíveis.
 
 O operador local define permissões com
 `discord-mcp set-permission ID_DISCORD CANAL read|send|both|none` e consulta
@@ -79,6 +80,12 @@ com `discord-mcp show-permissions CANAL`. O ID é o identificador numérico da
 conta Discord, não o nome exibido. Não há concessão automática no login. A
 substituição ou exclusão do canal revoga suas permissões; webhooks não aceitam
 permissão de leitura. Os comandos exigem acesso local ao banco e à chave.
+
+A área `/admin` permite à conta Discord cujo ID corresponde a
+`DISCORD_MCP_ADMIN_ID` consultar e alterar permissões por canal. O login de
+qualquer outra conta não concede administração. A sessão administrativa expira
+após 30 minutos e termina ao reiniciar o servidor ou sair; mudanças exigem uma
+requisição da mesma origem. A criação de canais ainda é feita na interface local.
 
 Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
 segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;

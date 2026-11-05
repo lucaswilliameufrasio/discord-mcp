@@ -1,3 +1,4 @@
+pub mod admin_web;
 pub mod bot;
 pub mod channels;
 pub mod discord_login;

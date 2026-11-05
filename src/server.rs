@@ -2,7 +2,11 @@
 use std::{net::SocketAddr, time::Duration};
 
 use discord_mcp::{
-    discord_login::DiscordLoginClient, http_auth::AuthState, http_mcp, oauth_web::OAuthWebConfig,
+    admin_web::{self, AdminConfig},
+    discord_login::DiscordLoginClient,
+    http_auth::AuthState,
+    http_mcp,
+    oauth_web::OAuthWebConfig,
 };
 
 use crate::StorageConfig;
@@ -37,12 +41,24 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         &discord_secret,
         &format!("{origin}/oauth/discord/callback"),
     )?;
+    let admin_discord = DiscordLoginClient::new(
+        &discord_id,
+        &discord_secret,
+        &format!("{origin}/admin/discord/callback"),
+    )?;
+    let auth = AuthState {
+        database_path: storage.path.clone(),
+        encryption_key: storage.key,
+        resource: format!("{origin}/mcp"),
+    };
+    let admin = AdminConfig {
+        auth: auth.clone(),
+        public_origin: origin.clone(),
+        admin_user_id: required("DISCORD_MCP_ADMIN_ID")?,
+        discord: admin_discord,
+    };
     let config = OAuthWebConfig {
-        auth: AuthState {
-            database_path: storage.path.clone(),
-            encryption_key: storage.key,
-            resource: format!("{origin}/mcp"),
-        },
+        auth,
         public_origin: origin,
         client_id: required("DISCORD_MCP_CLIENT_ID")?,
         client_name: required("DISCORD_MCP_CLIENT_NAME")?,
@@ -50,7 +66,7 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         discord,
     };
     storage.open()?;
-    let router = http_mcp::router(config)?;
+    let router = http_mcp::router(config)?.merge(admin_web::router(admin)?);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!(
         "MCP HTTP listening on {} (loopback only)",

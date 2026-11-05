@@ -42,8 +42,10 @@ de código com PKCE S256. A troca é atômica e exige o cliente, URI de retorno 
 recurso configurados. Atualmente há apenas um cliente pré-registrado na
 configuração; o transporte MCP HTTP sem sessões já está composto com esse
 roteador e verifica o token em cada requisição e as permissões em cada operação.
-Ainda faltam gestão de clientes, administração compartilhada de permissões,
-validação com Discord real e preparação operacional. O comando `serve` inicia o
+Ainda faltam gestão de clientes, validação com Discord real e preparação
+operacional. A interface `/admin` permite que a conta Discord configurada pelo
+operador gerencie permissões; canais ainda são cadastrados na interface local.
+O comando `serve` inicia o
 roteador integrado exclusivamente em loopback; acesso remoto exige proxy HTTPS
 configurado pelo operador. A CLI local permite conceder e revogar permissões.
 Nenhum endpoint remoto de produção deve ser

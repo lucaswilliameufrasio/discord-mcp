@@ -59,6 +59,7 @@ async fn cli_starts_loopback_server_enforces_permissions_and_drains_on_term() {
         .env("DISCORD_MCP_LISTEN", addr.to_string())
         .env("DISCORD_MCP_PUBLIC_ORIGIN", &origin)
         .env("DISCORD_MCP_DISCORD_CLIENT_ID", "123")
+        .env("DISCORD_MCP_ADMIN_ID", "123")
         .env(
             "DISCORD_MCP_DISCORD_CLIENT_SECRET",
             "synthetic-client-secret",
@@ -79,6 +80,14 @@ async fn cli_starts_loopback_server_enforces_permissions_and_drains_on_term() {
     assert!(line.contains("loopback only"));
     assert!(!line.contains("synthetic-client-secret"));
     let client = reqwest::Client::new();
+    let admin_page = client.get(format!("{origin}/admin")).send().await.unwrap();
+    assert!(
+        admin_page
+            .text()
+            .await
+            .unwrap()
+            .contains("Entrar com Discord")
+    );
     let metadata: Value = client
         .get(format!("{origin}/.well-known/oauth-protected-resource"))
         .send()
