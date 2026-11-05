@@ -575,7 +575,7 @@ mod tests {
                         guard.0 = true;
                         writeln!(stream, "OPENED").unwrap();
                     }
-                    "CAPTURE" => {
+                    "CAPTURE" | "CAPTURE_FAULT" => {
                         {
                             let mut guard = state.lock().unwrap();
                             if guard.1 {
@@ -613,6 +613,33 @@ mod tests {
                         let mut next = String::new();
                         if reader.read_line(&mut next).is_err() || next.trim() != "GO" {
                             state.lock().unwrap().1 = false;
+                            return;
+                        }
+                        if command.trim() == "CAPTURE_FAULT" {
+                            // Fixture-only path: the public capture_once API has
+                            // no fault hook, so exercise the same spool boundary
+                            // directly while the authority holds its lock.
+                            let repository = dir.join("repository");
+                            let wal = fs::read(dir.join("source.db-wal")).unwrap();
+                            let base = recover(&repository, &wal).unwrap();
+                            let (transactions, next_state) =
+                                sqlite_replication_wal::translate::translate_wal(&wal, &base, 200)
+                                    .unwrap();
+                            assert_eq!(transactions.len(), 1);
+                            let _ = publish_transactions(
+                                &repository,
+                                &transactions,
+                                &next_state,
+                                |point, _| {
+                                    if point == FaultPoint::AfterLtxPublish {
+                                        writeln!(stream, "PUBLISHED")?;
+                                        let mut release = String::new();
+                                        reader.read_line(&mut release)?;
+                                        return Err(io::Error::other("synthetic interruption"));
+                                    }
+                                    Ok(())
+                                },
+                            );
                             return;
                         }
                         let result = sqlite_replication_core::capture_once(
@@ -801,6 +828,100 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn authority_death_after_ltx_publish_requires_explicit_spool_reconciliation() {
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+        let (dir, db) = barrier_fixture();
+        let repository = dir.path().join("repository");
+        db.execute("INSERT INTO records VALUES(2, 'pending-publication')", [])
+            .unwrap();
+        let witness = image_state(&db, &dir.path().join("updated-witness.db"));
+        fs::write(dir.path().join("witness.txt"), format!("{witness:?}")).unwrap();
+        let source_count: i64 = db
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_count, 2);
+        let mut authority = start_continuity_authority(dir.path()).await;
+        let mut capture = authority_command(dir.path(), "CAPTURE_FAULT").await;
+        assert_eq!(authority_line(&mut capture).await, "VERIFIED");
+        capture.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut capture).await, "PUBLISHED");
+        let delta_path = ltx_path(&repository, 2, 2);
+        let delta = fs::read(&delta_path).unwrap();
+        assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        assert!(
+            tokio::net::UnixStream::connect(dir.path().join("authority.sock"))
+                .await
+                .is_err()
+        );
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let mut restarted = start_continuity_authority(dir.path()).await;
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+        let mut reconcile = authority_command(dir.path(), "CAPTURE").await;
+        assert_eq!(authority_line(&mut reconcile).await, "VERIFIED");
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        reconcile.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut reconcile).await, "CAPTURED");
+        assert_eq!(read_watermark(&repository).unwrap().txid, 2);
+        assert_eq!(fs::read(delta_path).unwrap(), delta);
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        let restored = dir.path().join("restored-after-crash.db");
+        sqlite_replication_core::restore_to_target(
+            &repository,
+            &restored,
+            sqlite_replication_core::RestoreTarget::Txid(2),
+        )
+        .unwrap();
+        let recovered = rusqlite::Connection::open(restored).unwrap();
+        let count: i64 = recovered
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = recovered
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, source_count);
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            source_count
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "OPENED"
         );
         restarted.kill().await.unwrap();
         timeout(Duration::from_secs(5), restarted.wait())

@@ -574,6 +574,25 @@ evidência independente durável não foram testadas nesse fluxo. Não cobre
 perda de energia, rede, estado parcial nem identidade da fonte. O gate real
 continua não implementado e não deve ser inferido desses resultados.
 
+O fixture também executa uma publicação LTX sintética em um subprocesso de
+autoridade com a barreira mantida. Como `capture_once` público não oferece um
+hook de falha, esse caminho de teste chama diretamente tradução WAL e
+`publish_transactions`, sinaliza no hook `AfterLtxPublish` e aguarda; o teste
+mata a autoridade nesse ponto. O delta TXID 2 existe com watermark em 1. O
+cliente cooperativo não consegue conectar enquanto a autoridade está ausente;
+após reinício, `WRITE` e `OPEN` são recusados. Uma nova comparação de evidência
+e uma chamada explícita de `capture_once` reconciliam o spool até watermark 2,
+sem alterar os bytes do delta; a autoridade ainda recusa escrita até abertura
+explícita. O restore em caminho novo passa `integrity_check` e contém a mesma
+contagem de linhas da fonte sintética, que permanece inalterada.
+
+Esse teste mata o processo após a publicação LTX pela API de spool, **não**
+interrompe uma chamada real a `capture_once` no hook interno. Também não cobre
+power loss, corrupção, checkpoint concorrente, sincronização remota, efeito
+externo, identidade da fonte ou escritores que ignorem a autoridade. Os
+marcadores e a evidência são locais e sintéticos; o resultado não qualifica
+o protocolo para uso operacional.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
