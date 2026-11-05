@@ -744,6 +744,30 @@ escopo transitório próprio; não instala nem altera políticas do host:
 systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/landlock_boundary_fixture.py"
 ```
 
+#### Exercício opt-in de máscara em namespace de montagem
+
+`tests/mount_boundary_fixture.py` cria banco e escopo sintéticos próprios. Após
+matar o corretor com uma transação aberta e verificar rollback, inicia um processo
+com o mesmo UID no host em user/mount namespaces privados. O processo monta um
+tmpfs somente sobre o diretório sintético em seu namespace: o caminho normal do
+banco deixa de existir ali. Porém, um descritor de escrita intencionalmente
+aberto antes da máscara continua funcionando; o teste altera o `user_version`
+do banco sintético e verifica o resultado externamente. Nessa configuração, o
+processo também conseguiu desmontar sua própria máscara e confirmar uma linha
+via SQLite. O gate sintético continuou recusando admissão e captura.
+
+O teste pressupõe um descritor vazado e capacidades de montagem no namespace;
+não prova que uma configuração endurecida permita os mesmos acessos. Ele mostra
+que esconder apenas o caminho não é fencing global: descritores existentes e
+capacidade de alterar o namespace precisam ser considerados. Não há autenticação,
+isolamento obrigatório de todos os escritores, captura incremental ou recuperação
+operacional. Não use este experimento como fronteira de produção. A montagem é
+privada, não altera a hierarquia de montagem do host, e o banco é temporário:
+
+```sh
+systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/mount_boundary_fixture.py"
+```
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela
