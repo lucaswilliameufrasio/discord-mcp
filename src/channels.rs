@@ -513,7 +513,7 @@ fn valid_token(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn valid_resource(value: &str) -> bool {
+pub(crate) fn valid_resource(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
@@ -535,7 +535,7 @@ fn valid_client_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 512 && value.bytes().all(|b| b.is_ascii_graphic())
 }
 
-fn valid_redirect(value: &str) -> bool {
+pub(crate) fn valid_redirect(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
@@ -559,7 +559,7 @@ fn valid_verifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
 }
 
-fn valid_challenge(value: &str) -> bool {
+pub(crate) fn valid_challenge(value: &str) -> bool {
     if value.len() != 43 {
         return false;
     }

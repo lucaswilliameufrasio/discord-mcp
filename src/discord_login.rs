@@ -41,6 +41,8 @@ pub struct DiscordLoginClient {
     client_id: String,
     client_secret: String,
     redirect_uri: Url,
+    #[cfg(test)]
+    test_base: Option<Url>,
 }
 
 pub struct PendingDiscordLogin {
@@ -73,6 +75,10 @@ fn equal(a: &str, b: &str) -> bool {
 }
 
 impl DiscordLoginClient {
+    pub fn redirect_uri(&self) -> &Url {
+        &self.redirect_uri
+    }
+
     /// `redirect_uri` is operator-configured and must match the Discord application.
     pub fn new(
         client_id: &str,
@@ -110,6 +116,8 @@ impl DiscordLoginClient {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: uri,
+            #[cfg(test)]
+            test_base: None,
         })
     }
 
@@ -151,6 +159,8 @@ impl DiscordLoginClient {
     ) -> Result<DiscordIdentity, LoginError> {
         let base =
             Url::parse("https://discord.com/").map_err(|_| LoginError::InvalidConfiguration)?;
+        #[cfg(test)]
+        let base = self.test_base.clone().unwrap_or(base);
         self.finish_at(pending, state, browser_binding, issuer, code, &base)
             .await
     }
@@ -220,6 +230,14 @@ impl DiscordLoginClient {
             return Err(LoginError::InvalidResponse);
         }
         Ok(identity)
+    }
+}
+
+#[cfg(test)]
+impl DiscordLoginClient {
+    pub(crate) fn with_test_base(mut self, base: Url) -> Self {
+        self.test_base = Some(base);
+        self
     }
 }
 

@@ -29,14 +29,15 @@ tokens MCP. A CLI orientará o fluxo sem inserir segredos em argumentos.
 
 A fundação de login Discord implementa a troca de código, PKCE S256, `state`,
 identificador de navegador, validação do emissor e consulta de identidade com
-escopo `identify`. O controlador HTTP ainda precisa guardar a tentativa no
-servidor, associá-la a um cookie seguro e consumi-la atomicamente; não existe
-login de navegador conectado e a integração real com Discord não foi validada.
+escopo `identify`. Um controlador HTTP isolado associa tentativas ao navegador,
+exige consentimento e emite códigos para um cliente pré-registrado. Ele ainda não
+é iniciado por uma interface de produção e a integração com o Discord real não
+foi validada.
 
 A fundação local de autorização contém tokens opacos de curta duração,
 armazenados como hashes, associados a usuário e recurso, com revogação e um
 middleware HTTP para verificá-los. Ela **não é um servidor OAuth**: ainda faltam
-controlador de login Discord, consentimento, descoberta MCP, registro e validação de clientes,
+descoberta MCP, gestão de clientes e endpoint de troca,
 emissão por um fluxo validado e integração com o transporte MCP. A fundação já
 implementa a troca atômica de código de autorização de uso único por token,
 com PKCE S256 e vinculação exata de cliente, retorno e recurso. A emissão do
