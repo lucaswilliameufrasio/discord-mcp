@@ -5,7 +5,7 @@ use std::{fmt, time::Duration};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use rmcp::serde_json::json;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebhookUrl(Url);
 
 impl WebhookUrl {
