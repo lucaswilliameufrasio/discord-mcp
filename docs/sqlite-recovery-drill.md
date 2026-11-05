@@ -677,13 +677,23 @@ do repositório e watermark permanecem idênticos. O teste verifica que a linha
 confirmada existe e que o WAL mudou, mas que a tentativa posterior de captura
 não o alterou.
 
+Após os dois subprocessos conhecidos terminarem, o teste copia o banco, seu WAL
+e o repositório sintéticos para um diretório privado separado. Nesse cenário
+controlado, sem escritores adicionais iniciados pelo teste, uma captura sobre
+as cópias avança de TXID 1 para 2; a restauração isolada tem as mesmas linhas da
+fonte e passa `integrity_check`. O teste compara os bytes do banco principal,
+WAL e repositório originais antes e depois e mantém os três comandos de captura
+e abertura da autoridade conservadora negados.
+
 O banco e seus sidecars são sintéticos, com permissões temporariamente
 compartilhadas apenas dentro do diretório próprio do teste; o processo que
-representa o corretor não implementa um corretor operacional. A recusa é fixa
-por falta de prova de inventário: não detecta automaticamente o escritor e não
-executa captura ou reconciliação incremental. A biblioteca usa o checkout irmão
-local modificável. Para executá-lo, além dos requisitos do exercício de spool,
-são necessários Linux x86-64, `unshare` e mapeamentos de UID subordinado:
+representa o corretor não implementa um corretor operacional. Copiar banco e WAL
+assim é válido somente para esta fixture controlada, não procedimento de backup.
+O gate usado na cópia não bloqueia escritores; a saída de dois processos conhecidos
+não prova ausência de escritores externos ou continuidade real. Não há
+reconciliação nem reabertura do repositório original. A biblioteca usa o checkout
+irmão local modificável. Para executá-lo, além dos requisitos do exercício de
+spool, são necessários Linux x86-64, `unshare` e mapeamentos de UID subordinado:
 
 ```sh
 TMPDIR=/tmp/opencode cargo test --locked --manifest-path drills/s3/Cargo.toml --target-dir target/s3-drill --example spool_recovery tests::subordinate_uid_direct_writer_cannot_trigger_conservative_capture -- --ignored --exact

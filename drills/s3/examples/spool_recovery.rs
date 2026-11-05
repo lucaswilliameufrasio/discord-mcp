@@ -1627,6 +1627,81 @@ connection.close()
                 .unwrap()
                 .success()
         );
+        // Reconcile only an isolated copy after both fixture-owned processes
+        // have exited. This is not evidence that external writers are absent.
+        assert!(outsider.try_wait().unwrap().is_some());
+        assert!(broker.try_wait().unwrap().is_some());
+        let source_bytes = fs::read(&source).unwrap();
+        let isolated = dir.path().join("isolated-reconciliation");
+        fs::create_dir(&isolated).unwrap();
+        fs::set_permissions(&isolated, fs::Permissions::from_mode(0o700)).unwrap();
+        let isolated_source = isolated.join("source.db");
+        let isolated_repository = isolated.join("repository");
+        fs::write(&isolated_source, &source_bytes).unwrap();
+        fs::write(isolated.join("source.db-wal"), &wal).unwrap();
+        for (path, bytes) in &before {
+            let destination = isolated_repository.join(path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+        assert_eq!(files(&isolated_repository), before);
+        assert_eq!(read_watermark(&isolated_repository).unwrap(), watermark);
+        let isolated_db = rusqlite::Connection::open(&isolated_source).unwrap();
+        assert_eq!(
+            isolated_db
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let captured = sqlite_replication_core::capture_once(
+            &isolated_source,
+            &isolated_repository,
+            &IsolatedGate,
+        )
+        .unwrap();
+        assert_eq!(captured.txid, 2);
+        assert_eq!(read_watermark(&isolated_repository).unwrap().txid, 2);
+        let restored = isolated.join("restored.db");
+        sqlite_replication_core::restore_to_target(
+            &isolated_repository,
+            &restored,
+            sqlite_replication_core::RestoreTarget::Txid(2),
+        )
+        .unwrap();
+        let recovered = rusqlite::Connection::open(restored).unwrap();
+        let rows = |connection: &rusqlite::Connection| {
+            connection
+                .prepare("SELECT id, value FROM records ORDER BY id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(rows(&recovered), rows(&db));
+        assert_eq!(
+            recovered
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(dir.path().join("source.db-wal")).unwrap(), wal);
+        assert_eq!(files(&repository), before);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), command).await).await,
+                "INVENTORY_UNKNOWN"
+            );
+        }
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
         restarted.kill().await.unwrap();
         timeout(Duration::from_secs(5), restarted.wait())
             .await
