@@ -443,10 +443,22 @@ estado, o restore em destino novo contém as mesmas linhas da fonte e passa
 Esses testes não simulam perda de um WAL contendo commits não checkpointados:
 o checkpoint anterior concluiu com sucesso. O spool inicial contém apenas o
 snapshot, não um delta parcialmente publicado; as falhas parciais são cobertas
-separadamente acima. Não há concorrência, SIGKILL, substituição de WAL por um
+separadamente acima e nos cenários combinados abaixo. Não há concorrência, SIGKILL, substituição de WAL por um
 terceiro, gate real ou validação de dados de aplicação. A comparação verifica
 as linhas observáveis e integridade da cópia restaurada, não uma recuperação de
 host ou uma prova de preservação de todas as transações sob falhas arbitrárias.
+
+Dois cenários combinados acrescentam ao mesmo exercício uma falha injetada
+`AfterLtxPublish`: o delta TXID 2 já existe enquanto o watermark permanece em
+TXID 1. O teste grava uma linha adicional, conclui checkpoint e então remove o
+WAL pelo fechamento normal da última conexão ou cria outra geração de WAL com
+salts diferentes. Em ambos `capture_once` recupera o spool e reconcilia a
+imagem SQLite, resultando em watermark TXID 3. O restore em destino novo passa
+`integrity_check` e suas linhas coincidem com a fonte; uma segunda captura não
+adiciona transações. A falha é um retorno injetado, não morte de processo; o
+checkpoint foi bem-sucedido e o gate é o fixture de escritor único, sem
+concorrência. Não há teste de perda de commits não checkpointados nem garantia
+para queda de energia, armazenamento remoto ou banco de aplicação.
 
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;

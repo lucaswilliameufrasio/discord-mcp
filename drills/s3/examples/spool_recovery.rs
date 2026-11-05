@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn checkpoint_generation_drill(new_generation: bool) {
+    fn checkpoint_generation_drill(new_generation: bool, partial_publication: bool) {
         use rusqlite::Connection;
         use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
 
@@ -119,10 +119,30 @@ mod tests {
         let db = Connection::open(&source).unwrap();
         db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
         snapshot(&source, &repository).unwrap();
+        let base = recover(&repository, &[]).unwrap();
         db.execute("INSERT INTO records VALUES(2, 'checkpointed')", [])
             .unwrap();
         let old_wal = fs::read(&wal_path).unwrap();
         assert!(old_wal.len() > 32);
+        if partial_publication {
+            let (transactions, state) =
+                sqlite_replication_wal::translate::translate_wal(&old_wal, &base, 200).unwrap();
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(state.database.txid, 2);
+            assert!(
+                publish_transactions(&repository, &transactions, &state, |point, _| {
+                    if point == FaultPoint::AfterLtxPublish {
+                        return Err(io::Error::other("synthetic interruption after publication"));
+                    }
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert_eq!(read_watermark(&repository).unwrap().txid, 1);
+            assert!(ltx_path(&repository, 2, 2).exists());
+            db.execute("INSERT INTO records VALUES(4, 'after-publication')", [])
+                .unwrap();
+        }
         let checkpoint: (i64, i64, i64) = db
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -156,7 +176,11 @@ mod tests {
             Some(db)
         };
         let result = capture_once(&source, &repository, &IsolatedGate).unwrap();
-        assert!(result.txid >= 2);
+        if partial_publication {
+            assert_eq!(result.txid, 3);
+        } else {
+            assert!(result.txid >= 2);
+        }
         assert_eq!(read_watermark(&repository).unwrap().txid, result.txid);
         let repeated = capture_once(&source, &repository, &IsolatedGate).unwrap();
         assert_eq!(repeated.txid, result.txid);
@@ -191,13 +215,25 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn capture_reconciles_checkpointed_changes_when_wal_is_absent() {
-        checkpoint_generation_drill(false);
+        checkpoint_generation_drill(false, false);
     }
 
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn capture_reconciles_checkpointed_changes_with_new_wal_generation() {
-        checkpoint_generation_drill(true);
+        checkpoint_generation_drill(true, false);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn capture_recovers_published_ltx_after_checkpoint_and_missing_wal() {
+        checkpoint_generation_drill(false, true);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn capture_recovers_published_ltx_after_wal_generation_change() {
+        checkpoint_generation_drill(true, true);
     }
 
     #[test]
