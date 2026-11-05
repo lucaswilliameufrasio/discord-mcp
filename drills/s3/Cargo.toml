@@ -18,3 +18,6 @@ sqlite-replication-spool = { version = "0.1.0", path = "../../../sqlite-replicat
 sqlite-replication-ltx = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/ltx" }
 sqlite-replication-wal = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/wal" }
 sqlite-replication-storage-fs = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/storage-fs" }
+
+[dev-dependencies]
+rusqlite = { version = "0.41.1", features = ["bundled"] }

@@ -412,6 +412,24 @@ vazio; a biblioteca exige reconciliar o estado recuperado com a base ativa quand
 a geração WAL não está disponível. Não foram testados captura real, publicação
 remota parcial, consistência com o banco da aplicação ou retomada operacional.
 
+Uma ampliação usa SQLite real com dados sintéticos: cria uma tabela e uma linha,
+faz checkpoint inicial, cria snapshot, insere outra linha e mantém a conexão
+aberta com autocheckpoint desativado. A biblioteca traduz o WAL não vazio para
+um delta; após falha injetada na publicação, uma cópia em memória com cabeçalho
+WAL corrompido é recusada sem mudar o watermark. Com o WAL original, `recover`
+reconcilia o TXID e a posição WAL, e uma segunda chamada repete o mesmo estado.
+O restore TXID 2 para arquivo novo passa `PRAGMA integrity_check` e contém as
+mesmas linhas da fonte, que também são comparadas antes e depois do exercício.
+
+O teste não usa `capture_once`: a tradução e a publicação são chamadas
+diretamente, sem escritores concorrentes e sem gate real. A corrupção foi só na
+cópia em memória; a interrupção foi injetada, não uma queda de processo. Não
+testa rotação/checkpoint concorrente, reconciliação de WAL ausente ou de outra
+geração, nem uma base Discord MCP, recuperação de host ou armazenamento remoto.
+A revisão do checkout irmão observada para esta execução foi novamente
+`f5c0984f069407913365136a10d5962f9a33930d`, com mudanças locais preexistentes;
+dependências por caminho não oferecem uma árvore imutável reproduzível.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

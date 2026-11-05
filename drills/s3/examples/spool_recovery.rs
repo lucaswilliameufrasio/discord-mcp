@@ -92,6 +92,84 @@ mod tests {
     use std::io;
 
     #[test]
+    fn real_sqlite_wal_reconciles_published_delta_and_restores_rows() {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, restore_to_target, snapshot};
+        use sqlite_replication_wal::translate::translate_wal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let repository = dir.path().join("repository");
+        let connection = Connection::open(&source).unwrap();
+        connection.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &repository).unwrap();
+        let base = recover(&repository, &[]).unwrap();
+        assert_eq!(base.database.txid, 1);
+        connection
+            .execute("INSERT INTO records VALUES (2, 'synthetic')", [])
+            .unwrap();
+        let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        assert!(wal.len() > 32);
+        let (transactions, expected) = translate_wal(&wal, &base, 200).unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(expected.database.txid, 2);
+        let baseline: Vec<(i64, String)> = connection
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            publish_transactions(&repository, &transactions, &expected, |point, _| {
+                if point == FaultPoint::AfterLtxPublish {
+                    return Err(io::Error::other("synthetic interruption after LTX publish"));
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        let before = read_watermark(&repository).unwrap();
+        assert_eq!(before.txid, 1);
+        let mut corrupt_wal = wal.clone();
+        corrupt_wal[0] ^= 0xff;
+        assert!(recover(&repository, &corrupt_wal).is_err());
+        assert_eq!(read_watermark(&repository).unwrap(), before);
+        let recovered = recover(&repository, &wal).unwrap();
+        assert_eq!(recovered.database.txid, 2);
+        assert_eq!(recovered.database.checksum, expected.database.checksum);
+        assert!(recovered.wal.initialized);
+        assert_eq!(recovered.wal.frame_count, expected.wal.frame_count);
+        assert_eq!(
+            recover(&repository, &wal).unwrap().database,
+            recovered.database
+        );
+        let restored = dir.path().join("restored.db");
+        restore_to_target(&repository, &restored, RestoreTarget::Txid(2)).unwrap();
+        let restored_db = Connection::open(&restored).unwrap();
+        let integrity: String = restored_db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let restored_rows: Vec<(i64, String)> = restored_db
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(restored_rows, baseline);
+        let source_rows: Vec<(i64, String)> = connection
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(source_rows, baseline);
+    }
+
+    #[test]
     fn published_ltx_before_watermark_is_verified_and_reconciled_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let (image, transaction, state) = fixture(dir.path());
