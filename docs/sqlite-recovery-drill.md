@@ -201,6 +201,22 @@ consultivos: a prova vale apenas para processos participantes que abrem os
 mesmos arquivos e seguem a mesma ordem. Os subprocessos são sincronizados por
 mensagens explícitas e encerrados pelo próprio teste; não há dados reais.
 
+Ampliação dos testes: arquivos de estado ou lock ausentes e estado vazio são
+recusados sem recriação; três escritores já admitidos terminam suas transações
+antes da drenagem, enquanto outro aguarda; e dois coordenadores não entram na
+captura simultaneamente. Falhas são injetadas no processo de teste depois da
+gravação do byte e antes de chamar `sync_all`, tanto ao fechar quanto ao reabrir.
+Não há falha real de disco ou perda de energia nessas injeções.
+
+**Lacuna demonstrada:** na reabertura, uma falha entre gravar o byte aberto e
+sincronizá-lo encerra o coordenador e libera seus locks; outro processo pode
+observar o byte aberto e escrever mesmo sem confirmação de persistência. O
+teste registra deliberadamente esse comportamento inseguro — passar não quer
+dizer que a reabertura seja segura. Na falha equivalente ao fechar, outro
+processo viu o byte fechado no mesmo sistema em execução; isso não prova que o
+fechamento sobreviva a queda de energia. O protocolo deve ser redesenhado e
+revalidado antes de qualquer integração, não tratado como solução fail-closed.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
