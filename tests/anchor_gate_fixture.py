@@ -3,6 +3,7 @@ import fcntl
 import array
 import os
 import select
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -67,7 +68,8 @@ def publisher(sock_fd, directory, failure):
             os.close(fd)
 
 
-def transition_authority(control_fd, writer_fd, barrier_fd, state_path, previous_pidfd=None):
+def transition_authority(control_fd, writer_fd, barrier_fd, state_path, previous_pidfd=None,
+                         complete=True):
     control = socket.socket(fileno=control_fd)
     writer = socket.socket(fileno=writer_fd)
     opened = False
@@ -82,9 +84,14 @@ def transition_authority(control_fd, writer_fd, barrier_fd, state_path, previous
             if not command:
                 return
             if command == b"D":
-                if previous_pidfd is not None and not select.select([previous_pidfd], [], [], 0)[0]:
+                if not complete:
                     control.sendall(b"B")
                     continue
+                if previous_pidfd is not None:
+                    handles = previous_pidfd if isinstance(previous_pidfd, list) else [previous_pidfd]
+                    if any(not select.select([handle], [], [], 0)[0] for handle in handles):
+                        control.sendall(b"B")
+                        continue
                 try:
                     fcntl.flock(barrier_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -139,6 +146,27 @@ def sqlite_writer(fd, database):
     connection.commit()
     connection.close()
     os.close(fd)
+
+
+def spawn_descendant(database):
+    descendant = subprocess.Popen(
+        [sys.executable, __file__, "descendant", database],
+        stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+    )
+    print(f"CHILD {descendant.pid}", flush=True)
+
+
+def descendant_writer(database):
+    if sys.stdin.readline().strip() != "begin":
+        raise RuntimeError("expected begin")
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    print("DESCENDANT_WRITING", flush=True)
+    if sys.stdin.readline().strip() != "commit":
+        raise RuntimeError("expected commit")
+    connection.commit()
+    connection.close()
 
 
 def admitted_sqlite_writer(fd, socket_fd, database):
@@ -268,6 +296,124 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+                         "Linux pidfd APIs are required")
+    def test_multiple_writers_and_unknown_descendant_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            state = os.path.join(directory, "state")
+            database = os.path.join(directory, "synthetic.db")
+            with open(path, "wb"), open(state, "wb") as marker:
+                marker.write(b"uncertain\n")
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            anchor = os.open(path, os.O_RDWR)
+            processes = []
+            handles = []
+            sockets = []
+            child_handle = None
+            try:
+                guard_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    guard = subprocess.Popen(
+                        [sys.executable, __file__, "independent_guard", str(guard_fd)],
+                        pass_fds=(guard_fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(guard_fd)
+                processes.append(guard)
+                self.assertEqual(line(guard.stdout), "GUARDED")
+                writer_fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    writer = subprocess.Popen(
+                        [sys.executable, __file__, "sqlite_writer", str(writer_fd), database],
+                        pass_fds=(writer_fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(writer_fd)
+                processes.append(writer)
+                handles.append(os.pidfd_open(writer.pid))
+                self.assertEqual(line(writer.stdout), "TRANSACTION")
+                parent = subprocess.Popen(
+                    [sys.executable, __file__, "spawn_descendant", database],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                processes.append(parent)
+                handles.append(os.pidfd_open(parent.pid))
+                announcement = line(parent.stdout).split()
+                self.assertEqual(announcement[0], "CHILD")
+                child_handle = os.pidfd_open(int(announcement[1]))
+                self.assertEqual(parent.wait(timeout=5), 0)
+                guard.kill()
+                guard.wait(timeout=5)
+                writer.stdin.write("commit\n")
+                writer.stdin.flush()
+                self.assertEqual(writer.wait(timeout=5), 0)
+                parent.stdin.write("begin\n")
+                parent.stdin.flush()
+                self.assertEqual(line(parent.stdout), "DESCENDANT_WRITING")
+
+                def start_authority(complete, pidfds):
+                    control, control_peer = socket.socketpair()
+                    candidate, candidate_peer = socket.socketpair()
+                    control.settimeout(5)
+                    candidate.settimeout(5)
+                    sockets.extend((control, candidate))
+                    barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                    try:
+                        process = subprocess.Popen(
+                            [sys.executable, __file__, "multi_transition", str(control_peer.fileno()),
+                             str(candidate_peer.fileno()), str(barrier), state, str(int(complete)),
+                             *[str(handle) for handle in pidfds]],
+                            pass_fds=(control_peer.fileno(), candidate_peer.fileno(), barrier, *pidfds),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        )
+                    finally:
+                        control_peer.close()
+                        candidate_peer.close()
+                        os.close(barrier)
+                    processes.append(process)
+                    return process, control, candidate
+
+                incomplete, control, candidate = start_authority(False, handles)
+                candidate.sendall(b"W")
+                self.assertEqual(candidate.recv(1), b"N")
+                control.sendall(b"D")
+                self.assertEqual(control.recv(1), b"B")
+                incomplete.kill()
+                incomplete.wait(timeout=5)
+                complete, control, candidate = start_authority(True, [*handles, child_handle])
+                control.sendall(b"D")
+                self.assertEqual(control.recv(1), b"B")
+                parent.stdin.write("commit\n")
+                parent.stdin.flush()
+                self.assertTrue(select.select([child_handle], [], [], 5)[0])
+                with sqlite3.connect(database) as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 2)
+                for sent, expected in ((b"D", b"D"), (b"P", b"P"), (b"O", b"O")):
+                    control.sendall(sent)
+                    self.assertEqual(control.recv(1), expected)
+                candidate.sendall(b"W")
+                self.assertEqual(candidate.recv(1), b"Y")
+                control.close()
+                self.assertEqual(complete.wait(timeout=5), 0)
+            finally:
+                if child_handle is not None:
+                    if not select.select([child_handle], [], [], 0)[0]:
+                        signal.pidfd_send_signal(child_handle, signal.SIGKILL)
+                    os.close(child_handle)
+                for sock in sockets:
+                    sock.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                for handle in handles:
+                    os.close(handle)
+                os.close(anchor)
+
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd_open is required")
     def test_pidfd_reconciliation_refuses_live_writer_after_supervisor_death(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1069,7 +1215,14 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 7 and sys.argv[1] == "pidfd_transition":
+    if len(sys.argv) >= 7 and sys.argv[1] == "multi_transition":
+        transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
+                             [int(value) for value in sys.argv[7:]], sys.argv[6] == "1")
+    elif len(sys.argv) == 3 and sys.argv[1] == "spawn_descendant":
+        spawn_descendant(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "descendant":
+        descendant_writer(sys.argv[2])
+    elif len(sys.argv) == 7 and sys.argv[1] == "pidfd_transition":
         transition_authority(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6]))
     elif len(sys.argv) == 5 and sys.argv[1] == "early_writer":
         early_release_writer(int(sys.argv[2]), sys.argv[3], sys.argv[4])

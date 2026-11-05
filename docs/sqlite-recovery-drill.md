@@ -506,6 +506,23 @@ supervisor. Também não há captura real, validação de continuidade ou garant
 de durabilidade após crash. O teste é condicional à disponibilidade de
 `pidfd_open` e não autoriza integração operacional.
 
+Uma ampliação acompanha múltiplos processos sintéticos por `pidfd`, incluindo
+um pai que inicia um descendente e termina enquanto o descendente permanece
+ativo. Após a morte do supervisor e o término dos processos inicialmente
+conhecidos, o descendente mantém uma transação SQLite aberta sem lock cooperativo.
+Uma autoridade marcada como tendo lista incompleta recusa admissão e drenagem.
+Uma segunda autoridade recebe explicitamente também o `pidfd` do descendente e,
+mesmo marcada como completa pelo teste, recusa drenar até o descendente confirmar
+e terminar; o banco contém então as duas linhas esperadas e a transição explícita
+pode ocorrer.
+
+A marca de completude e todos os handles são fornecidos pelo processo de teste;
+não há mecanismo que descubra descendentes, prove que a lista está completa ou
+recupere handles após perda de seu custodiante. Marcar erroneamente uma lista
+como completa continua inseguro. O caso cobre apenas uma árvore sintética e
+depende de `pidfd_open` e `pidfd_send_signal`; não constitui fencing, controle
+de processos externos ou reconciliação operacional.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
