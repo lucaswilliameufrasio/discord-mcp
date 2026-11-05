@@ -70,6 +70,33 @@ def broker(database, socket_fd):
     sock.close()
 
 
+def closed_gate(socket_fd):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    while True:
+        command = sock.recv(1)
+        if not command:
+            return
+        if command not in (b"W", b"C"):
+            raise RuntimeError("invalid gate request")
+        # This fixture has no trustworthy proof that direct access is fenced.
+        sock.sendall(b"N")
+
+
+def same_uid_writer(database, socket_fd):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (2)")
+    sock.sendall(f"DIRECT {os.getpid()}".encode())
+    if sock.recv(1) != b"C":
+        raise RuntimeError("expected commit")
+    connection.commit()
+    connection.close()
+    sock.sendall(b"COMMITTED")
+
+
 def stop(process):
     if process.poll() is None:
         process.kill()
@@ -152,10 +179,66 @@ def run():
                 print("broker_death_rolls_back_and_direct_access_denied=yes", flush=True)
                 print("recovery_decision=closed", flush=True)
 
+        gate_client, gate_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        writer_client, writer_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        for sock in (gate_client, gate_peer, writer_client, writer_peer):
+            stack.callback(sock.close)
+        gate_client.settimeout(5)
+        writer_client.settimeout(5)
+        gate = subprocess.Popen(
+            [sys.executable, __file__, "closed_gate", str(gate_peer.fileno())],
+            pass_fds=(gate_peer.fileno(),), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        stack.callback(stop, gate)
+        other = subprocess.Popen(
+            [sys.executable, __file__, "same_uid_writer", database, str(writer_peer.fileno())],
+            pass_fds=(writer_peer.fileno(),), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        stack.callback(stop, other)
+        gate_peer.close()
+        writer_peer.close()
+        message = writer_client.recv(128).decode().split()
+        if len(message) != 2 or message[0] != "DIRECT" or int(message[1]) != other.pid:
+            raise RuntimeError("same-UID writer did not enter transaction")
+        with open(f"/proc/{other.pid}/status", encoding="ascii") as source:
+            fields = dict(line.rstrip().split(":", 1) for line in source if ":" in line)
+        if int(fields["Uid"].split()[1]) != os.geteuid():
+            raise RuntimeError("writer UID differs from broker UID")
+        for request in (b"W", b"C"):
+            gate_client.sendall(request)
+            if gate_client.recv(1) != b"N":
+                raise RuntimeError("gate opened without fencing evidence")
+        with sqlite3.connect(database) as db:
+            if db.execute("SELECT COUNT(*) FROM writes").fetchone() != (1,):
+                raise RuntimeError("uncommitted direct write was visible")
+        writer_client.sendall(b"C")
+        if writer_client.recv(128) != b"COMMITTED" or other.wait(timeout=5) != 0:
+            raise RuntimeError("same-UID direct write did not commit")
+        with sqlite3.connect(database) as db:
+            if db.execute("SELECT COUNT(*) FROM writes").fetchone() != (2,):
+                raise RuntimeError("direct write missing")
+        for request in (b"W", b"C"):
+            gate_client.sendall(request)
+            if gate_client.recv(1) != b"N":
+                raise RuntimeError("gate reopened without fencing evidence")
+        print("same_uid_direct_sqlite_commit=verified", flush=True)
+        print("unknown_direct_access_admission_and_capture=denied", flush=True)
+        gate_client.close()
+        if gate.wait(timeout=5) != 0:
+            raise RuntimeError("gate did not exit cleanly")
+
 
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "broker":
         broker(sys.argv[2], int(sys.argv[3]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "same_uid_writer":
+        same_uid_writer(sys.argv[2], int(sys.argv[3]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "closed_gate":
+        closed_gate(int(sys.argv[2]))
     elif len(sys.argv) == 1:
         run()
     else:

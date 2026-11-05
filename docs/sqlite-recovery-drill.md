@@ -707,6 +707,19 @@ descritores vazados, autorização de canais, captura incremental, perda de host
 ou recuperação operacional. O corretor é apenas uma fixture: não foi integrado
 ao aplicativo nem demonstra que todos os escritores reais passem por ele.
 
+O mesmo exercício agora inicia outra autoridade sintética que recusa pedidos de
+escrita e captura enquanto não há prova de fencing. Um subprocesso distinto com
+o mesmo UID do corretor acessa diretamente o banco privado e mantém uma transação;
+a autoridade recusa ambos os pedidos. O subprocesso confirma a linha sem usar o
+corretor, e a autoridade continua recusando. A contagem é verificada por uma
+conexão independente antes e depois do commit.
+
+Esse controle mostra que um gate fechado **não impede** acesso direto por outro
+processo com o mesmo UID e permissões ao arquivo. A autoridade da fixture apenas
+nega mensagens: não executa captura, não identifica automaticamente processos,
+não aplica isolamento obrigatório e não protege o aplicativo real. A recusa é
+conservadora, não uma solução para o acesso concorrente.
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela
