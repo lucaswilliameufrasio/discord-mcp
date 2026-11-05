@@ -667,6 +667,28 @@ os escritores são lançados por ela. O teste não estabelece controle obrigató
 isolamento completo ou recuperação operacional. Não aplicar ao aplicativo como
 se fosse prova de completude.
 
+O exemplo de spool inclui um teste opt-in que combina processos com o mesmo UID
+subordinado e a recusa conservadora de captura. Um processo representando o
+corretor mantém uma conexão SQLite; outro processo com o mesmo UID inicia e
+confirma uma escrita direta, sem consultar o gate. A autoridade é morta e
+reiniciada enquanto a transação está aberta. Antes e depois do commit, os três
+caminhos de captura conservadores retornam `INVENTORY_UNKNOWN`; nomes e bytes
+do repositório e watermark permanecem idênticos. O teste verifica que a linha
+confirmada existe e que o WAL mudou, mas que a tentativa posterior de captura
+não o alterou.
+
+O banco e seus sidecars são sintéticos, com permissões temporariamente
+compartilhadas apenas dentro do diretório próprio do teste; o processo que
+representa o corretor não implementa um corretor operacional. A recusa é fixa
+por falta de prova de inventário: não detecta automaticamente o escritor e não
+executa captura ou reconciliação incremental. A biblioteca usa o checkout irmão
+local modificável. Para executá-lo, além dos requisitos do exercício de spool,
+são necessários Linux x86-64, `unshare` e mapeamentos de UID subordinado:
+
+```sh
+TMPDIR=/tmp/opencode cargo test --locked --manifest-path drills/s3/Cargo.toml --target-dir target/s3-drill --example spool_recovery tests::subordinate_uid_direct_writer_cannot_trigger_conservative_capture -- --ignored --exact
+```
+
 A variante opt-in `--uncontrolled-writer` cria um banco SQLite exclusivamente
 sintético em diretório temporário próprio e concede acesso de escrita ao arquivo
 de teste para a identidade subordinada. Um processo restrito, sem capacidades

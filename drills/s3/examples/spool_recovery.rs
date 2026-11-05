@@ -1450,6 +1450,191 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Linux user namespaces, subordinate UID mappings and /usr/bin/unshare"]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn subordinate_uid_direct_writer_cannot_trigger_conservative_capture() {
+        use std::{
+            os::unix::fs::{MetadataExt, PermissionsExt},
+            path::PathBuf,
+            process::Stdio,
+        };
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+
+        fn files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            fn collect(root: &Path, path: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        collect(root, &path, output);
+                    } else {
+                        output.push((
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            fs::read(&path).unwrap(),
+                        ));
+                    }
+                }
+            }
+            let mut output = Vec::new();
+            collect(root, root, &mut output);
+            output.sort();
+            output
+        }
+
+        fn effective_uid(pid: u32) -> u32 {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+
+        const WORKER: &str = r#"
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=5)
+if sys.argv[2] == 'outsider':
+    connection.execute('BEGIN IMMEDIATE')
+    connection.execute("INSERT INTO records VALUES(2, 'subuid outsider')")
+print('MARK ready', file=sys.stderr, flush=True)
+action = sys.stdin.readline().strip()
+if sys.argv[2] == 'outsider' and action == 'commit':
+    connection.commit()
+elif sys.argv[2] != 'broker' or action != 'stop':
+    raise RuntimeError('unexpected action')
+connection.close()
+"#;
+        async fn spawn(source: &Path, role: &str) -> tokio::process::Child {
+            let mut child = tokio::process::Command::new("/usr/bin/unshare")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .args([
+                    "--user",
+                    "--map-auto",
+                    "--map-root-user",
+                    "--setgid",
+                    "1",
+                    "--setuid",
+                    "1",
+                    "/usr/bin/python3",
+                    "-c",
+                    WORKER,
+                ])
+                .arg(source)
+                .arg(role)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+            barrier_marker(&mut stderr, "ready").await;
+            child
+        }
+
+        let (dir, db) = barrier_fixture();
+        // Only synthetic files under this fixture are made accessible to the
+        // subordinate UID. No application database or host policy is changed.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o733)).unwrap();
+        for name in ["source.db", "source.db-wal", "source.db-shm"] {
+            fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        let source = dir.path().join("source.db");
+        let repository = dir.path().join("repository");
+        let before = files(&repository);
+        let watermark = read_watermark(&repository).unwrap();
+        let mut broker = spawn(&source, "broker").await;
+        let mut outsider = spawn(&source, "outsider").await;
+        let broker_uid = effective_uid(broker.id().unwrap());
+        assert_ne!(broker_uid, fs::metadata(dir.path()).unwrap().uid());
+        assert_eq!(effective_uid(outsider.id().unwrap()), broker_uid);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let wal_before_commit = fs::read(dir.path().join("source.db-wal")).unwrap();
+        let mut authority = start_continuity_authority_mode(dir.path(), false).await;
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let mut restarted = start_continuity_authority_mode(dir.path(), false).await;
+        for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), command).await).await,
+                "INVENTORY_UNKNOWN"
+            );
+        }
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        assert_eq!(files(&repository), before);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        outsider
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"commit\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), outsider.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        assert_ne!(wal, wal_before_commit);
+        for command in ["CAPTURE", "CAPTURE_FAULT", "CAPTURE_INVENTORY"] {
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), command).await).await,
+                "INVENTORY_UNKNOWN"
+            );
+        }
+        assert_eq!(fs::read(dir.path().join("source.db-wal")).unwrap(), wal);
+        assert_eq!(files(&repository), before);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        broker
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"stop\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), broker.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     async fn authority_death_after_ltx_publish_requires_explicit_spool_reconciliation() {
         use tokio::{
