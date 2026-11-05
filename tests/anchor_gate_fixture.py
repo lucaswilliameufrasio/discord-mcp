@@ -188,6 +188,29 @@ def transferred_sqlite_writer(socket_fd, database):
     os.close(fd)
 
 
+def early_release_writer(socket_fd, database, action):
+    sock = socket.socket(fileno=socket_fd)
+    sock.settimeout(5)
+    fd = receive_descriptor(sock)
+    if fd is None:
+        raise RuntimeError("missing barrier")
+    sock.sendall(b"A")
+    if sys.stdin.readline().strip() != "start":
+        raise RuntimeError("expected start")
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("INSERT INTO writes VALUES (1)")
+    if action == "unlock":
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    print("RELEASED", flush=True)
+    if sys.stdin.readline().strip() != "commit":
+        raise RuntimeError("expected commit")
+    connection.commit()
+    connection.close()
+    sock.close()
+
+
 def receive_descriptor(sock):
     data, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
     if not data:
@@ -238,6 +261,74 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_early_release_and_supervisor_reference_limits(self):
+        cases = ((False, "close", False), (True, "close", True), (True, "unlock", False))
+        for retain, action, blocked in cases:
+            with self.subTest(retain=retain, action=action), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "activity.lock")
+                database = os.path.join(directory, "synthetic.db")
+                with open(path, "wb"):
+                    pass
+                with sqlite3.connect(database) as db:
+                    db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+                anchor = os.open(path, os.O_RDWR)
+                barrier = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                retained = os.dup(barrier) if retain else None
+                sender, receiver = socket.socketpair()
+                processes = []
+                try:
+                    authority = subprocess.Popen(
+                        [sys.executable, __file__, "grant_authority", str(sender.fileno()), str(barrier)],
+                        pass_fds=(sender.fileno(), barrier), stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+                    processes.append(authority)
+                    os.close(barrier)
+                    writer = subprocess.Popen(
+                        [sys.executable, __file__, "early_writer", str(receiver.fileno()), database, action],
+                        pass_fds=(receiver.fileno(),), stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+                    processes.append(writer)
+                    sender.close()
+                    receiver.close()
+                    self.assertEqual(line(authority.stdout), "ACK")
+                    authority.kill()
+                    authority.wait(timeout=5)
+                    writer.stdin.write("start\n")
+                    writer.stdin.flush()
+                    self.assertEqual(line(writer.stdout), "RELEASED")
+                    probe = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                    try:
+                        if blocked:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        else:
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        # Commit happens while the exclusive probe is still held
+                        # in the unprotected cases, proving a false drain.
+                        writer.stdin.write("commit\n")
+                        writer.stdin.flush()
+                        self.assertEqual(writer.wait(timeout=5), 0)
+                        if retained is not None:
+                            os.close(retained)
+                            retained = None
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(probe)
+                    with sqlite3.connect(database) as db:
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+                finally:
+                    sender.close()
+                    receiver.close()
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill()
+                        process.communicate(timeout=5)
+                    if retained is not None:
+                        os.close(retained)
+                    os.close(anchor)
+
     def test_transferred_writer_lock_survives_disconnect_and_authority_death(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "activity.lock")
@@ -794,7 +885,9 @@ class AnchorTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "grant_authority":
+    if len(sys.argv) == 5 and sys.argv[1] == "early_writer":
+        early_release_writer(int(sys.argv[2]), sys.argv[3], sys.argv[4])
+    elif len(sys.argv) == 4 and sys.argv[1] == "grant_authority":
         grant_authority(int(sys.argv[2]), int(sys.argv[3]))
     elif len(sys.argv) == 4 and sys.argv[1] == "transferred_writer":
         transferred_sqlite_writer(int(sys.argv[2]), sys.argv[3])

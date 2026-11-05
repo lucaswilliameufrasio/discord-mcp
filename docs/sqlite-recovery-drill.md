@@ -458,6 +458,24 @@ SQLite, teste de falha da transferência/ACK nessa fixture, nem protocolo comple
 de reinício, captura ou recuperação. O supervisor mantém a âncora viva. Portanto
 isso não qualifica a admissão de escritores reais nem substitui cooperação.
 
+Um teste posterior compara três variantes com transação SQLite aberta e
+autoridade morta após o ACK. Se o escritor fecha prematuramente o descritor
+transferido sem outra referência ao lock, um probe independente obtém lock
+exclusivo e o escritor ainda confirma enquanto esse lock está mantido. Se o
+supervisor mantém uma referência duplicada à mesma descrição até o processo
+escritor terminar, o fechamento prematuro não libera o lock e o probe é recusado;
+após o commit, saída do escritor e fechamento da referência do supervisor, o
+probe consegue adquiri-lo. Porém, se o escritor chama `flock(LOCK_UN)` antes de
+fechar, o probe obtém lock exclusivo mesmo com a referência duplicada retida, e
+o commit ocorre durante esse lock: os descritores compartilham a descrição de
+arquivo e o desbloqueio afeta o mesmo lock.
+
+Reter uma duplicata protege apenas contra fechamento prematuro nos casos
+testados, não contra desbloqueio explícito, morte do supervisor, processos
+externos ou descendentes que continuem escrevendo. A fixture não impõe posse
+contínua nem prova que o processo acompanhado seja o único capaz de escrever;
+continua imprópria para integração operacional.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
