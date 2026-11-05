@@ -667,6 +667,22 @@ os escritores são lançados por ela. O teste não estabelece controle obrigató
 isolamento completo ou recuperação operacional. Não aplicar ao aplicativo como
 se fosse prova de completude.
 
+A variante opt-in `--uncontrolled-writer` cria um banco SQLite exclusivamente
+sintético em diretório temporário próprio e concede acesso de escrita ao arquivo
+de teste para a identidade subordinada. Um processo restrito, sem capacidades
+efetivas, é iniciado no escopo transitório **fora** do subgrupo controlado e sem
+o handshake de lançamento. Ele abre uma transação e confirma uma linha; antes do
+commit a linha não é visível a outra conexão. Enquanto ele está ativo, o
+subgrupo indica vazio e o observador de inventário mantém a decisão fechada.
+O teste confirma o commit, encerra o processo e remove os recursos próprios.
+
+As permissões deliberadamente compartilhadas são apenas do arquivo sintético,
+não representam a configuração do banco real. O resultado mostra que, quando
+uma identidade possui acesso ao banco, executar código com essa identidade fora
+do launcher pode contorná-lo. O observador não identifica automaticamente esse
+escritor; permanece fechado por política fixa. Não foram alteradas permissões do
+host ou da aplicação, e o experimento não estabelece contenção operacional.
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela

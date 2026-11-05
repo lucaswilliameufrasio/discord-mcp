@@ -1,4 +1,5 @@
 """Opt-in Linux cgroup research inside an owned transient systemd scope only."""
+import contextlib
 import os
 import select
 import signal
@@ -75,6 +76,24 @@ if sock.recv(1) != b"Q":
     raise SystemExit(3)
 '''
 
+UNCONTROLLED_WRITER = r'''
+import os, socket, sqlite3, sys
+sock = socket.socket(fileno=int(sys.argv[2]))
+sock.settimeout(5)
+connection = sqlite3.connect(sys.argv[1], timeout=5)
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("INSERT INTO writes VALUES (1)")
+sock.sendall(f"WRITING {os.getpid()}".encode())
+if sock.recv(1) != b"C":
+    raise SystemExit(2)
+connection.commit()
+sock.sendall(b"COMMITTED")
+if sock.recv(1) != b"Q":
+    raise SystemExit(3)
+connection.close()
+sock.close()
+'''
+
 
 def worker(leaf, scope, socket_fd, separate_identity=False, database_dir="-", gated=False):
     sock = socket.socket(fileno=socket_fd)
@@ -142,6 +161,96 @@ def inventory_recovery(leaf):
         print(f"populated={int(active)} count={count} decision=closed", flush=True)
     except (OSError, KeyError, ValueError):
         print("evidence=unavailable decision=closed", flush=True)
+
+
+def run_uncontrolled_writer():
+    with open("/proc/self/cgroup", encoding="ascii") as source:
+        lines = source.read().splitlines()
+    if len(lines) != 1 or not lines[0].startswith("0::/"):
+        raise RuntimeError("expected a unified cgroup v2 hierarchy")
+    relative = lines[0][3:]
+    name = os.path.basename(relative)
+    if not name.startswith("discord-mcp-cgroup-drill-") or not name.endswith(".scope"):
+        raise RuntimeError("requires an owned discord-mcp-cgroup-drill transient scope")
+    scope = os.path.join("/sys/fs/cgroup", relative.lstrip("/"))
+    leaf = os.path.join(scope, f"uncontrolled-{os.getpid()}")
+    os.mkdir(leaf)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    parent.settimeout(5)
+    process = None
+    try:
+        with contextlib.ExitStack() as stack:
+            scratch = stack.enter_context(tempfile.TemporaryDirectory(prefix="cgroup-uncontrolled-", dir="/tmp/opencode"))
+            # Synthetic test-only shared access: the restricted identity can
+            # write this file, so filesystem permissions do not enforce launch.
+            os.chmod(scratch, 0o733)
+            database = os.path.join(scratch, "synthetic.db")
+            with sqlite3.connect(database) as db:
+                db.execute("CREATE TABLE writes(value INTEGER NOT NULL)")
+            os.chmod(database, 0o666)
+            process = subprocess.Popen(
+                ["/usr/bin/unshare", "--user", "--map-auto", "--map-root-user",
+                 "--setgid", "1", "--setuid", "1", "/usr/bin/python3", "-c",
+                 UNCONTROLLED_WRITER, database, str(child.fileno())],
+                pass_fds=(child.fileno(),), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            def stop_writer():
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+            stack.callback(stop_writer)
+            child.close()
+            message = parent.recv(128).decode().split()
+            if len(message) != 2 or message[0] != "WRITING" or int(message[1]) != process.pid:
+                raise RuntimeError("uncontrolled writer did not start")
+            with open(f"/proc/{process.pid}/status", encoding="ascii") as status:
+                fields = dict(line.rstrip().split(":", 1) for line in status if ":" in line)
+            if int(fields["Uid"].split()[1]) == os.geteuid() or int(fields["CapEff"].strip(), 16) != 0:
+                raise RuntimeError("writer identity/capabilities were not separated")
+            with open(f"/proc/{process.pid}/cgroup", encoding="ascii") as source:
+                membership = source.read().strip()
+            if membership != "0::/" + relative.lstrip("/") or populated(leaf):
+                raise RuntimeError("writer was not outside the controlled leaf")
+            with sqlite3.connect(database) as db:
+                if db.execute("SELECT COUNT(*) FROM writes").fetchone() != (0,):
+                    raise RuntimeError("uncommitted row was visible")
+            observed = subprocess.run(
+                [sys.executable, __file__, "inventory-recovery", leaf],
+                capture_output=True, text=True, timeout=5, check=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            if observed.stdout.strip() != "populated=0 count=0 decision=closed":
+                raise RuntimeError("unknown inventory did not remain closed")
+            print("uncontrolled_restricted_writer_outside_leaf=active", flush=True)
+            print("empty_leaf_with_unknown_writer=closed", flush=True)
+            parent.sendall(b"C")
+            if parent.recv(128) != b"COMMITTED":
+                raise RuntimeError("uncontrolled writer did not commit")
+            with sqlite3.connect(database) as db:
+                if db.execute("SELECT COUNT(*) FROM writes").fetchone() != (1,):
+                    raise RuntimeError("synthetic commit missing")
+            observed = subprocess.run(
+                [sys.executable, __file__, "inventory-recovery", leaf],
+                capture_output=True, text=True, timeout=5, check=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            if observed.stdout.strip() != "populated=0 count=0 decision=closed":
+                raise RuntimeError("unknown inventory reopened after commit")
+            print("uncontrolled_sqlite_commit=verified_decision_closed", flush=True)
+            parent.sendall(b"Q")
+            if process.wait(timeout=5) != 0:
+                raise RuntimeError("uncontrolled writer failed")
+    finally:
+        parent.close()
+        child.close()
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        os.rmdir(leaf)
 
 
 def run_inventory():
@@ -516,6 +625,8 @@ if __name__ == "__main__":
         run(separate_identity=True, controller_crash=True, sqlite_transaction=True)
     elif len(sys.argv) == 2 and sys.argv[1] == "--inventory":
         run_inventory()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--uncontrolled-writer":
+        run_uncontrolled_writer()
     elif len(sys.argv) == 2 and sys.argv[1] == "--launch-admission":
         run(separate_identity=True, controller_crash=True, sqlite_transaction=True, launch_gate=True)
     elif len(sys.argv) == 2 and sys.argv[1] == "--launch-deny":
