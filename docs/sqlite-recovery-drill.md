@@ -768,6 +768,30 @@ privada, não altera a hierarquia de montagem do host, e o banco é temporário:
 systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/mount_boundary_fixture.py"
 ```
 
+#### Exercício opt-in de namespace endurecido e descritores
+
+`tests/hardened_mount_fixture.py` testa uma variante local: antes de executar o
+cliente, um bootstrap sintético rejeita descritores herdados fora de uma lista
+permitida; uma execução com descritor do banco intencionalmente herdado é
+recusada. Sem o descritor, o bootstrap mascara o diretório sintético em namespace
+privado, limpa grupos suplementares, troca para UID/GID subordinados, aplica
+`no_new_privs` e verifica que não recupera UID 0. A desmontagem retorna `EPERM`,
+e os caminhos testados — direto e via `/proc/<pid>/root` do processo de teste —
+não permitem abrir o banco. O controlador confirma UID efetivo distinto e
+ausência de capacidades efetivas no cliente.
+
+Como contraprova, outro processo fora dessa restrição e com o UID original
+confirma uma escrita diretamente no mesmo banco sintético; o gate de mensagens
+continua recusando captura e admissão. A lista de descritores e o bootstrap são
+confiáveis apenas por hipótese: não há imposição para todos os processos, prova
+de ausência de outros caminhos ou de processos privilegiados, autenticação,
+captura incremental ou recuperação de host. O teste não qualifica sandbox nem
+gate de produção. A montagem é privada e os recursos são próprios do exercício:
+
+```sh
+systemd-run --user --scope --quiet --property=Delegate=yes --collect --unit="discord-mcp-cgroup-drill-$$" /usr/bin/python3 "$PWD/tests/hardened_mount_fixture.py"
+```
+
 A variante `--sqlite-controller-crash` acrescenta uma transação SQLite em WAL
 ao descendente restrito. Antes de sinalizar prontidão, ele cria banco sintético,
 inicia `BEGIN IMMEDIATE`, insere uma linha e confirma com outra conexão que ela
