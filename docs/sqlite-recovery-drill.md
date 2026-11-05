@@ -134,6 +134,46 @@ respectivamente em 0,185 s e 0,181 s para o trecho sintético medido, sem build
 ou inicialização do emulador. São evidência do fluxo testado, não de durabilidade
 remota, desempenho de produção ou recuperação de host.
 
+### Investigação de coordenação de escritores — 2026-11-05
+
+`tests/sqlite_coordination.rs` usa bancos temporários separados, processos reais
+da CLI e do servidor em loopback, identidades sintéticas e nenhuma chamada
+válida ao Discord. Uma conexão independente mantém `BEGIN IMMEDIATE` enquanto
+outra tenta conceder permissão. Com a reserva ativa, o processo CLI permaneceu
+pendente por 400 ms, uma segunda reserva com timeout zero falhou e uma leitura
+WAL viu o estado anterior; após `ROLLBACK`, a CLI terminou e a permissão e sua
+auditoria apareceram. Uma reserva mais longa levou a CLI a falhar no prazo
+limitado, sem conceder a permissão ou registrar alteração bem-sucedida. Em outro
+teste, uma requisição MCP ao servidor permaneceu pendente durante a reserva e
+concluiu após a liberação; a métrica de leitura foi persistida. Os testes usam
+esperas de observação e demonstram o comportamento dos caminhos exercitados,
+não uma prova formal de que cada processo atingiu um ponto específico interno
+ao SQLite antes da observação.
+
+Este resultado **não é um write-gate** nem garante que todos os escritores
+estejam coordenados. A abertura de `ChannelStore` faz inicialização e
+`INSERT OR IGNORE` para verificar a chave, além de usar `busy_timeout` de cinco
+segundos; portanto uma reserva SQLite pode bloquear até caminhos aparentemente
+de leitura e fazer operações falharem. A coleta de métricas é de melhor esforço
+e pode perder eventos se a gravação falhar. Há múltiplos processos/caminhos:
+CLI de canais e permissões, stdio e web locais, servidor HTTP, OAuth, métricas,
+auditoria, inicialização/limpeza e recuperação; abrir um SQLite diretamente por
+fora da aplicação também não participa de qualquer protocolo futuro. Os testes
+atuais não cobrem todos esses caminhos, checkpoint, crash, concorrência alta,
+nem falhas de rede ou efeitos Discord em andamento.
+
+É especialmente incorreto simplesmente manter `BEGIN IMMEDIATE` na conexão do
+gate enquanto chama `capture_once`: o próprio adaptador de captura do projeto
+irmão tenta adquirir outra reserva `BEGIN IMMEDIATE` em sua conexão. Isso
+produziria contenção, não a exclusão mútua cooperativa exigida. Um mecanismo
+real precisaria impedir novas escritas em **todos** os processos participantes,
+aguardar as já admitidas, lidar com morte/reinício de processos e falha de
+liberação, e permitir que a própria captura obtenha sua reserva SQLite. Seu
+contrato, integração, limites de espera e falhas precisam de projeto e testes
+antes de uso. Um snapshot completo via SQLite Backup API é uma operação distinta
+da captura incremental do WAL; os testes de snapshot existentes não demonstram
+que esse gate incremental foi implementado.
+
 ## Preparar uma cópia restaurada
 
 Os comandos abaixo descrevem a ferramenta, não autorizam acesso a backups reais
