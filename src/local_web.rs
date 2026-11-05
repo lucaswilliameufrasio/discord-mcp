@@ -63,6 +63,7 @@ fn router(app: Shared) -> Router {
         .route("/", get(home))
         .route("/login", post(login))
         .route("/channels", post(save))
+        .route("/channels/bot", post(save_bot))
         .route("/delete", post(delete_confirm))
         .route("/delete/confirm", post(delete))
         .layer(DefaultBodyLimit::max(8192))
@@ -174,7 +175,7 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
     page(
         StatusCode::OK,
         format!(
-            r#"<p>Gerencie os destinos locais disponíveis para envio. Os webhooks cadastrados não são exibidos novamente.</p><section><h2>Canais cadastrados</h2><ul>{list}</ul></section><section><h2>Cadastrar ou substituir webhook</h2><p class="note">Use letras, números, hífen ou sublinhado no nome. Um nome existente terá seu webhook substituído.</p><form method="post" action="/channels"><label for="name">Nome do canal</label><input id="name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="webhook">URL do webhook do Discord</label><input id="webhook" name="webhook" type="password" autocomplete="off" required><button>Salvar canal</button></form></section>"#
+            r#"<p>Gerencie os destinos locais. Webhooks e tokens cadastrados não são exibidos novamente.</p><section><h2>Canais cadastrados</h2><ul>{list}</ul></section><section><h2>Cadastrar ou substituir webhook</h2><p class="note">Use letras, números, hífen ou sublinhado no nome. Um nome existente será substituído.</p><form method="post" action="/channels"><label for="name">Nome do canal</label><input id="name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="webhook">URL do webhook do Discord</label><input id="webhook" name="webhook" type="password" autocomplete="off" required><button>Salvar webhook</button></form></section><section><h2>Cadastrar ou substituir bot</h2><p>O bot precisa estar instalado no servidor e ter permissões de leitura e envio para o canal. Um nome existente será substituído.</p><form method="post" action="/channels/bot"><label for="bot-name">Nome do canal</label><input id="bot-name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="channel-id">ID do canal Discord</label><input id="channel-id" name="channel_id" inputmode="numeric" pattern="[0-9]+" required><label for="bot-token">Token do bot</label><input id="bot-token" name="token" type="password" autocomplete="off" required><button>Salvar bot</button></form></section>"#
         ),
     )
 }
@@ -224,6 +225,32 @@ async fn login(State(app): State<Shared>, headers: HeaderMap, Form(form): Form<L
 struct ChannelForm {
     name: String,
     webhook: String,
+}
+
+#[derive(Deserialize)]
+struct BotForm {
+    name: String,
+    channel_id: String,
+    token: String,
+}
+
+async fn save_bot(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<BotForm>,
+) -> Response {
+    if !allowed_post(&app, &headers) || !authenticated(&app, &headers) {
+        return denied();
+    }
+    if app
+        .storage
+        .open()
+        .and_then(|store| store.put_bot(&form.name, &form.channel_id, &form.token))
+        .is_err()
+    {
+        return page(StatusCode::UNPROCESSABLE_ENTITY, "<p>Não foi possível salvar o bot. Confira nome, ID, token e banco.</p><p><a href=\"/\">Voltar aos canais</a></p>".into());
+    }
+    (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response()
 }
 
 async fn save(
@@ -384,6 +411,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        let bot_saved = post(
+            "/channels/bot",
+            "name=robot&channel_id=123&token=synthetic-bot-token".into(),
+        )
+        .header(header::ORIGIN, &origin)
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(bot_saved.status(), StatusCode::SEE_OTHER);
         let page = client
             .get(&origin)
             .header(header::COOKIE, &cookie)
@@ -395,7 +432,11 @@ mod tests {
             .unwrap();
         assert!(page.contains("alerts"));
         assert!(!page.contains("synthetic-token"));
-        assert_eq!(storage.open().unwrap().list().unwrap(), vec!["alerts"]);
+        assert!(!page.contains("synthetic-bot-token"));
+        assert_eq!(
+            storage.open().unwrap().list().unwrap(),
+            vec!["alerts", "robot"]
+        );
         let confirmation = post("/delete", "name=alerts".into())
             .header(header::ORIGIN, &origin)
             .header(header::COOKIE, &cookie)
@@ -403,7 +444,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(confirmation.status(), StatusCode::OK);
-        assert_eq!(storage.open().unwrap().list().unwrap(), vec!["alerts"]);
+        assert_eq!(
+            storage.open().unwrap().list().unwrap(),
+            vec!["alerts", "robot"]
+        );
         let removed = post("/delete/confirm", "name=alerts".into())
             .header(header::ORIGIN, &origin)
             .header(header::COOKIE, &cookie)
@@ -411,7 +455,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed.status(), StatusCode::SEE_OTHER);
-        assert!(storage.open().unwrap().list().unwrap().is_empty());
+        assert_eq!(storage.open().unwrap().list().unwrap(), vec!["robot"]);
         server.abort();
     }
 }

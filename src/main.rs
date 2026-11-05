@@ -3,7 +3,8 @@ use std::{io::Read, path::PathBuf};
 mod local_web;
 
 use discord_mcp::{
-    channels::ChannelStore,
+    bot::BotClient,
+    channels::{Channel, ChannelStore},
     webhook::{WebhookClient, WebhookUrl},
 };
 use rmcp::{
@@ -21,11 +22,20 @@ struct SendMessage {
     content: String,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ReadMessages {
+    /// Registered bot channel name; webhook-only channels cannot be read.
+    channel: String,
+    /// Number of recent messages, between 1 and 20 (default 10).
+    limit: Option<u8>,
+}
+
 #[derive(Clone)]
 struct DiscordMcp {
     webhook: Option<WebhookUrl>,
     storage: Option<StorageConfig>,
     client: WebhookClient,
+    bot_client: BotClient,
     tool_router: ToolRouter<Self>,
 }
 
@@ -62,12 +72,12 @@ impl StorageConfig {
 
 #[tool_router]
 impl DiscordMcp {
-    #[tool(description = "Send a message to the locally configured Discord webhook")]
+    #[tool(description = "Send a message to a registered Discord bot or webhook channel")]
     async fn send_message(&self, Parameters(input): Parameters<SendMessage>) -> CallToolResult {
         let selected = match (&input.channel, &self.storage) {
             (Some(channel), Some(storage)) => {
-                match storage.open().and_then(|db| db.get_webhook(channel)) {
-                    Ok(webhook) => Some(webhook),
+                match storage.open().and_then(|db| db.get_channel(channel)) {
+                    Ok(channel) => Some(channel),
                     Err(error) => {
                         return CallToolResult::error(vec![ContentBlock::text(error.to_string())]);
                     }
@@ -78,15 +88,58 @@ impl DiscordMcp {
                     "Channel storage is not configured.",
                 )]);
             }
-            (None, _) => self.webhook.clone(),
+            (None, _) => self.webhook.clone().map(Channel::Webhook),
         };
-        let Some(webhook) = &selected else {
+        let Some(channel) = &selected else {
             return CallToolResult::error(vec![ContentBlock::text(
                 "No webhook is configured. Set DISCORD_WEBHOOK_URL in the client environment.",
             )]);
         };
-        match self.client.send(webhook, &input.content).await {
+        let result = match channel {
+            Channel::Webhook(webhook) => self
+                .client
+                .send(webhook, &input.content)
+                .await
+                .map_err(|e| e.to_string()),
+            Channel::Bot(bot) => self
+                .bot_client
+                .send(bot, &input.content)
+                .await
+                .map_err(|e| e.to_string()),
+        };
+        match result {
             Ok(()) => CallToolResult::success(vec![ContentBlock::text("Message sent.")]),
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(error)]),
+        }
+    }
+
+    #[tool(
+        description = "Read recent messages from a registered Discord bot channel. Discord may restrict message content."
+    )]
+    async fn read_messages(&self, Parameters(input): Parameters<ReadMessages>) -> CallToolResult {
+        let Some(storage) = &self.storage else {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Channel storage is not configured.",
+            )]);
+        };
+        let channel = match storage.open().and_then(|db| db.get_channel(&input.channel)) {
+            Ok(channel) => channel,
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(error.to_string())]);
+            }
+        };
+        let Channel::Bot(bot) = channel else {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Webhook channels do not support reading.",
+            )]);
+        };
+        match self.bot_client.read(&bot, input.limit.unwrap_or(10)).await {
+            Ok(messages) => match rmcp::serde_json::to_string(&messages) {
+                Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+                Err(_) => {
+                    CallToolResult::error(vec![ContentBlock::text("Unable to encode messages.")])
+                }
+            },
             Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
         }
     }
@@ -96,7 +149,7 @@ impl DiscordMcp {
 impl ServerHandler for DiscordMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Local webhook sending only. Channel management, bot access and remote mode are not available yet.",
+            "Local Discord webhook and bot channels. Remote mode and per-user permissions are not available yet.",
         )
     }
 }
@@ -143,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webhook,
         storage,
         client: WebhookClient::new()?,
+        bot_client: BotClient::new()?,
         tool_router: DiscordMcp::tool_router(),
     }
     .serve(rmcp::transport::stdio())

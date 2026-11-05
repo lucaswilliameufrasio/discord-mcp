@@ -44,6 +44,29 @@ fn encrypted_channels_survive_restart_and_wrong_key_cannot_replace_them() {
         store.put_webhook("invalid name", secret_a),
         Err(StoreError::InvalidInput)
     ));
+    store
+        .put_bot("robot", "123", "synthetic-bot-token")
+        .unwrap();
+    assert!(matches!(
+        store.get_channel("robot"),
+        Ok(discord_mcp::channels::Channel::Bot(_))
+    ));
+    assert!(matches!(
+        store.get_webhook("robot"),
+        Err(StoreError::InvalidInput)
+    ));
+    drop(store);
+    let raw = std::fs::read(&path).unwrap();
+    assert!(
+        !raw.windows(b"synthetic-bot-token".len())
+            .any(|v| v == b"synthetic-bot-token")
+    );
+    assert!(matches!(
+        ChannelStore::open(&path, &key)
+            .unwrap()
+            .get_channel("robot"),
+        Ok(discord_mcp::channels::Channel::Bot(_))
+    ));
 }
 
 #[test]

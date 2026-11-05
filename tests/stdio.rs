@@ -35,7 +35,7 @@ fn initializes_over_stdio_and_advertises_local_webhook_scope() {
         response["result"]["instructions"]
             .as_str()
             .expect("instructions")
-            .contains("Local webhook sending only")
+            .contains("Local Discord webhook and bot channels")
     );
     assert!(response["result"]["capabilities"].get("tools").is_some());
     writeln!(
@@ -71,6 +71,10 @@ fn registered_channel_is_resolved_by_mcp() {
         .unwrap()
         .put_webhook("alpha", "https://discord.com/api/webhooks/123/synthetic")
         .unwrap();
+    ChannelStore::open(&path, &key)
+        .unwrap()
+        .put_bot("robot", "123", "synthetic-token")
+        .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
         .env_remove("DISCORD_WEBHOOK_URL")
         .env("DISCORD_MCP_DB", &path)
@@ -103,6 +107,30 @@ fn registered_channel_is_resolved_by_mcp() {
             .as_str()
             .unwrap()
             .contains("message must contain")
+    );
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_messages","arguments":{"channel":"alpha"}}})).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let response: Value = rmcp::serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 3);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("do not support reading")
+    );
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_messages","arguments":{"channel":"robot","limit":0}}})).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let response: Value = rmcp::serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 4);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be")
     );
     drop(input);
     assert!(child.wait().unwrap().success());

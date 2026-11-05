@@ -11,7 +11,7 @@ conforme as permissões concedidas no Discord.
 
 O protocolo stdio oferece envio para um webhook configurado na variável de
 ambiente `DISCORD_WEBHOOK_URL`; mensagens não permitem menções automáticas. O
-modo servidor, OAuth, controle de acesso, gestão guiada de segredos, bot e
+modo servidor, OAuth, controle de acesso, gestão guiada de segredos e
 interface administrativa compartilhada ainda precisam ser implementados.
 
 Também é possível cadastrar múltiplos webhooks em SQLite local e selecionar o
@@ -44,6 +44,20 @@ SameSite estrito e não exibe webhooks já cadastrados. É uma interface local,
 não um servidor acessível remotamente. Ela roda em processo separado do MCP
 stdio e utiliza o mesmo banco. Não protege contra outro processo com os mesmos
 privilégios do usuário que consiga ler a chave ou controlar o navegador.
+
+### Canais com bot
+
+Na interface local, informe o nome, o ID do canal e o token de um bot já
+instalado no servidor Discord. O token é cifrado no mesmo banco e não é exibido
+novamente. `send_message` envia pelo bot ou webhook; `read_messages` só aceita
+canais de bot e retorna até 20 mensagens recentes. O bot precisa das permissões
+Discord adequadas, incluindo `VIEW_CHANNEL`, `SEND_MESSAGES` e
+`READ_MESSAGE_HISTORY` para as respectivas operações. A ausência de
+`READ_MESSAGE_HISTORY` pode resultar em lista vazia; não prova que o canal não
+tem mensagens. O Discord também pode retornar conteúdo vazio quando o intent
+privilegiado `MESSAGE_CONTENT` não está configurado ou aprovado. Esta versão
+não acompanha mensagens em tempo real e ainda não foi validada contra o Discord
+real.
 
 ## Desenvolvimento
 

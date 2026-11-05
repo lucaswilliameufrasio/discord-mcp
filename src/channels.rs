@@ -7,7 +7,12 @@ use chacha20poly1305::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::webhook::WebhookUrl;
+use crate::{bot::BotChannel, webhook::WebhookUrl};
+
+pub enum Channel {
+    Webhook(WebhookUrl),
+    Bot(BotChannel),
+}
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -102,6 +107,16 @@ impl ChannelStore {
     }
 
     pub fn put_webhook(&self, name: &str, url: &str) -> Result<(), StoreError> {
+        WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
+        self.put_secret(name, url)
+    }
+
+    pub fn put_bot(&self, name: &str, channel_id: &str, token: &str) -> Result<(), StoreError> {
+        let bot = BotChannel::new(channel_id, token).ok_or(StoreError::InvalidInput)?;
+        self.put_secret(name, &bot.encode())
+    }
+
+    fn put_secret(&self, name: &str, url: &str) -> Result<(), StoreError> {
         if name.is_empty()
             || name.len() > 64
             || !name
@@ -110,7 +125,6 @@ impl ChannelStore {
         {
             return Err(StoreError::InvalidInput);
         }
-        WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
         let mut nonce = [0_u8; 24];
         getrandom::fill(&mut nonce).map_err(|_| StoreError::Storage)?;
         let encrypted = self
@@ -128,6 +142,13 @@ impl ChannelStore {
     }
 
     pub fn get_webhook(&self, name: &str) -> Result<WebhookUrl, StoreError> {
+        match self.get_channel(name)? {
+            Channel::Webhook(url) => Ok(url),
+            Channel::Bot(_) => Err(StoreError::InvalidInput),
+        }
+    }
+
+    pub fn get_channel(&self, name: &str) -> Result<Channel, StoreError> {
         let record: Option<(Vec<u8>, Vec<u8>)> = self
             .db
             .query_row(
@@ -153,7 +174,14 @@ impl ChannelStore {
             )
             .map_err(|_| StoreError::Decryption)?;
         let value = std::str::from_utf8(&plaintext).map_err(|_| StoreError::Decryption)?;
-        WebhookUrl::parse(value).map_err(|_| StoreError::Decryption)
+        if value.starts_with("bot:") {
+            return BotChannel::decode(value)
+                .map(Channel::Bot)
+                .ok_or(StoreError::Decryption);
+        }
+        WebhookUrl::parse(value)
+            .map(Channel::Webhook)
+            .map_err(|_| StoreError::Decryption)
     }
 
     pub fn list(&self) -> Result<Vec<String>, StoreError> {
