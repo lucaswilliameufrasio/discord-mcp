@@ -297,6 +297,18 @@ no diretório do lock; não demonstra que tal acesso exista na implantação. A
 fixture não protege a identidade do arquivo e o resultado não estabelece uma
 solução para substituição, corrida de caminhos ou filesystem hostil.
 
+Uma segunda fixture de subprocesso mantém aberto o descritor original antes de
+um escritor cooperativo adquirir seu lock. O teste substitui o caminho entre a
+abertura e a tentativa de lock: o descritor retido ainda retorna `busy` enquanto
+o escritor vive. Após matar esse subprocesso e iniciar outro que reabre o mesmo
+caminho, a tentativa adquire o lock substituto apesar da transação antiga ainda
+estar aberta; a tentativa libera seu lock e o escritor antigo confirma. Assim,
+reter o descritor elimina apenas essa troca de caminho para aquele processo e
+arquivo já aberto. Não protege escritores novos que abram o caminho substituído,
+nem estabelece identidade confiável após reinício, proteção de diretório,
+persistência, ou segurança contra filesystem hostil. O subprocesso é somente
+uma experiência da primitiva, não uma implementação do protocolo de autoridade.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;

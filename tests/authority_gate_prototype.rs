@@ -536,6 +536,117 @@ async fn replacing_activity_lock_allows_false_drain_with_cooperative_writer() {
     assert_eq!(fixture.command("FINISH").await, "FINISHED_CLOSED");
 }
 
+// Isolated primitive experiment, not part of the authority protocol.
+#[test]
+fn pinned_barrier_worker() {
+    let Some(dir) = std::env::var_os("PINNED_BARRIER_DIR") else {
+        return;
+    };
+    let barrier = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new(&dir).join("activity.lock"))
+        .unwrap();
+    eprintln!("MARK pinned");
+    for command in std::io::stdin().lock().lines() {
+        assert_eq!(command.unwrap(), "probe");
+        if barrier.try_lock().is_ok() {
+            eprintln!("MARK acquired");
+            barrier.unlock().unwrap();
+        } else {
+            eprintln!("MARK busy");
+        }
+    }
+}
+
+async fn start_pinned_barrier(dir: &Path) -> (Child, BufReader<tokio::process::ChildStderr>) {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PINNED_BARRIER_DIR", dir)
+        .args(["--exact", "pinned_barrier_worker", "--nocapture"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    assert_eq!(worker_line(&mut stderr).await, "MARK pinned");
+    (child, stderr)
+}
+
+async fn worker_line(stderr: &mut BufReader<tokio::process::ChildStderr>) -> String {
+    let mut line = String::new();
+    let count = timeout(Duration::from_secs(5), stderr.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(count > 0);
+    line.trim().to_owned()
+}
+
+#[tokio::test]
+async fn pinned_barrier_survives_path_swap_but_not_process_restart() {
+    let fixture = Fixture::start().await;
+    assert_eq!(fixture.command("OPEN").await, "OPENED");
+    let (mut pinned, mut stderr) = start_pinned_barrier(fixture.dir.path()).await;
+    let mut writer = start_writer_with_disconnect(fixture.dir.path(), true).await;
+    let replacement = fixture.dir.path().join("replacement.lock");
+    std::fs::write(&replacement, []).unwrap();
+    // Force the path swap between the original open and the lock attempt.
+    std::fs::rename(&replacement, fixture.dir.path().join("activity.lock")).unwrap();
+    pinned
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"probe\n")
+        .await
+        .unwrap();
+    assert_eq!(worker_line(&mut stderr).await, "MARK busy");
+
+    pinned.kill().await.unwrap();
+    pinned.wait().await.unwrap();
+    let (mut restarted, mut restarted_stderr) = start_pinned_barrier(fixture.dir.path()).await;
+    restarted
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"probe\n")
+        .await
+        .unwrap();
+    assert_eq!(worker_line(&mut restarted_stderr).await, "MARK acquired");
+    // The restarted process locked a different inode while the old writer lived.
+    writer
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"commit\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), writer.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let db = rusqlite::Connection::open(fixture.dir.path().join("writer.db")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM writes", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(restarted.stdin.take());
+    assert!(
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
 #[tokio::test]
 async fn previous_writer_blocks_restart_and_capture_until_commit() {
     let mut fixture = Fixture::start().await;
