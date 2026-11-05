@@ -174,6 +174,48 @@ antes de uso. Um snapshot completo via SQLite Backup API é uma operação disti
 da captura incremental do WAL; os testes de snapshot existentes não demonstram
 que esse gate incremental foi implementado.
 
+### Protocolo cooperativo experimental — 2026-11-05
+
+`cargo test --test cooperative_gate_prototype` executa uma experiência isolada
+entre subprocessos, com arquivos e SQLite sintéticos em diretório temporário.
+Ela não altera os caminhos de escrita da aplicação nem chama `capture_once`.
+O desenho pesquisado usa dois locks de arquivo separados e um byte de estado:
+
+1. O escritor obtém lock compartilhado de admissão, verifica o estado aberto,
+   obtém lock compartilhado de atividade e libera a admissão. Ele mantém o
+   lock de atividade durante toda a transação SQLite, inclusive commit.
+2. O coordenador obtém a admissão exclusivamente, grava e sincroniza o estado
+   fechado e depois obtém o lock de atividade exclusivamente. Isso impede
+   novas admissões e espera os escritores que já entraram terminarem.
+3. Depois da drenagem, o experimento confirma que outra conexão consegue obter
+   `BEGIN IMMEDIATE` no SQLite; o próprio gate não mantém essa reserva. O
+   coordenador só marca aberto novamente enquanto ainda controla a admissão e
+   após um comando explícito no teste.
+
+Os testes verificam fechamento antes da drenagem, entrada de um escritor
+posterior somente após reabertura, commit da escrita anterior, rollback SQLite
+após morte do escritor, morte do coordenador antes e depois da drenagem, recusa
+enquanto o estado permanece fechado, reinício e reabertura explícita. Estado
+inválido faz o processo de teste falhar antes de admitir a escrita. Locks são
+consultivos: a prova vale apenas para processos participantes que abrem os
+mesmos arquivos e seguem a mesma ordem. Os subprocessos são sincronizados por
+mensagens explícitas e encerrados pelo próprio teste; não há dados reais.
+
+**Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
+stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
+um processo não cooperativo pode escrever diretamente no banco. O fixture não
+garante proteção contra substituição de arquivos/inodes, symlinks, permissões
+incorretas, múltiplos hosts ou filesystems de rede; não qualifica semântica de
+lock em outras plataformas, `fork`, perda física de energia, corrupção parcial
+ou durabilidade do diretório. Também não define inicialização fail-closed,
+timeouts, tratamento de falha de `fsync`, starvation, limites de espera,
+reconciliação após captura ou uma liberação condicionada à publicação durável.
+O encerramento do processo libera locks do sistema, mas não comprova que seu
+efeito externo ou seu estado de captura esteja consistente. Antes de uma
+integração operacional, é necessário especificar e testar esses casos, integrar
+todos os escritores e o write-gate real da biblioteca, além de publicar e fixar
+uma revisão reproduzível dela.
+
 ## Preparar uma cópia restaurada
 
 Os comandos abaixo descrevem a ferramenta, não autorizam acesso a backups reais
