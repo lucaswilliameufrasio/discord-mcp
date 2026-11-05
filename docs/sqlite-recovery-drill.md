@@ -585,6 +585,21 @@ escritores dentro do domínio, morte do controlador, recuperação após reiníc
 nem comportamento sob outras configurações. Não é sandbox qualificada nem
 autorização para integrar a fronteira ao gate de produção.
 
+Outra variante opt-in usa `--controller-crash` no mesmo comando. O processo de
+teste mantém o escopo transitório e inicia um controlador separado, que lança
+o descendente de identidade restrita no subgrupo. Depois que o descendente está
+pronto, o teste mata o controlador. Um processo novo observa `populated=1` e
+mantém `decision=closed`; o descendente ainda não consegue migrar para o escopo
+pai. Após sua saída, outro processo observa `populated=0`, mas permanece fechado.
+O experimento remove apenas o subgrupo próprio ao final.
+
+O processo de recuperação é deliberadamente um observador que sempre recusa:
+ele não recupera inventário, não verifica continuidade da replicação e não
+autoriza reabertura. O processo de teste e o escopo sobrevivem à morte do
+controlador; não foram simuladas perda do escopo/host, falha de persistência,
+transação SQLite ou integração com escritores reais. A evidência não qualifica
+essa fronteira para produção.
+
 Uma fixture de inventário investiga a janela entre lançar e registrar um
 escritor. O lançador grava `launching` e chama `fsync` antes de iniciar um
 subprocesso SQLite; o teste o mata depois de iniciar o escritor e antes de

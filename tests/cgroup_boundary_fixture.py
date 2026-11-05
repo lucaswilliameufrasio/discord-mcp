@@ -1,5 +1,6 @@
 """Opt-in Linux cgroup research inside an owned transient systemd scope only."""
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -74,7 +75,26 @@ def worker(leaf, scope, socket_fd, separate_identity=False):
     os._exit(0)
 
 
-def run(separate_identity=False):
+def controller(leaf, scope, socket_fd):
+    process = subprocess.Popen(
+        [sys.executable, __file__, "worker", leaf, scope, str(socket_fd), "identity"],
+        pass_fds=(socket_fd,), stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    os.close(socket_fd)
+    if process.wait(timeout=5) != 0:
+        raise RuntimeError("launcher failed")
+    print("CONTROLLER_READY", flush=True)
+    sys.stdin.readline()
+
+
+def recovery(leaf):
+    # Observation only: no policy here grants re-opening.
+    print(f"populated={int(populated(leaf))} decision=closed", flush=True)
+
+
+def run(separate_identity=False, controller_crash=False):
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise RuntimeError("Linux pidfd APIs required")
     with open("/proc/self/cgroup", encoding="ascii") as source:
@@ -93,13 +113,15 @@ def run(separate_identity=False):
     process = None
     pidfd = None
     try:
-        args = [sys.executable, __file__, "worker", leaf, scope, str(child.fileno())]
-        if separate_identity:
+        role = "controller" if controller_crash else "worker"
+        args = [sys.executable, __file__, role, leaf, scope, str(child.fileno())]
+        if separate_identity and not controller_crash:
             args.append("identity")
         process = subprocess.Popen(
-            args,
-            pass_fds=(child.fileno(),), stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            args, pass_fds=(child.fileno(),),
+            stdin=subprocess.PIPE if controller_crash else subprocess.DEVNULL,
+            stdout=subprocess.PIPE if controller_crash else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env={"PATH": "/usr/bin:/bin"},
         )
         child.close()
@@ -114,7 +136,23 @@ def run(separate_identity=False):
             if effective_uid == os.geteuid() or int(fields["CapEff"].strip(), 16) != 0:
                 raise RuntimeError("worker identity/capabilities were not separated")
             print("worker_identity_separated_and_no_effective_caps=yes", flush=True)
-        if process.wait(timeout=5) != 0:
+        if controller_crash:
+            if not select.select([process.stdout], [], [], 5)[0]:
+                raise TimeoutError("controller did not become ready")
+            if process.stdout.readline().strip() != b"CONTROLLER_READY":
+                raise RuntimeError("controller failed before ready")
+            process.kill()
+            process.wait(timeout=5)
+            print("controller_killed_while_descendant_alive=yes", flush=True)
+            observed = subprocess.run(
+                [sys.executable, __file__, "recovery", leaf],
+                capture_output=True, text=True, timeout=5, check=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            if observed.stdout.strip() != "populated=1 decision=closed":
+                raise RuntimeError("recovery did not observe a populated closed group")
+            print("recovery_after_controller_death=populated_closed", flush=True)
+        elif process.wait(timeout=5) != 0:
             raise RuntimeError("launcher failed")
         if not populated(leaf):
             raise RuntimeError("descendant not observed in leaf after launcher exit")
@@ -139,12 +177,20 @@ def run(separate_identity=False):
             raise RuntimeError("invalid migration response")
         print("admission_decision=closed_unqualified_boundary", flush=True)
         parent.sendall(b"Q")
-        import select
         if not select.select([pidfd], [], [], 5)[0]:
             raise TimeoutError("descendant did not exit")
         if populated(leaf):
             raise RuntimeError("leaf remained populated after descendant exit")
         print("owned_leaf_empty_after_exit=yes", flush=True)
+        if controller_crash:
+            observed = subprocess.run(
+                [sys.executable, __file__, "recovery", leaf],
+                capture_output=True, text=True, timeout=5, check=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            if observed.stdout.strip() != "populated=0 decision=closed":
+                raise RuntimeError("recovery did not remain closed after exit")
+            print("recovery_after_descendant_exit=empty_closed", flush=True)
     finally:
         parent.close()
         child.close()
@@ -153,7 +199,6 @@ def run(separate_identity=False):
                 process.kill()
             process.communicate(timeout=5)
         if pidfd is not None:
-            import select
             if not select.select([pidfd], [], [], 0)[0]:
                 signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                 select.select([pidfd], [], [], 5)
@@ -162,7 +207,11 @@ def run(separate_identity=False):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "worker":
+    if len(sys.argv) == 5 and sys.argv[1] == "controller":
+        controller(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "recovery":
+        recovery(sys.argv[2])
+    elif len(sys.argv) == 5 and sys.argv[1] == "worker":
         worker(sys.argv[2], sys.argv[3], int(sys.argv[4]))
     elif len(sys.argv) == 6 and sys.argv[1] == "worker" and sys.argv[5] == "identity":
         worker(sys.argv[2], sys.argv[3], int(sys.argv[4]), separate_identity=True)
@@ -170,5 +219,7 @@ if __name__ == "__main__":
         run()
     elif len(sys.argv) == 2 and sys.argv[1] == "--identity":
         run(separate_identity=True)
+    elif len(sys.argv) == 2 and sys.argv[1] == "--controller-crash":
+        run(separate_identity=True, controller_crash=True)
     else:
         raise SystemExit("invalid fixture arguments")
