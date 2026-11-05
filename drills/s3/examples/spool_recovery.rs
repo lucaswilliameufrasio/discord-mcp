@@ -825,6 +825,23 @@ mod tests {
         drop(lock);
     }
 
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn continuity_unknown_writer_worker() {
+        let Some(dir) = std::env::var_os("CONTINUITY_UNKNOWN_WRITER_DIR") else {
+            return;
+        };
+        let db = rusqlite::Connection::open(Path::new(&dir).join("source.db")).unwrap();
+        // Deliberately omits the advisory lock and inventory registration.
+        db.execute_batch("BEGIN IMMEDIATE; INSERT INTO records VALUES(2, 'unknown');")
+            .unwrap();
+        eprintln!("MARK transaction");
+        let mut command = String::new();
+        std::io::stdin().read_line(&mut command).unwrap();
+        assert_eq!(command.trim(), "commit");
+        db.execute_batch("COMMIT").unwrap();
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     async fn start_continuity_writer(dir: &Path, id: i64) -> tokio::process::Child {
         use std::process::Stdio;
@@ -896,7 +913,7 @@ mod tests {
                         guard.0 = true;
                         writeln!(stream, "OPENED").unwrap();
                     }
-                    "CAPTURE" | "CAPTURE_FAULT" => {
+                    "CAPTURE" | "CAPTURE_FAULT" | "CAPTURE_INVENTORY" => {
                         {
                             let mut guard = state.lock().unwrap();
                             if guard.1 {
@@ -906,6 +923,13 @@ mod tests {
                             guard.0 = false;
                             guard.1 = true;
                             guard.2 = false;
+                        }
+                        // This experiment has no trusted proof of inventory
+                        // completeness, even if a marker claims otherwise.
+                        if command.trim() == "CAPTURE_INVENTORY" {
+                            state.lock().unwrap().1 = false;
+                            writeln!(stream, "INVENTORY_UNKNOWN").unwrap();
+                            return;
                         }
                         let lock = fs::OpenOptions::new()
                             .read(true)
@@ -1281,6 +1305,125 @@ mod tests {
         };
         assert_eq!(read_rows(&db), read_rows(&recovered));
         assert_eq!(read_rows(&recovered).len(), 3);
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn unknown_inventory_refuses_capture_after_authority_death() {
+        use std::{path::PathBuf, process::Stdio};
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+
+        fn files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            fn collect(root: &Path, path: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        collect(root, &path, output);
+                    } else {
+                        output.push((
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            fs::read(&path).unwrap(),
+                        ));
+                    }
+                }
+            }
+            let mut output = Vec::new();
+            collect(root, root, &mut output);
+            output.sort();
+            output
+        }
+
+        let (dir, db) = barrier_fixture();
+        let repository = dir.path().join("repository");
+        let before = files(&repository);
+        let watermark = read_watermark(&repository).unwrap();
+        let mut authority = start_continuity_authority(dir.path()).await;
+        let mut writer = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("CONTINUITY_UNKNOWN_WRITER_DIR", dir.path())
+            .args([
+                "--exact",
+                "tests::continuity_unknown_writer_worker",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stderr = tokio::io::BufReader::new(writer.stderr.take().unwrap());
+        barrier_marker(&mut stderr, "transaction").await;
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let mut restarted = start_continuity_authority(dir.path()).await;
+        for inventory in [
+            None,
+            Some(b"incomplete\n".as_slice()),
+            Some(b"complete\n".as_slice()),
+        ] {
+            if let Some(value) = inventory {
+                fs::write(dir.path().join("inventory.txt"), value).unwrap();
+            }
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), "CAPTURE_INVENTORY").await).await,
+                "INVENTORY_UNKNOWN"
+            );
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+                "DENIED"
+            );
+            assert_eq!(
+                authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+                "DENIED"
+            );
+            assert_eq!(files(&repository), before);
+            assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        }
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        writer
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"commit\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), writer.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "CAPTURE_INVENTORY").await).await,
+            "INVENTORY_UNKNOWN"
+        );
+        assert_eq!(fs::read(dir.path().join("source.db-wal")).unwrap(), wal);
+        assert_eq!(files(&repository), before);
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
         restarted.kill().await.unwrap();
         timeout(Duration::from_secs(5), restarted.wait())
             .await
