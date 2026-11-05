@@ -44,6 +44,7 @@ struct DiscordMcp {
 struct StorageConfig {
     path: PathBuf,
     key: [u8; 32],
+    audit_retention_days: u16,
 }
 
 impl StorageConfig {
@@ -54,12 +55,21 @@ impl StorageConfig {
         ) {
             (None, Err(std::env::VarError::NotPresent)) => Ok(None),
             (Some(path), Ok(value)) => {
+                let audit_retention_days = match std::env::var("DISCORD_MCP_AUDIT_RETENTION_DAYS") {
+                    Ok(value) => value
+                        .parse::<u16>()
+                        .map_err(|_| "invalid audit retention")?,
+                    Err(std::env::VarError::NotPresent) => 90,
+                    Err(_) => return Err("invalid audit retention".into()),
+                };
+                discord_mcp::http_auth::AuditState::new(audit_retention_days)?;
                 let key: [u8; 32] = hex::decode(value)?
                     .try_into()
                     .map_err(|_| "key must be 32 bytes encoded in hex")?;
                 Ok(Some(Self {
                     path: path.into(),
                     key,
+                    audit_retention_days,
                 }))
             }
             _ => Err("configure both DISCORD_MCP_DB and DISCORD_MCP_KEY".into()),
@@ -67,7 +77,7 @@ impl StorageConfig {
     }
 
     fn open(&self) -> Result<ChannelStore, discord_mcp::channels::StoreError> {
-        ChannelStore::open(&self.path, &self.key)
+        ChannelStore::open(&self.path, &self.key)?.with_audit_retention(self.audit_retention_days)
     }
 }
 

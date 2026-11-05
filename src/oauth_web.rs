@@ -18,8 +18,8 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     channels::{
-        AuthorizationExchange, AuthorizationGrant, ChannelStore, StoreError, valid_challenge,
-        valid_redirect, valid_resource,
+        AuditActor, AuthorizationExchange, AuthorizationGrant, ChannelStore, LoginKind, StoreError,
+        valid_challenge, valid_redirect, valid_resource,
     },
     discord_login::{DiscordLoginClient, PendingDiscordLogin},
     http_auth::AuthState,
@@ -367,7 +367,15 @@ async fn callback(
         .await
     {
         Ok(identity) => identity,
-        Err(_) => return error(StatusCode::FORBIDDEN),
+        Err(_) => {
+            let _ = app.config.auth.audit.record_login(
+                &app.config.auth,
+                LoginKind::Mcp,
+                AuditActor::Unknown,
+                false,
+            );
+            return error(StatusCode::FORBIDDEN);
+        }
     };
     let mut consents = match app.consents.lock() {
         Ok(value) => value,
@@ -376,6 +384,20 @@ async fn callback(
     consents.retain(|_, value| value.expires > Instant::now());
     if consents.len() >= MAX_PENDING {
         return error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if app
+        .config
+        .auth
+        .audit
+        .record_login(
+            &app.config.auth,
+            LoginKind::Mcp,
+            AuditActor::Discord(&identity.id),
+            true,
+        )
+        .is_err()
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR);
     }
     consents.insert(
         binding,
@@ -637,6 +659,7 @@ mod tests {
                 encryption_key: key,
                 resource: resource.clone(),
                 metrics: crate::http_auth::MetricsState::default(),
+                audit: crate::http_auth::AuditState::default(),
             },
             public_origin: origin.clone(),
             client_id: "trusted-client".into(),
@@ -834,6 +857,10 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         let store = ChannelStore::open(&db, &key).unwrap();
+        let logins = store.audit_events(None, Some("mcp_login"), 10).unwrap();
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins[0].actor_id.as_deref(), Some("123"));
+        assert_eq!(logins[0].outcome, "success");
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -929,6 +956,7 @@ mod tests {
                     encryption_key: key,
                     resource: format!("{origin}/mcp"),
                     metrics: crate::http_auth::MetricsState::default(),
+                    audit: crate::http_auth::AuditState::default(),
                 },
                 public_origin: origin.into(),
                 client_id: "client".into(),

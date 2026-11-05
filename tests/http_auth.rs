@@ -53,6 +53,7 @@ async fn http_authenticates_each_request_and_enforces_channel_permissions() {
         encryption_key: key,
         resource: resource.into(),
         metrics: discord_mcp::http_auth::MetricsState::default(),
+        audit: discord_mcp::http_auth::AuditState::default(),
     };
     let router = Router::new()
         .route("/channels/{channel}", get(read_channel))

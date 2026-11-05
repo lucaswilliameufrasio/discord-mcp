@@ -16,7 +16,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
 use crate::{
-    channels::ChannelStore,
+    channels::{AuditActor, AuditContext, ChannelStore, LoginKind, current_timestamp},
     discord_login::{DiscordLoginClient, PendingDiscordLogin},
     http_auth::AuthState,
 };
@@ -60,6 +60,7 @@ pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
         .route("/admin", get(home))
         .route("/admin/channels", get(channels))
         .route("/admin/observability", get(observability))
+        .route("/admin/audit", get(audit))
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -162,9 +163,23 @@ async fn callback(
         .await
     {
         Ok(value) => value,
-        Err(_) => return error(StatusCode::FORBIDDEN),
+        Err(_) => {
+            let _ = app.config.auth.audit.record_login(
+                &app.config.auth,
+                LoginKind::Admin,
+                AuditActor::Unknown,
+                false,
+            );
+            return error(StatusCode::FORBIDDEN);
+        }
     };
     if identity.id != app.config.admin_user_id {
+        let _ = app.config.auth.audit.record_login(
+            &app.config.auth,
+            LoginKind::Admin,
+            AuditActor::Discord(&identity.id),
+            false,
+        );
         return error(StatusCode::FORBIDDEN);
     }
     let mut random = [0u8; 32];
@@ -179,6 +194,20 @@ async fn callback(
     sessions.retain(|_, expires| *expires > Instant::now());
     if sessions.len() >= LIMIT {
         return error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if app
+        .config
+        .auth
+        .audit
+        .record_login(
+            &app.config.auth,
+            LoginKind::Admin,
+            AuditActor::Discord(&identity.id),
+            true,
+        )
+        .is_err()
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR);
     }
     sessions.insert(session.clone(), Instant::now() + Duration::from_secs(1800));
     let secure = if app.config.public_origin.starts_with("https://") {
@@ -246,7 +275,8 @@ fn store(app: &Inner) -> Result<ChannelStore, crate::channels::StoreError> {
     ChannelStore::open(
         &app.config.auth.database_path,
         &app.config.auth.encryption_key,
-    )
+    )?
+    .with_audit_retention(app.config.auth.audit.retention_days())
 }
 
 async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
@@ -276,12 +306,90 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
         ""
     };
     page(format!(
-        r#"<header><p>Discord MCP / Administração</p><h1>Visão geral</h1><p>Resumo do cadastro e dos acessos. Atualizado em <time datetime="{timestamp_iso}">{timestamp}</time>; recarregue para atualizar.</p></header><section aria-labelledby="summary"><h2 id="summary">Configuração e acesso</h2><dl class="metrics"><div><dt>Canais cadastrados</dt><dd>{}</dd></div><div><dt>Usuários com permissões</dt><dd>{}</dd></div><div><dt>Concessões de leitura</dt><dd>{}</dd></div><div><dt>Concessões de envio</dt><dd>{}</dd></div><div><dt>Tokens MCP não expirados</dt><dd>{}</dd></div></dl>{empty}<p>Usuários são distintos; concessões contam pares de usuário e canal. Tokens não expirados não indicam conexões ativas.</p><p><a href="/admin/channels">Gerenciar permissões dos canais</a></p></section><section aria-labelledby="monitor"><h2 id="monitor">Monitoramento e auditoria</h2><p><a href="/admin/observability">Consultar tráfego e falhas MCP HTTP</a></p><p>A saúde do Discord e o histórico de auditoria ainda não são coletados. Nenhum estado de saúde é inferido a partir desta visão.</p></section><form method="post" action="/admin/logout"><button>Sair</button></form>"#,
+        r#"<header><p>Discord MCP / Administração</p><h1>Visão geral</h1><p>Resumo do cadastro e dos acessos. Atualizado em <time datetime="{timestamp_iso}">{timestamp}</time>; recarregue para atualizar.</p></header><section aria-labelledby="summary"><h2 id="summary">Configuração e acesso</h2><dl class="metrics"><div><dt>Canais cadastrados</dt><dd>{}</dd></div><div><dt>Usuários com permissões</dt><dd>{}</dd></div><div><dt>Concessões de leitura</dt><dd>{}</dd></div><div><dt>Concessões de envio</dt><dd>{}</dd></div><div><dt>Tokens MCP não expirados</dt><dd>{}</dd></div></dl>{empty}<p>Usuários são distintos; concessões contam pares de usuário e canal. Tokens não expirados não indicam conexões ativas.</p><p><a href="/admin/channels">Gerenciar permissões dos canais</a></p></section><section aria-labelledby="monitor"><h2 id="monitor">Monitoramento e auditoria</h2><p><a href="/admin/observability">Consultar tráfego e falhas MCP HTTP</a></p><p><a href="/admin/audit">Consultar histórico de auditoria</a></p><p>A saúde do Discord não é coletada. Nenhum estado de saúde é inferido a partir desta visão.</p></section><form method="post" action="/admin/logout"><button>Sair</button></form>"#,
         metrics.channels,
         metrics.permitted_users,
         metrics.read_grants,
         metrics.send_grants,
         metrics.unexpired_tokens
+    ))
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    before: Option<i64>,
+    kind: Option<String>,
+}
+
+async fn audit(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    if !authorized(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    let filter = query.kind.as_deref().filter(|value| !value.is_empty());
+    let mut events = match store(&app)
+        .and_then(|store| store.audit_events(query.before, filter, 51))
+    {
+        Ok(value) => value,
+        Err(crate::channels::StoreError::InvalidInput) => return error(StatusCode::BAD_REQUEST),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let more = events.len() > 50;
+    if more {
+        events.pop();
+    }
+    let before = events.last().map(|event| event.id);
+    let mut rows = String::new();
+    for event in events {
+        let at = chrono::DateTime::from_timestamp(event.occurred_at, 0)
+            .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "Horário inválido".into());
+        let actor = match event.actor_id {
+            Some(id) => format!("{}: {}", event.actor_kind, id),
+            None => event.actor_kind,
+        };
+        let permissions = match (event.can_read, event.can_send) {
+            (Some(read), Some(send)) => format!(
+                "Leitura: {}; envio: {}",
+                if read { "sim" } else { "não" },
+                if send { "sim" } else { "não" }
+            ),
+            _ => "—".into(),
+        };
+        rows.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", escape(&at), escape(&event.event_type), escape(&event.outcome), escape(&actor), escape(event.channel.as_deref().unwrap_or("—")), escape(event.subject_user_id.as_deref().unwrap_or("—")), escape(&permissions)));
+    }
+    if rows.is_empty() {
+        rows.push_str("<tr><td colspan=\"7\">Nenhum evento encontrado.</td></tr>");
+    }
+    let next = if more {
+        let mut url =
+            match reqwest::Url::parse(&format!("{}/admin/audit", app.config.public_origin)) {
+                Ok(value) => value,
+                Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+        if let Some(id) = before {
+            url.query_pairs_mut().append_pair("before", &id.to_string());
+        }
+        if let Some(filter) = filter {
+            url.query_pairs_mut().append_pair("kind", filter);
+        }
+        format!(
+            "<p><a href=\"{}\">Eventos anteriores</a></p>",
+            escape(url.as_str())
+        )
+    } else {
+        String::new()
+    };
+    let warning = if app.config.auth.audit.is_degraded() {
+        "<p role=\"alert\">A gravação de auditoria falhou nesta execução; o histórico pode estar incompleto.</p>"
+    } else {
+        ""
+    };
+    page(format!(
+        r#"<p><a href="/admin">Voltar à visão geral</a></p><h1>Auditoria</h1>{warning}<p>Registra resultados do login Discord após validação da tentativa, alterações de canais locais e permissões bem-sucedidas. Não registra conteúdo de mensagens ou credenciais. Dados anteriores à ativação e tentativas rejeitadas antes da validação não estão incluídos.</p><form method="get" action="/admin/audit"><label for="kind">Tipo de evento</label><select id="kind" name="kind"><option value="">Todos</option><option value="admin_login">Login administrativo</option><option value="mcp_login">Login MCP</option><option value="permission_change">Alteração de permissão</option><option value="channel_configured">Canal cadastrado ou alterado</option><option value="channel_deleted">Canal removido</option><option value="channel_grants_revoked">Revogação ao alterar canal</option></select><button>Filtrar</button></form><div class="table-scroll"><table><thead><tr><th>Horário</th><th>Evento</th><th>Resultado</th><th>Ator</th><th>Canal</th><th>Usuário afetado</th><th>Permissões</th></tr></thead><tbody>{rows}</tbody></table></div>{next}"#
     ))
 }
 
@@ -411,11 +519,30 @@ async fn set_permission(
         "both" => (true, true),
         _ => return error(StatusCode::UNPROCESSABLE_ENTITY),
     };
-    if store(&app)
-        .and_then(|store| store.set_permissions(&form.user_id, &form.channel, read, send))
-        .is_err()
-    {
-        return error(StatusCode::UNPROCESSABLE_ENTITY);
+    let now = match current_timestamp() {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let result = store(&app).and_then(|store| {
+        store.set_permissions_audited(
+            &form.user_id,
+            &form.channel,
+            read,
+            send,
+            AuditContext {
+                actor: AuditActor::Discord(&app.config.admin_user_id),
+                now,
+                retention_days: app.config.auth.audit.retention_days(),
+            },
+        )
+    });
+    match result {
+        Ok(()) => {}
+        Err(crate::channels::StoreError::Storage | crate::channels::StoreError::Decryption) => {
+            app.config.auth.audit.mark_failure();
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Err(_) => return error(StatusCode::UNPROCESSABLE_ENTITY),
     }
     let mut target =
         match reqwest::Url::parse(&format!("{}/admin/channel", app.config.public_origin)) {
@@ -474,7 +601,7 @@ fn headers(response: &mut Response) {
 
 fn page(body: String) -> Response {
     let html = format!(
-        "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Discord MCP · Administração</title><style>body{{font:16px system-ui;background:#101a2d;color:#edf3ff;max-width:860px;margin:2rem auto;padding:0 1rem}}p{{line-height:1.6}}a{{color:#bdd2ff}}label{{display:block;margin:1rem 0 .4rem}}input,select,button{{padding:.7rem;font:inherit}}button{{margin-top:1rem}}td,th{{padding:.5rem;text-align:left}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));gap:1rem}}.metrics div{{padding:1rem;border:1px solid #52637e;border-radius:.4rem;background:#1c2b43}}.metrics dt{{line-height:1.4}}.metrics dd{{margin:.5rem 0 0;font-size:2rem;font-weight:700}}:focus-visible{{outline:3px solid #fbd279}}</style></head><body><main>{body}</main></body></html>"
+        "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Discord MCP · Administração</title><style>body{{font:16px system-ui;background:#101a2d;color:#edf3ff;max-width:860px;margin:2rem auto;padding:0 1rem}}p{{line-height:1.6}}a{{color:#bdd2ff}}label{{display:block;margin:1rem 0 .4rem}}input,select,button{{padding:.7rem;font:inherit}}button{{margin-top:1rem}}td,th{{padding:.5rem;text-align:left}}.table-scroll{{overflow-x:auto}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));gap:1rem}}.metrics div{{padding:1rem;border:1px solid #52637e;border-radius:.4rem;background:#1c2b43}}.metrics dt{{line-height:1.4}}.metrics dd{{margin:.5rem 0 0;font-size:2rem;font-weight:700}}:focus-visible{{outline:3px solid #fbd279}}</style></head><body><main>{body}</main></body></html>"
     );
     let mut response = Html(html).into_response();
     headers(&mut response);
@@ -576,6 +703,7 @@ mod tests {
                 encryption_key: key,
                 resource: format!("{origin}/mcp"),
                 metrics: crate::http_auth::MetricsState::default(),
+                audit: crate::http_auth::AuditState::default(),
             },
             public_origin: origin.clone(),
             admin_user_id: "123".into(),
@@ -593,6 +721,11 @@ mod tests {
         let channel = format!("{origin}/admin/channel?name=alerts");
         let overview_url = format!("{origin}/admin");
         let metrics_url = format!("{origin}/admin/observability");
+        let audit_url = format!("{origin}/admin/audit");
+        assert_eq!(
+            client.get(&audit_url).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             client.get(&metrics_url).send().await.unwrap().status(),
             StatusCode::FORBIDDEN
@@ -789,6 +922,20 @@ mod tests {
                 .is_permitted("456", "alerts", ChannelAction::Send)
                 .unwrap()
         );
+        let audit = client
+            .get(format!("{audit_url}?kind=permission_change"))
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(audit.contains("permission_change"));
+        assert!(audit.contains("discord: 123"));
+        assert!(audit.contains("456"));
+        assert!(!audit.contains("synthetic-bot-token"));
+        assert!(!audit.contains("<td>admin_login</td>"));
         let response = client
             .get(&overview_url)
             .header(header::COOKIE, &session)
@@ -863,6 +1010,12 @@ mod tests {
             .unwrap();
         assert_eq!(other.status(), StatusCode::FORBIDDEN);
         assert!(other.headers().get(header::SET_COOKIE).is_none());
+        let logins = store.audit_events(None, Some("admin_login"), 10).unwrap();
+        assert_eq!(logins.len(), 2);
+        assert_eq!(logins[0].actor_id.as_deref(), Some("999"));
+        assert_eq!(logins[0].outcome, "denied");
+        assert_eq!(logins[1].actor_id.as_deref(), Some("123"));
+        assert_eq!(logins[1].outcome, "success");
         fake.join().unwrap();
         let logout = client
             .post(format!("{origin}/admin/logout"))

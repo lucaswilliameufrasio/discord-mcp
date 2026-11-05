@@ -68,6 +68,7 @@ Além de `DISCORD_MCP_DB` e `DISCORD_MCP_KEY`, configure:
 | `DISCORD_MCP_CLIENT_NAME` | Nome do cliente mostrado no consentimento. |
 | `DISCORD_MCP_CLIENT_REDIRECT` | URI de retorno exata desse cliente. |
 | `DISCORD_MCP_METRICS_RETENTION_DAYS` | Retenção de métricas, entre 1 e 365 dias; padrão 30. |
+| `DISCORD_MCP_AUDIT_RETENTION_DAYS` | Retenção de auditoria, entre 1 e 3650 dias; padrão 90. |
 
 Registre no Discord as URIs de callback formadas por sua origem pública e
 `/oauth/discord/callback` e `/admin/discord/callback`. O recurso MCP será a
@@ -105,8 +106,23 @@ que falharam. Um aviso aparece se uma falha de gravação for detectada durante 
 execução atual; ele não sobrevive ao reinício. A limpeza da retenção ocorre na
 inicialização e quando um novo evento é gravado: dados antigos podem permanecer
 em um servidor ocioso até o próximo evento ou reinício. A coleta não cobre stdio,
-OAuth, interface administrativa nem a saúde do Discord. Auditoria ainda não está
-implementada.
+OAuth, interface administrativa nem a saúde do Discord.
+
+Em `/admin/audit`, o administrador pode consultar eventos de login Discord após
+validação da tentativa, alterações de canais locais e concessões ou revogações
+de permissões. Alterações bem-sucedidas e seus eventos são gravados na mesma
+transação; se o registro falhar, a alteração é revertida. O histórico inclui
+identificadores Discord e nomes de canais, mas não inclui conteúdo de mensagens,
+tokens ou URLs de webhook. Esses metadados ficam no mesmo banco SQLite, protegidos
+pelas permissões do arquivo, mas não são cifrados nem resistentes à adulteração
+por quem controla o banco. Tentativas rejeitadas antes da validação do login,
+erros de token MCP e eventos anteriores à implementação não são registrados.
+
+A retenção de auditoria é de 90 dias por padrão; sua limpeza ocorre na
+inicialização e em novas gravações, podendo ser adiada enquanto o servidor está
+ocioso. Falhas de gravação de tentativas de login negadas são indicadas na
+interface apenas durante a execução atual. O histórico não é uma trilha de
+auditoria completa ou imutável.
 
 Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
 segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;

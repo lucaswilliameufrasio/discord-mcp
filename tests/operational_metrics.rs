@@ -72,6 +72,7 @@ fn recording_failure_marks_collection_incomplete() {
         encryption_key: [1; 32],
         resource: "https://example.invalid/mcp".into(),
         metrics: metrics.clone(),
+        audit: discord_mcp::http_auth::AuditState::default(),
     };
     assert!(!metrics.is_degraded());
     metrics.record(&auth, OperationalEvent::Read { failed: true });

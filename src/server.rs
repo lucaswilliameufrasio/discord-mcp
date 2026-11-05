@@ -59,6 +59,7 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         encryption_key: storage.key,
         resource: format!("{origin}/mcp"),
         metrics,
+        audit: discord_mcp::http_auth::AuditState::new(storage.audit_retention_days)?,
     };
     let admin = AdminConfig {
         auth: auth.clone(),
@@ -79,9 +80,9 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
     )?;
-    storage
-        .open()?
-        .prune_operational_metrics(now, retention_days)?;
+    let store = storage.open()?;
+    store.prune_operational_metrics(now, retention_days)?;
+    store.prune_audit(now, storage.audit_retention_days)?;
     let router = http_mcp::router(config)?.merge(admin_web::router(admin)?);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!(

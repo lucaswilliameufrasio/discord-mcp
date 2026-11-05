@@ -30,6 +30,38 @@ pub struct ChannelPermission {
     pub can_send: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum AuditActor<'a> {
+    LocalOperator,
+    Discord(&'a str),
+    Unknown,
+}
+
+pub struct AuditContext<'a> {
+    pub actor: AuditActor<'a>,
+    pub now: i64,
+    pub retention_days: u16,
+}
+
+#[derive(Clone, Copy)]
+pub enum LoginKind {
+    Admin,
+    Mcp,
+}
+
+pub struct AuditRow {
+    pub id: i64,
+    pub occurred_at: i64,
+    pub event_type: String,
+    pub outcome: String,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub channel: Option<String>,
+    pub subject_user_id: Option<String>,
+    pub can_read: Option<bool>,
+    pub can_send: Option<bool>,
+}
+
 /// Point-in-time database counts; not a measure of live connections or delivery health.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Overview {
@@ -104,6 +136,7 @@ impl std::error::Error for StoreError {}
 pub struct ChannelStore {
     db: Connection,
     cipher: XChaCha20Poly1305,
+    audit_retention_days: u16,
 }
 
 impl ChannelStore {
@@ -138,6 +171,7 @@ impl ChannelStore {
         let store = Self {
             db,
             cipher: XChaCha20Poly1305::new(key.into()),
+            audit_retention_days: 90,
         };
         let mut nonce = [0_u8; 24];
         getrandom::fill(&mut nonce).map_err(|_| StoreError::Storage)?;
@@ -186,6 +220,23 @@ impl ChannelStore {
         store
             .db
             .execute_batch(
+                "CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            actor_kind TEXT NOT NULL,
+            actor_id TEXT,
+            channel_name TEXT,
+            subject_user_id TEXT,
+            can_read INTEGER,
+            can_send INTEGER
+        ); CREATE INDEX IF NOT EXISTS audit_events_time ON audit_events(occurred_at);",
+            )
+            .map_err(|_| StoreError::Storage)?;
+        store
+            .db
+            .execute_batch(
                 "CREATE TABLE IF NOT EXISTS operational_metrics (
             minute INTEGER PRIMARY KEY NOT NULL,
             http_requests INTEGER NOT NULL DEFAULT 0,
@@ -227,6 +278,12 @@ impl ChannelStore {
         Ok(store)
     }
 
+    pub fn with_audit_retention(mut self, days: u16) -> Result<Self, StoreError> {
+        validate_audit(AuditActor::Unknown, 0, days)?;
+        self.audit_retention_days = days;
+        Ok(self)
+    }
+
     pub fn put_webhook(&self, name: &str, url: &str) -> Result<(), StoreError> {
         WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
         self.put_secret(name, url)
@@ -264,13 +321,37 @@ impl ChannelStore {
             .map_err(|_| StoreError::Storage)?;
         // A name can be repointed to a different Discord resource. Never carry
         // old grants over to a newly configured destination.
-        transaction
+        let revoked = transaction
             .execute(
                 "DELETE FROM channel_permissions WHERE channel_name=?1",
                 [name],
             )
             .map_err(|_| StoreError::Storage)?;
+        if revoked > 0 {
+            self.append_audit(
+                current_timestamp()?,
+                self.audit_retention_days,
+                "channel_grants_revoked",
+                "success",
+                AuditActor::LocalOperator,
+                Some(name),
+                None,
+                None,
+                None,
+            )?;
+        }
         transaction.execute("INSERT INTO channels(name, nonce, ciphertext) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext", params![name, nonce.as_slice(), encrypted]).map_err(|_| StoreError::Storage)?;
+        self.append_audit(
+            current_timestamp()?,
+            self.audit_retention_days,
+            "channel_configured",
+            "success",
+            AuditActor::LocalOperator,
+            Some(name),
+            None,
+            None,
+            None,
+        )?;
         transaction.commit().map_err(|_| StoreError::Storage)?;
         Ok(())
     }
@@ -331,14 +412,48 @@ impl ChannelStore {
     }
 
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
-        let count = self
+        let transaction = self
             .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        let grants: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM channel_permissions WHERE channel_name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Storage)?;
+        let count = transaction
             .execute("DELETE FROM channels WHERE name = ?1", [name])
             .map_err(|_| StoreError::Storage)?;
         if count == 0 {
             return Err(StoreError::NotFound);
         }
-        Ok(())
+        if grants > 0 {
+            self.append_audit(
+                current_timestamp()?,
+                self.audit_retention_days,
+                "channel_grants_revoked",
+                "success",
+                AuditActor::LocalOperator,
+                Some(name),
+                None,
+                None,
+                None,
+            )?;
+        }
+        self.append_audit(
+            current_timestamp()?,
+            self.audit_retention_days,
+            "channel_deleted",
+            "success",
+            AuditActor::LocalOperator,
+            Some(name),
+            None,
+            None,
+            None,
+        )?;
+        transaction.commit().map_err(|_| StoreError::Storage)
     }
 
     /// This persists policy only; the caller must authenticate and authorize the administrator.
@@ -349,9 +464,38 @@ impl ChannelStore {
         can_read: bool,
         can_send: bool,
     ) -> Result<(), StoreError> {
+        let now = current_timestamp()?;
+        self.set_permissions_audited(
+            user_id,
+            channel,
+            can_read,
+            can_send,
+            AuditContext {
+                actor: AuditActor::LocalOperator,
+                now,
+                retention_days: self.audit_retention_days,
+            },
+        )
+    }
+
+    /// Call only after authenticating and authorizing the administrator.
+    pub fn set_permissions_audited(
+        &self,
+        user_id: &str,
+        channel: &str,
+        can_read: bool,
+        can_send: bool,
+        context: AuditContext<'_>,
+    ) -> Result<(), StoreError> {
         if !valid_user_id(user_id) {
             return Err(StoreError::InvalidInput);
         }
+        let AuditContext {
+            actor,
+            now,
+            retention_days,
+        } = context;
+        validate_audit(actor, now, retention_days)?;
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -360,6 +504,17 @@ impl ChannelStore {
         if can_read && matches!(self.get_channel(channel)?, Channel::Webhook(_)) {
             return Err(StoreError::InvalidInput);
         }
+        let exists: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM channels WHERE name=?1)",
+                [channel],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
         if !can_read && !can_send {
             transaction
                 .execute(
@@ -367,6 +522,17 @@ impl ChannelStore {
                     params![user_id, channel],
                 )
                 .map_err(|_| StoreError::Storage)?;
+            self.append_audit(
+                now,
+                retention_days,
+                "permission_change",
+                "success",
+                actor,
+                Some(channel),
+                Some(user_id),
+                Some(can_read),
+                Some(can_send),
+            )?;
             return transaction.commit().map_err(|_| StoreError::Storage);
         }
         let changed = transaction.execute(
@@ -378,7 +544,125 @@ impl ChannelStore {
         if changed == 0 {
             return Err(StoreError::NotFound);
         }
+        self.append_audit(
+            now,
+            retention_days,
+            "permission_change",
+            "success",
+            actor,
+            Some(channel),
+            Some(user_id),
+            Some(can_read),
+            Some(can_send),
+        )?;
         transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    pub fn record_discord_login(
+        &self,
+        kind: LoginKind,
+        actor: AuditActor<'_>,
+        success: bool,
+        now: i64,
+        retention_days: u16,
+    ) -> Result<(), StoreError> {
+        validate_audit(actor, now, retention_days)?;
+        let event_type = match kind {
+            LoginKind::Admin => "admin_login",
+            LoginKind::Mcp => "mcp_login",
+        };
+        let outcome = if success { "success" } else { "denied" };
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.append_audit(
+            now,
+            retention_days,
+            event_type,
+            outcome,
+            actor,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_audit(
+        &self,
+        now: i64,
+        retention_days: u16,
+        event_type: &str,
+        outcome: &str,
+        actor: AuditActor<'_>,
+        channel: Option<&str>,
+        subject: Option<&str>,
+        can_read: Option<bool>,
+        can_send: Option<bool>,
+    ) -> Result<(), StoreError> {
+        let (actor_kind, actor_id) = match actor {
+            AuditActor::LocalOperator => ("local_operator", None),
+            AuditActor::Discord(id) => ("discord", Some(id)),
+            AuditActor::Unknown => ("unknown", None),
+        };
+        self.db.execute("INSERT INTO audit_events(occurred_at,event_type,outcome,actor_kind,actor_id,channel_name,subject_user_id,can_read,can_send) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![now,event_type,outcome,actor_kind,actor_id,channel,subject,can_read,can_send]).map_err(|_| StoreError::Storage)?;
+        self.prune_audit(now, retention_days)
+    }
+
+    pub fn prune_audit(&self, now: i64, retention_days: u16) -> Result<(), StoreError> {
+        validate_audit(AuditActor::Unknown, now, retention_days)?;
+        let cutoff = now.saturating_sub(i64::from(retention_days) * 86400);
+        self.db
+            .execute("DELETE FROM audit_events WHERE occurred_at < ?1", [cutoff])
+            .map_err(|_| StoreError::Storage)?;
+        Ok(())
+    }
+
+    /// Newest first. Supplying the last ID provides stable backwards pagination.
+    pub fn audit_events(
+        &self,
+        before_id: Option<i64>,
+        filter: Option<&str>,
+        limit: u8,
+    ) -> Result<Vec<AuditRow>, StoreError> {
+        if limit == 0 || limit > 100 || before_id.is_some_and(|id| id <= 0) {
+            return Err(StoreError::InvalidInput);
+        }
+        if filter.is_some_and(|value| {
+            !matches!(
+                value,
+                "admin_login"
+                    | "mcp_login"
+                    | "permission_change"
+                    | "channel_grants_revoked"
+                    | "channel_configured"
+                    | "channel_deleted"
+            )
+        }) {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut statement = self.db.prepare("SELECT id,occurred_at,event_type,outcome,actor_kind,actor_id,channel_name,subject_user_id,can_read,can_send FROM audit_events WHERE (?1 IS NULL OR id < ?1) AND (?2 IS NULL OR event_type=?2) ORDER BY id DESC LIMIT ?3").map_err(|_| StoreError::Storage)?;
+        let rows = statement
+            .query_map(params![before_id, filter, limit], |row| {
+                Ok(AuditRow {
+                    id: row.get(0)?,
+                    occurred_at: row.get(1)?,
+                    event_type: row.get(2)?,
+                    outcome: row.get(3)?,
+                    actor_kind: row.get(4)?,
+                    actor_id: row.get(5)?,
+                    channel: row.get(6)?,
+                    subject_user_id: row.get(7)?,
+                    can_read: row.get(8)?,
+                    can_send: row.get(9)?,
+                })
+            })
+            .map_err(|_| StoreError::Storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Storage)
     }
 
     /// Call on every operation using a user ID established by the authentication layer.
@@ -681,6 +965,26 @@ impl ChannelStore {
 
 fn valid_user_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+pub fn current_timestamp() -> Result<i64, StoreError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|v| i64::try_from(v.as_secs()).ok())
+        .ok_or(StoreError::Storage)
+}
+
+fn validate_audit(actor: AuditActor<'_>, now: i64, retention_days: u16) -> Result<(), StoreError> {
+    if now < 0 || !(1..=3650).contains(&retention_days) {
+        return Err(StoreError::InvalidInput);
+    }
+    if let AuditActor::Discord(id) = actor
+        && !valid_user_id(id)
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn valid_token(value: &str) -> bool {

@@ -39,6 +39,7 @@ async fn streamable_http_authenticates_each_call_and_enforces_user_channel_actio
             encryption_key: key,
             resource: resource.clone(),
             metrics: discord_mcp::http_auth::MetricsState::default(),
+            audit: discord_mcp::http_auth::AuditState::default(),
         },
         public_origin: origin.clone(),
         client_id: "client".into(),

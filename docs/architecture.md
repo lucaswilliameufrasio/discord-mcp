@@ -75,6 +75,10 @@ acesso limitado ao contexto e às permissões de cada pessoa:
   de canais, mudanças de permissões, logins e tentativas de acesso ou operação.
   Os registros devem identificar ator, ação, alvo, horário e resultado quando
   disponíveis, sem incluir credenciais nem conteúdo de mensagens por padrão.
+  O escopo implementado cobre resultados de login Discord após validar a
+  tentativa, cadastro/remoção de canais locais e mudanças de permissões
+  bem-sucedidas. É armazenado no SQLite, não é imutável e não inclui requisições
+  com token MCP inválido nem tentativas rejeitadas antes da validação do login.
 * **Canais e integrações:** cadastro e manutenção de conexões webhook e bot,
   mostrando as capacidades e o estado de cada uma.
 * **Usuários e permissões:** no modo compartilhado, administração de acesso por

@@ -17,8 +17,67 @@ use axum::{
 };
 
 use crate::channels::{
-    Channel, ChannelAction, ChannelStore, OperationalEvent, StoreError, valid_resource,
+    AuditActor, Channel, ChannelAction, ChannelStore, LoginKind, OperationalEvent, StoreError,
+    current_timestamp, valid_resource,
 };
+
+#[derive(Clone)]
+pub struct AuditState {
+    retention_days: u16,
+    degraded: Arc<AtomicBool>,
+}
+
+impl Default for AuditState {
+    fn default() -> Self {
+        Self {
+            retention_days: 90,
+            degraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl AuditState {
+    pub fn new(retention_days: u16) -> Result<Self, &'static str> {
+        if !(1..=3650).contains(&retention_days) {
+            return Err("audit retention must be between 1 and 3650 days");
+        }
+        Ok(Self {
+            retention_days,
+            degraded: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn retention_days(&self) -> u16 {
+        self.retention_days
+    }
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+    pub fn mark_failure(&self) {
+        self.degraded.store(true, Ordering::Relaxed);
+    }
+    pub fn record_login(
+        &self,
+        auth: &AuthState,
+        kind: LoginKind,
+        actor: AuditActor<'_>,
+        success: bool,
+    ) -> Result<(), StoreError> {
+        let result = current_timestamp().and_then(|now| {
+            ChannelStore::open(&auth.database_path, &auth.encryption_key)?.record_discord_login(
+                kind,
+                actor,
+                success,
+                now,
+                self.retention_days,
+            )
+        });
+        if result.is_err() {
+            self.degraded.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+}
 
 #[derive(Clone)]
 pub struct MetricsState {
@@ -73,6 +132,7 @@ pub struct AuthState {
     /// The fixed resource identifier configured by the server operator.
     pub resource: String,
     pub metrics: MetricsState,
+    pub audit: AuditState,
 }
 
 #[derive(Clone)]

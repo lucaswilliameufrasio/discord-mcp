@@ -335,6 +335,7 @@ mod tests {
         let storage = StorageConfig {
             path: dir.path().join("test.db"),
             key: [12; 32],
+            audit_retention_days: 90,
         };
         storage.open().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
