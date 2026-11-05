@@ -4,8 +4,9 @@ use std::process::{Command, Stdio};
 use rmcp::serde_json::{Value, json};
 
 #[test]
-fn initializes_over_stdio_without_advertising_discord_operations() {
+fn initializes_over_stdio_and_advertises_local_webhook_scope() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_remove("DISCORD_WEBHOOK_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -32,9 +33,28 @@ fn initializes_over_stdio_without_advertising_discord_operations() {
         response["result"]["instructions"]
             .as_str()
             .expect("instructions")
-            .contains("No Discord operations")
+            .contains("Local webhook sending only")
     );
-    assert!(response["result"]["capabilities"].get("tools").is_none());
+    assert!(response["result"]["capabilities"].get("tools").is_some());
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"})
+    )
+    .unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"send_message", "arguments":{"content":"hello"}}})).unwrap();
+    stdin.flush().unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let response: Value = rmcp::serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["isError"], true);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("No webhook is configured")
+    );
     drop(stdin);
     assert!(child.wait().expect("wait for server").success());
 }
