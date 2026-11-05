@@ -144,6 +144,14 @@ contenção continua limitada pelo `busy_timeout` do armazenamento. Isso cobre
 cadastros concorrentes nesse cenário local, não todos os métodos de escrita nem
 fencing para captura incremental.
 
+A exclusão de canal também reserva a escrita com `BEGIN IMMEDIATE` antes de
+verificar quarentena e permissões. Um teste com subprocesso mantém outra
+transação escritora aberta, verifica que a exclusão aguarda, libera a reserva
+e confirma remoção do canal e das permissões e os eventos de auditoria de
+revogação e exclusão. Antes dessa alteração, a transação diferida falhava ao
+tentar promover a leitura para escrita sob contenção. A espera continua sujeita
+ao limite configurado; isso não implementa exclusividade para replicação.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin

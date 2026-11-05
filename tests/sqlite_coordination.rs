@@ -9,10 +9,107 @@ use std::{
 use discord_mcp::channels::{ChannelAction, ChannelStore};
 use rmcp::serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     time::{sleep, timeout},
 };
+
+#[test]
+fn delete_worker() {
+    let Some(path) = std::env::var_os("DELETE_FIXTURE_DB") else {
+        return;
+    };
+    let store = ChannelStore::open(std::path::Path::new(&path), &[184; 32]).unwrap();
+    eprintln!("READY");
+    let mut command = String::new();
+    std::io::stdin().read_line(&mut command).unwrap();
+    assert_eq!(command.trim(), "delete");
+    eprintln!("DELETING");
+    store.delete("support").unwrap();
+}
+
+#[tokio::test]
+async fn deletion_waits_for_writer_and_preserves_audit_and_revocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("delete.db");
+    let store = ChannelStore::open(&database, &[184; 32]).unwrap();
+    store.put_bot("support", "123", "synthetic-token").unwrap();
+    store
+        .set_permissions("101", "support", true, false)
+        .unwrap();
+    let mut worker = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("DELETE_FIXTURE_DB", &database)
+        .args(["--exact", "delete_worker", "--nocapture"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(worker.stderr.take().unwrap());
+    let mut marker = String::new();
+    timeout(Duration::from_secs(5), stderr.read_line(&mut marker))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.trim(), "READY");
+    let blocker = rusqlite::Connection::open(&database).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    worker
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"delete\n")
+        .await
+        .unwrap();
+    marker.clear();
+    timeout(Duration::from_secs(5), stderr.read_line(&mut marker))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.trim(), "DELETING");
+    assert!(
+        timeout(Duration::from_millis(300), worker.wait())
+            .await
+            .is_err(),
+        "delete failed instead of waiting for the concurrent writer"
+    );
+    assert!(
+        store
+            .is_permitted("101", "support", ChannelAction::Read)
+            .unwrap()
+    );
+    blocker.execute_batch("COMMIT").unwrap();
+    assert!(
+        timeout(Duration::from_secs(6), worker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!store.list().unwrap().contains(&"support".to_owned()));
+    let grants: i64 = blocker
+        .query_row("SELECT COUNT(*) FROM channel_permissions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(grants, 0);
+    assert_eq!(
+        store
+            .audit_events(None, Some("channel_grants_revoked"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .audit_events(None, Some("channel_deleted"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
 
 #[tokio::test]
 async fn sqlite_writer_reservation_blocks_cli_until_released() {

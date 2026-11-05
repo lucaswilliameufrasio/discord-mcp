@@ -512,10 +512,11 @@ impl ChannelStore {
     }
 
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
-        let transaction = self
-            .db
-            .unchecked_transaction()
-            .map_err(|_| StoreError::Storage)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
         let grants: i64 = transaction
             .query_row(
