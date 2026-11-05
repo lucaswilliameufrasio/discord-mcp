@@ -608,6 +608,20 @@ evidência é uma ação controlada pelo teste, não procedimento seguro de
 recuperação em produção; o ponto de falha continua na API de spool direta, não
 dentro do hook privado de `capture_once`.
 
+Em outro teste, o delta TXID 2 sintético é truncado após a autoridade ser morta
+no hook de publicação. A autoridade reiniciada permanece fechada; a evidência
+da fonte confere, mas a reconciliação com `capture_once` retorna `FAILED`, sem
+avançar o watermark TXID 1, publicar TXID 3 ou admitir escrita. Os bytes do
+snapshot anterior, o delta truncado, as linhas e o WAL da fonte são comparados
+antes e depois. A tentativa de restaurar TXID 1 do **mesmo repositório** também
+falha ao encontrar o delta posterior truncado e não publica destino. Copiar os
+bytes intactos do snapshot para um repositório temporário separado permitiu
+restaurar TXID 1 com uma linha e `integrity_check` bem-sucedido. Isso demonstra
+integridade do snapshot isolado, não disponibilidade direta do ponto anterior
+no repositório corrompido nem um procedimento aprovado de reparo. O teste não
+modifica ou remove o delta corrompido original. A morte continua no hook da
+API de spool direta, não no hook interno de `capture_once`.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não

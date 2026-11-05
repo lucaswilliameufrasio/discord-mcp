@@ -983,6 +983,118 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    async fn authority_restart_rejects_corrupt_published_ltx_and_keeps_gate_closed() {
+        use tokio::{
+            io::AsyncWriteExt,
+            time::{Duration, timeout},
+        };
+        let (dir, db) = barrier_fixture();
+        let repository = dir.path().join("repository");
+        db.execute("INSERT INTO records VALUES(2, 'synthetic')", [])
+            .unwrap();
+        let witness = image_state(&db, &dir.path().join("updated-witness.db"));
+        fs::write(dir.path().join("witness.txt"), format!("{witness:?}")).unwrap();
+        let source_wal = fs::read(dir.path().join("source.db-wal")).unwrap();
+        let snapshot_path = ltx_path(&repository, 1, 1);
+        let snapshot_before = fs::read(&snapshot_path).unwrap();
+        let mut authority = start_continuity_authority(dir.path()).await;
+        let mut capture = authority_command(dir.path(), "CAPTURE_FAULT").await;
+        assert_eq!(authority_line(&mut capture).await, "VERIFIED");
+        capture.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut capture).await, "PUBLISHED");
+        let watermark = read_watermark(&repository).unwrap();
+        assert_eq!(watermark.txid, 1);
+        authority.kill().await.unwrap();
+        authority.wait().await.unwrap();
+        let delta_path = ltx_path(&repository, 2, 2);
+        let delta = fs::read(&delta_path).unwrap();
+        assert!(delta.len() > 1);
+        let truncated = &delta[..delta.len() / 2];
+        fs::write(&delta_path, truncated).unwrap();
+        assert!(
+            tokio::net::UnixStream::connect(dir.path().join("authority.sock"))
+                .await
+                .is_err()
+        );
+        fs::remove_file(dir.path().join("authority.sock")).unwrap();
+        let mut restarted = start_continuity_authority(dir.path()).await;
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        let mut reconcile = authority_command(dir.path(), "CAPTURE").await;
+        assert_eq!(authority_line(&mut reconcile).await, "VERIFIED");
+        reconcile.get_mut().write_all(b"GO\n").await.unwrap();
+        assert_eq!(authority_line(&mut reconcile).await, "FAILED");
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "WRITE").await).await,
+            "DENIED"
+        );
+        assert_eq!(
+            authority_line(&mut authority_command(dir.path(), "OPEN").await).await,
+            "DENIED"
+        );
+        assert_eq!(read_watermark(&repository).unwrap(), watermark);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
+        assert_eq!(fs::read(&delta_path).unwrap(), truncated);
+        assert!(!ltx_path(&repository, 3, 3).exists());
+        assert_eq!(
+            fs::read(dir.path().join("source.db-wal")).unwrap(),
+            source_wal
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let restored = dir.path().join("previous-point.db");
+        assert!(
+            sqlite_replication_core::restore_to_target(
+                &repository,
+                &restored,
+                sqlite_replication_core::RestoreTarget::Txid(1),
+            )
+            .is_err()
+        );
+        assert!(!restored.exists());
+        // Demonstrate only the independently copied snapshot's integrity;
+        // this is not a repair procedure for the corrupted repository.
+        let isolated = dir.path().join("isolated-previous-repository");
+        ensure_repository(&isolated).unwrap();
+        let isolated_snapshot = ltx_path(&isolated, 1, 1);
+        fs::create_dir_all(isolated_snapshot.parent().unwrap()).unwrap();
+        fs::write(&isolated_snapshot, &snapshot_before).unwrap();
+        sqlite_replication_core::restore_to_target(
+            &isolated,
+            &restored,
+            sqlite_replication_core::RestoreTarget::Txid(1),
+        )
+        .unwrap();
+        let old = rusqlite::Connection::open(restored).unwrap();
+        assert_eq!(
+            old.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let integrity: String = old
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        restarted.kill().await.unwrap();
+        timeout(Duration::from_secs(5), restarted.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     async fn barrier_marker(
         stderr: &mut tokio::io::BufReader<tokio::process::ChildStderr>,
