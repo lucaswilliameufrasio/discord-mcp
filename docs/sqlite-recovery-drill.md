@@ -128,6 +128,13 @@ do protocolo acessarem o mesmo arquivo continua exigindo um modelo de confiança
 e evidência adequados. O gate experimental e a captura incremental não estão
 integrados; não liberar reconciliação operacional apenas com esses requisitos.
 
+O teste `multiple_stdio_instances_observe_shared_channel_changes`, em
+`tests/stdio.rs`, inicia dois processos stdio reais com o mesmo banco sintético,
+registra um canal após ambos inicializarem e verifica que os dois resolvem esse
+canal em requisições MCP locais. O teste não faz chamadas ao Discord. Ele prova
+somente esse compartilhamento de leitura; não verifica escritas simultâneas,
+coordenação da captura, exclusividade global ou recuperação operacional.
+
 O checkout irmão observado em `f5c0984f069407913365136a10d5962f9a33930d`
 oferece `snapshot`, `sync_to_s3`, `restore_from_s3` e `capture_once`, mas essa
 revisão não foi encontrada pela API do GitHub. `git ls-remote origin

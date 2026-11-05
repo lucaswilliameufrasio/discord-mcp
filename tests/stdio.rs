@@ -135,3 +135,108 @@ fn registered_channel_is_resolved_by_mcp() {
     drop(input);
     assert!(child.wait().unwrap().success());
 }
+
+#[tokio::test]
+async fn multiple_stdio_instances_observe_shared_channel_changes() {
+    use discord_mcp::channels::ChannelStore;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncReader},
+        process::{Child, ChildStdin, ChildStdout, Command as AsyncCommand},
+        time::timeout,
+    };
+
+    async fn request(
+        input: &mut ChildStdin,
+        output: &mut AsyncReader<ChildStdout>,
+        value: Value,
+    ) -> Value {
+        input
+            .write_all(format!("{value}\n").as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        let mut line = String::new();
+        let count = timeout(Duration::from_secs(5), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(count > 0, "stdio process exited before responding");
+        rmcp::serde_json::from_str(&line).unwrap()
+    }
+
+    async fn start(
+        path: &std::path::Path,
+        key: &[u8; 32],
+    ) -> (Child, ChildStdin, AsyncReader<ChildStdout>) {
+        let mut child = AsyncCommand::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_DB", path)
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = AsyncReader::new(child.stdout.take().unwrap());
+        let response = request(
+            &mut input,
+            &mut output,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2025-11-25", "capabilities":{},
+                    "clientInfo":{"name":"multi-stdio-test", "version":"1"}}
+            }),
+        )
+        .await;
+        assert!(response.get("error").is_none());
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        (child, input, output)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("shared.db");
+    let key = [51_u8; 32];
+    let store = ChannelStore::open(&database, &key).unwrap();
+    let (mut first, mut first_input, mut first_output) = start(&database, &key).await;
+    let (mut second, mut second_input, mut second_output) = start(&database, &key).await;
+    store.put_bot("shared", "123", "synthetic-token").unwrap();
+    let call = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+        "name":"read_messages", "arguments":{"channel":"shared", "limit":0}
+    }});
+    let (one, two) = tokio::join!(
+        request(&mut first_input, &mut first_output, call.clone()),
+        request(&mut second_input, &mut second_output, call),
+    );
+    for response in [one, two] {
+        assert_eq!(response["id"], 2);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("limit must be")
+        );
+    }
+    drop(first_input);
+    drop(second_input);
+    assert!(
+        timeout(Duration::from_secs(5), first.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        timeout(Duration::from_secs(5), second.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
