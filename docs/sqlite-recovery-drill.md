@@ -66,11 +66,32 @@ documentação e testes, e Discord MCP em `4dfdde4` mais o subprojeto deste
 exercício. Docker rootless e imagem pelo digest do script. Duas execuções
 passaram: snapshot TXID 1 e dois objetos confirmados, restore e reconciliação,
 com 0,183 s e 0,173 s para o trecho medido. Esses tempos não incluem compilação,
-emulador, obtenção de credenciais ou configuração, e não são RTO. Não foram
-testados restart do Floci, truncamento de objetos, falhas de rede, recuperação
-de host ou provedores reais. O checkout irmão foi usado sem modificar seus
+emulador, obtenção de credenciais ou configuração, e não são RTO. Naquela
+campanha não foram testados restart do Floci, truncamento de objetos, falhas
+de rede, recuperação de host ou provedores reais. O checkout irmão foi usado sem modificar seus
 arquivos; sua revisão e seu estado precisam ser preservados independentemente
 para reproduzir o resultado.
+
+### Falhas sintéticas — 2026-11-05
+
+Duas execuções adicionais incluíram prefixos exclusivos com o manifesto presente
+mas LTX ausente, e com o mesmo manifesto mais LTX truncado. Cada restore retornou
+erro e não publicou banco nem sidecars no destino. Em outro cenário, um endpoint
+TCP loopback próprio recebeu bytes da primeira requisição S3 e ficou bloqueado;
+o teste então cancelou a tarefa de restore, aguardou seu encerramento e verificou
+que não havia banco nem sidecars publicados. Após cada falha, comparou os nomes
+e a acessibilidade dos canais e confirmou que leitura, envio e token revogados
+na fonte continuavam revogados. O destino protegido também permaneceu intacto.
+
+As execuções terminaram em 0,130 s e 0,131 s no trecho medido, sem build nem
+inicialização do emulador; isso não é RTO. Após os testes, a revisão observada
+no checkout irmão era `f5c0984f069407913365136a10d5962f9a33930d`, com alterações
+preexistentes em documentação e testes. A revisão do checkout pode mudar durante
+uma execução, portanto o registro não prova que todas as dependências foram
+compiladas a partir de uma árvore imutável. Não houve alteração intencional no
+checkout irmão. Não foram exercitados download parcial de um objeto, cancelamento
+durante publicação local, SIGKILL/crash, retomada, remoção de staging após queda
+brusca, restart do Floci, falhas reais de rede, perda de host ou provedores reais.
 
 ## Preparar uma cópia restaurada
 

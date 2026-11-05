@@ -12,6 +12,49 @@ use discord_mcp::{
 };
 use sqlite_replication_core::{RestoreTarget, restore_from_s3, snapshot, sync_to_s3};
 use sqlite_replication_storage_s3::S3Store;
+use tokio::io::AsyncReadExt;
+
+fn assert_source_unchanged(store: &ChannelStore, token: &str, resource: &str) {
+    assert_eq!(store.list().unwrap(), vec!["support"]);
+    assert!(store.get_channel("support").is_ok());
+    assert!(
+        !store
+            .is_permitted("101", "support", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_permitted("101", "support", ChannelAction::Send)
+            .unwrap()
+    );
+    assert!(
+        store
+            .verify_access_token(token, resource, 1001)
+            .unwrap()
+            .is_none()
+    );
+}
+
+fn assert_no_destination(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        assert!(
+            !Path::new(&value).exists(),
+            "unexpected published destination or sidecar"
+        );
+    }
+}
+
+fn s3_config(address: SocketAddr) -> aws_sdk_s3::Config {
+    aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(format!("http://{address}"))
+        .force_path_style(true)
+        .credentials_provider(Credentials::new("test", "test", None, None, "synthetic"))
+        .build()
+}
 
 async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if address.ip() != IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || address.port() == 0 {
@@ -38,20 +81,13 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
         },
         1000,
     )?;
-    let config = aws_sdk_s3::Config::builder()
-        .behavior_version_latest()
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .endpoint_url(format!("http://{address}"))
-        .force_path_style(true)
-        .credentials_provider(Credentials::new("test", "test", None, None, "synthetic"))
-        .build();
-    let client = aws_sdk_s3::Client::from_conf(config);
+    let client = aws_sdk_s3::Client::from_conf(s3_config(address));
     client
         .create_bucket()
         .bucket("discord-mcp-synthetic-drill")
         .send()
         .await?;
-    let s3 = S3Store::new(client, "discord-mcp-synthetic-drill")?;
+    let s3 = S3Store::new(client.clone(), "discord-mcp-synthetic-drill")?;
     snapshot(&source, &repository)?;
     let uploaded = sync_to_s3(&s3, &repository, "synthetic", "isolated-floci").await?;
     assert_eq!(uploaded.txid, 1);
@@ -59,8 +95,111 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     // Changes after the snapshot must not be silently undone on the source.
     store.set_permissions("101", "support", false, false)?;
     store.revoke_access_token(&token)?;
-    assert!(!store.is_permitted("101", "support", ChannelAction::Read)?);
-    assert!(store.verify_access_token(&token, resource, 1001)?.is_none());
+    assert_source_unchanged(&store, &token, resource);
+
+    // Independent prefixes contain only synthetic objects created by this run.
+    let objects = client
+        .list_objects_v2()
+        .bucket("discord-mcp-synthetic-drill")
+        .prefix("synthetic/")
+        .send()
+        .await?;
+    let keys: Vec<String> = objects
+        .contents()
+        .iter()
+        .filter_map(|item| item.key().map(str::to_owned))
+        .collect();
+    assert_eq!(keys.len(), 2);
+    let manifest = keys
+        .iter()
+        .find(|key| key.ends_with("_meta/repository.json"))
+        .ok_or("missing manifest")?;
+    let ltx = keys
+        .iter()
+        .find(|key| key.ends_with(".ltx"))
+        .ok_or("missing LTX")?;
+    let manifest_bytes = client
+        .get_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key(manifest)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    for prefix in ["missing", "corrupt"] {
+        client
+            .put_object()
+            .bucket("discord-mcp-synthetic-drill")
+            .key(format!("{prefix}/_meta/repository.json"))
+            .body(manifest_bytes.clone().into())
+            .send()
+            .await?;
+    }
+    let relative_ltx = ltx.strip_prefix("synthetic/").ok_or("invalid LTX key")?;
+    client
+        .put_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key(format!("corrupt/{relative_ltx}"))
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"truncated synthetic LTX",
+        ))
+        .send()
+        .await?;
+    for prefix in ["missing", "corrupt"] {
+        let destination = directory.join(format!("{prefix}.db"));
+        assert!(
+            restore_from_s3(&s3, prefix, &destination, RestoreTarget::Txid(1))
+                .await
+                .is_err()
+        );
+        assert_no_destination(&destination);
+        assert_source_unchanged(&store, &token, resource);
+        println!("PASS {prefix} object: restore rejected, destination absent, source unchanged");
+    }
+
+    // Stall a synthetic S3 request, then cancel only after bytes reach the proxy.
+    // This tests cancellation during the initial remote request, not mid-object download.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let stalled_address = stalled.local_addr()?;
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (mut socket, _) = stalled.accept().await.expect("accept synthetic connection");
+        let mut bytes = [0u8; 4096];
+        let received = socket
+            .read(&mut bytes)
+            .await
+            .expect("read synthetic S3 request");
+        assert!(received > 0);
+        let _ = seen_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    let stalled_store = S3Store::new(
+        aws_sdk_s3::Client::from_conf(s3_config(stalled_address)),
+        "discord-mcp-synthetic-drill",
+    )?;
+    let cancelled_destination = directory.join("cancelled.db");
+    let task_destination = cancelled_destination.clone();
+    let restore_task = tokio::spawn(async move {
+        restore_from_s3(
+            &stalled_store,
+            "synthetic",
+            task_destination,
+            RestoreTarget::Txid(1),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), seen_rx).await??;
+    restore_task.abort();
+    assert!(restore_task.await.is_err_and(|error| error.is_cancelled()));
+    proxy.abort();
+    let _ = proxy.await;
+    assert_no_destination(&cancelled_destination);
+    assert_source_unchanged(&store, &token, resource);
+    println!(
+        "PASS interrupted initial S3 request: restore cancelled, destination absent, source unchanged"
+    );
     let sentinel = b"synthetic protected destination";
     std::fs::write(&protected, sentinel)?;
     assert!(
@@ -100,8 +239,7 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
             .exchange_authorization_code(&exchange, 1001)
             .is_err()
     );
-    assert!(!store.is_permitted("101", "support", ChannelAction::Read)?);
-    assert!(store.verify_access_token(&token, resource, 1001)?.is_none());
+    assert_source_unchanged(&store, &token, resource);
     assert_eq!(std::fs::read(&protected)?, sentinel);
     println!(
         "PASS snapshot txid=1; uploaded={} objects; S3 restore, quarantine, revocation and no-overwrite verified",
