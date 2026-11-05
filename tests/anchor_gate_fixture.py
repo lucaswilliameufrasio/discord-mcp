@@ -79,6 +79,28 @@ def receive_descriptor(sock):
     return fds[0]
 
 
+def reconcile_known_children(anchor, writers, state_path, fail_before_sync=False):
+    """Closed-world test only: caller owns admission, handles and anchor."""
+    if any(writer.poll() is None for writer in writers):
+        return False
+    fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        with open(state_path, "r+b", buffering=0) as state:
+            state.seek(0)
+            state.write(b"clean\n")
+            state.truncate()
+            if fail_before_sync:
+                return False
+            os.fsync(state.fileno())
+        return True
+    finally:
+        os.close(fd)
+
+
 def line(stream):
     ready, _, _ = select.select([stream], [], [], 5)
     if not ready:
@@ -90,6 +112,84 @@ def line(stream):
 
 
 class AnchorTests(unittest.TestCase):
+    def test_reconcile_tracked_writers_only_after_anchor_holder_dies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity.lock")
+            state_path = os.path.join(directory, "state")
+            with open(path, "wb"):
+                pass
+            with open(state_path, "wb") as state:
+                state.write(b"uncertain\n")
+                state.flush()
+                os.fsync(state.fileno())
+            anchor = os.open(path, os.O_RDWR)
+            children = []
+
+            def cleanup():
+                for process in children:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                os.close(anchor)
+
+            self.addCleanup(cleanup)
+
+            def spawn(role):
+                fd = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, __file__, role, str(fd)],
+                        pass_fds=(fd,), stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+                finally:
+                    os.close(fd)
+                children.append(process)
+                return process
+
+            keeper = spawn("keeper")
+            self.assertEqual(line(keeper.stdout), "ANCHORED")
+            writers = [spawn("writer"), spawn("writer")]
+            for writer in writers:
+                self.assertEqual(line(writer.stdout), "HOLDING")
+            replacement = os.path.join(directory, "replacement")
+            with open(replacement, "wb"):
+                pass
+            os.replace(replacement, path)
+            keeper.kill()
+            keeper.wait(timeout=5)
+            self.assertFalse(reconcile_known_children(anchor, writers, state_path))
+            writers[0].stdin.write("release\n")
+            writers[0].stdin.flush()
+            self.assertEqual(writers[0].wait(timeout=5), 0)
+            self.assertFalse(reconcile_known_children(anchor, writers, state_path))
+            writers[1].stdin.write("release\n")
+            writers[1].stdin.flush()
+            self.assertEqual(writers[1].wait(timeout=5), 0)
+
+            # A live lock not represented by the tracked children still blocks.
+            extra = os.open(f"/proc/self/fd/{anchor}", os.O_RDWR)
+            try:
+                fcntl.flock(extra, fcntl.LOCK_SH)
+                self.assertFalse(reconcile_known_children(anchor, writers, state_path))
+            finally:
+                os.close(extra)
+            self.assertFalse(reconcile_known_children(anchor, writers, state_path, True))
+            # A visible clean byte before sync is not permission to reopen.
+            with open(state_path, "rb") as state:
+                self.assertEqual(state.read(), b"clean\n")
+            state_fd = os.open(state_path, os.O_RDONLY)
+            try:
+                restarted = subprocess.run(
+                    [sys.executable, __file__, "restart", str(state_fd)],
+                    pass_fds=(state_fd,), capture_output=True, text=True,
+                    timeout=5, check=True,
+                )
+            finally:
+                os.close(state_fd)
+            self.assertEqual(restarted.stdout.strip(), "CLOSED")
+            self.assertTrue(reconcile_known_children(anchor, writers, state_path))
+
     def test_persistence_failures_and_partial_distribution_restart_closed(self):
         for failure in ("before_write", "before_sync", "during_distribution"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:

@@ -375,6 +375,24 @@ observados em cache não provam durabilidade. Não há prova de exclusão entre
 autoridades, publicação segura em diretório, confirmação de transferência,
 autenticação nem caminho de reabertura. Nenhum escritor real utiliza o protocolo.
 
+Outro cenário pesquisa reconciliação sob uma hipótese mais forte: o processo de
+teste sobrevive, mantém seu próprio descritor do inode original, controla toda
+a admissão e conserva os handles de **todos** os escritores sintéticos. Após a
+morte do guardião e a substituição do caminho, a função de reconciliação retorna
+falso enquanto qualquer escritor conhecido vive ou um lock compartilhado no
+inode original está ocupado. Depois da saída dos escritores, uma falha injetada
+antes do `fsync` retorna falso mesmo que o marcador `clean` esteja visível; um
+subprocesso reiniciado ainda começa fechado. Só uma nova tentativa, com lock
+exclusivo e `fsync` bem-sucedido, retorna verdadeiro. É uma decisão booleana de
+teste, não uma reabertura de servidor ou captura real.
+
+A evidência não cobre perda ou reinício do supervisor que retém os handles,
+escritores desconhecidos sem lock, novos participantes após a checagem,
+descendentes, corrupção do marcador, power loss ou publicação real. A função
+solta o lock ao retornar e não fornece uma barreira operacional contínua; não se
+deve usar seu resultado para liberar escritores reais. A falha de persistência
+é injetada, não um erro do filesystem.
+
 **Correção experimental de `RETRY_DRAIN`:** anteriormente a tentativa declarava
 drenagem após `CLOSE_FAIL` sem repetir a persistência. Agora cada tentativa válida
 sincroniza o marcador fechado antes de verificar atividade ou adquirir a barreira;
