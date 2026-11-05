@@ -3,27 +3,32 @@
 O exemplo `examples/mcp_benchmark.rs` executa servidor MCP HTTP e gerador no
 mesmo processo, em loopback, com SQLite temporário e credenciais sintéticas.
 Não usa configurações, bancos ou serviços reais. Nenhuma requisição ao Discord
-é feita: os cenários exercitam leitura autorizada com limite inválido, envio
-autorizado com conteúdo vazio e leitura sem permissão. Cada resposta esperada é
-validada; erros de transporte, HTTP ou contrato são somados como erros de
-medição, sem discriminação por categoria. Esses casos **não medem leitura ou
-envio bem-sucedidos**.
+é feita: há três cenários de recusa e dois de sucesso de bot via servidor HTTP
+simulado em loopback. O servidor falso valida autorização sintética, corpo,
+menções e limite, e conta requisições; o cliente valida as respostas MCP.
+Erros de transporte, HTTP ou contrato são somados como erros de medição, sem
+discriminação por categoria. Sucesso significa sucesso contra o servidor falso,
+não entrega ou leitura no Discord real.
 
 Execute na raiz do projeto:
 
 ```sh
-TMPDIR=/tmp/opencode cargo run --release --example mcp_benchmark > /tmp/opencode/discord-mcp-benchmark.json
+TMPDIR=/tmp/opencode cargo run --release --features benchmark-fixture --example mcp_benchmark > /tmp/opencode/discord-mcp-benchmark.json
 ```
 
-O programa usa parâmetros fixos e limitados: 3 cenários, concorrência de 1 e 4,
+O programa usa parâmetros fixos e limitados: 5 cenários, concorrência de 1 e 4,
 3 repetições por combinação, 10 requisições sequenciais de aquecimento e 100
 requisições por trabalhador em cada repetição. O modelo é fechado: cada
 trabalhador espera uma resposta antes de enviar a próxima. O relatório JSON
-versão 1 registra tentativas, sucessos de medição, erros, duração, vazão e
+versão 2 registra tentativas, sucessos de medição, erros, duração, vazão e
 latências p50/p95/p99 de ponta a ponta pelo cliente. A latência inclui leitura e
 validação da resposta; aquecimento não entra nos resultados. As métricas e a
 auditoria padrão da aplicação ficam ativas. As mesmas conexões e o mesmo banco
 são reutilizados entre repetições; o banco é criado uma vez e removido ao sair.
+O endpoint injetável só é compilado com a feature explícita
+`benchmark-fixture`, aceita apenas endereço IP loopback e não é configurável
+pela CLI. O servidor falso compartilha o processo e a máquina com o gerador e
+o servidor MCP; não representa os limites de throughput do Discord.
 
 Este é um teste funcional de carga leve e referência inicial, não um teste de
 saturação: não há taxa de chegada independente, nem limiar acordado de
@@ -62,3 +67,28 @@ para inferir estabilidade, capacidade sustentada ou cauda de produção. Os dado
 brutos desta execução estão no arquivo temporário indicado no comando, não são
 um artefato persistente versionado. O exemplo e as condições acima permitem
 repetir a medição, mas não garantem resultados iguais em outro ambiente.
+
+## Sucesso contra Discord simulado — 2026-11-05
+
+Código base `04e1d44` mais a alteração da feature e do fixture desta etapa;
+`--release`, mesmo host, Rust e sistema descritos acima. A campanha contém
+7.500 medições, 5 cenários, 3 repetições e concorrências 1 e 4, com zero
+respostas inesperadas ou erros de medição. O servidor falso contou 1.560
+leituras e 1.560 envios (incluindo aquecimento), conferidos pelo programa.
+Somente as respostas simuladas são medidas; nenhum canal Discord foi acessado.
+
+| Cenário | Concorrência | req/s mediana | p50 ms | p95 ms | p99 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Leitura simulada | 1 | 463 | 2,062 | 2,719 | 3,215 |
+| Leitura simulada | 4 | 881 | 4,143 | 7,543 | 9,986 |
+| Envio simulado | 1 | 475 | 2,029 | 2,644 | 3,210 |
+| Envio simulado | 4 | 869 | 4,054 | 7,666 | 9,282 |
+
+Cada valor é a mediana das três repetições, inclusive para os percentis; eles
+não são calculados sobre todas as amostras agrupadas. O fixture retorna uma
+mensagem pequena fixa e resposta de envio 204, sem persistência, filas, rate
+limits, TLS ou latência de rede. O custo do servidor falso está incluído no
+resultado, mas não há evidência de seu limite independente; não é possível
+atribuir o resultado exclusivamente ao servidor MCP nem inferir capacidade do
+Discord. A saída bruta está em `/tmp/opencode/discord-mcp-benchmark-success.json`
+apenas nesta máquina e pode ser descartada pelo sistema.

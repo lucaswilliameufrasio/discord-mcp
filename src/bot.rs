@@ -85,6 +85,8 @@ pub struct Author {
 #[derive(Clone)]
 pub struct BotClient {
     client: Client,
+    #[cfg(feature = "benchmark-fixture")]
+    fixture_base: Option<Url>,
 }
 
 impl BotClient {
@@ -94,10 +96,39 @@ impl BotClient {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| BotError::Unavailable)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            #[cfg(feature = "benchmark-fixture")]
+            fixture_base: None,
+        })
+    }
+
+    /// Benchmark-only injected endpoint. Never accepts non-loopback addresses.
+    #[cfg(feature = "benchmark-fixture")]
+    pub fn loopback_fixture(address: std::net::SocketAddr) -> Result<Self, BotError> {
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(BotError::Unavailable);
+        }
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| BotError::Unavailable)?;
+        let fixture_base = Some(
+            Url::parse(&format!("http://{address}/api/v10/")).map_err(|_| BotError::Unavailable)?,
+        );
+        Ok(Self {
+            client,
+            fixture_base,
+        })
     }
 
     pub async fn send(&self, bot: &BotChannel, content: &str) -> Result<(), BotError> {
+        #[cfg(feature = "benchmark-fixture")]
+        if let Some(base) = &self.fixture_base {
+            return self.send_at(bot, content, base).await;
+        }
         self.send_at(
             bot,
             content,
@@ -125,6 +156,10 @@ impl BotClient {
     }
 
     pub async fn read(&self, bot: &BotChannel, limit: u8) -> Result<Vec<Message>, BotError> {
+        #[cfg(feature = "benchmark-fixture")]
+        if let Some(base) = &self.fixture_base {
+            return self.read_at(bot, limit, base).await;
+        }
         self.read_at(
             bot,
             limit,
@@ -185,6 +220,14 @@ mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[cfg(feature = "benchmark-fixture")]
+    #[test]
+    fn fixture_endpoint_rejects_public_addresses() {
+        assert!(BotClient::loopback_fixture("192.0.2.1:8080".parse().unwrap()).is_err());
+        assert!(BotClient::loopback_fixture("127.0.0.1:0".parse().unwrap()).is_err());
+        assert!(BotClient::loopback_fixture("127.0.0.1:8080".parse().unwrap()).is_ok());
+    }
 
     fn fake(response: String) -> (Url, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

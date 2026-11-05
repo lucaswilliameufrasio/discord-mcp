@@ -155,6 +155,25 @@ impl ServerHandler for HttpMcp {
 
 /// Assemble OAuth and MCP routes. The caller must enforce TLS outside loopback.
 pub fn router(config: OAuthWebConfig) -> Result<Router, &'static str> {
+    router_with_bot(
+        config,
+        BotClient::new().map_err(|_| "bot client unavailable")?,
+    )
+}
+
+/// Available only to explicitly compiled local benchmarks, never from CLI configuration.
+#[cfg(feature = "benchmark-fixture")]
+pub fn router_with_loopback_fixture(
+    config: OAuthWebConfig,
+    address: std::net::SocketAddr,
+) -> Result<Router, &'static str> {
+    router_with_bot(
+        config,
+        BotClient::loopback_fixture(address).map_err(|_| "invalid fixture address")?,
+    )
+}
+
+fn router_with_bot(config: OAuthWebConfig, bot: BotClient) -> Result<Router, &'static str> {
     if config.auth.resource != format!("{}/mcp", config.public_origin) {
         return Err("MCP resource must match the configured /mcp endpoint");
     }
@@ -178,7 +197,7 @@ pub fn router(config: OAuthWebConfig) -> Result<Router, &'static str> {
     let server = HttpMcp {
         auth: auth.clone(),
         webhook: WebhookClient::new().map_err(|_| "webhook client unavailable")?,
-        bot: BotClient::new().map_err(|_| "bot client unavailable")?,
+        bot,
         tool_router: HttpMcp::tool_router(),
     };
     let service = StreamableHttpService::new(
