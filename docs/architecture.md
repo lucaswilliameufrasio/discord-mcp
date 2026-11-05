@@ -66,6 +66,22 @@ registrar ambiente, versão, duração e metodologia. Resultados locais não pro
 capacidade em produção. Testes de carga usam recursos isolados e não devem atingir
 Discord nem infraestrutura de produção sem autorização explícita.
 
+## Recuperação de desastre
+
+Avaliar a biblioteca Rust do projeto irmão `sqlite-replication` como mecanismo
+de replicação e recuperação do SQLite. O projeto ainda está em desenvolvimento:
+seu README limita o protocolo de captura testado a Linux x86-64, combinações de
+SQLite testadas e um único escritor lógico coordenado; não homologa provedores
+S3 específicos nem perda física de energia/cache. Confirmar a revisão e as
+garantias antes de integrar, incluindo o write-gate e o ciclo de vida do banco.
+
+A recuperação precisa abranger também configuração e chaves de criptografia,
+guardadas fora do domínio de falha da máquina, e um destino remoto adequado.
+Validar recuperação em destino isolado com dados sintéticos, sem sobrescrever o
+banco ativo nem acionar integrações Discord; verificar integridade e fluxos da
+aplicação. Definir RPO, RTO, destino e custódia de chaves com o operador antes
+de alegar uma garantia. Replicação ou upload bem-sucedido não prova recuperação.
+
 ## Etapas
 
 1. Transporte stdio e contrato básico MCP.
