@@ -91,6 +91,115 @@ mod tests {
     use super::*;
     use std::io;
 
+    // Fixture is single-threaded: the test itself is the only writer and does
+    // not write during capture. This is not an application write gate.
+    struct IsolatedGate;
+    impl sqlite_replication_core::WriteGate for IsolatedGate {
+        type Permit = IsolatedGate;
+
+        fn acquire(&self) -> io::Result<Self::Permit> {
+            Ok(IsolatedGate)
+        }
+    }
+    impl sqlite_replication_core::WritePermit for IsolatedGate {
+        fn release(self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn checkpoint_generation_drill(new_generation: bool) {
+        use rusqlite::Connection;
+        use sqlite_replication_core::{RestoreTarget, capture_once, restore_to_target, snapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let repository = dir.path().join("repository");
+        let wal_path = dir.path().join("source.db-wal");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA page_size=512; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO records VALUES(1, 'base'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        snapshot(&source, &repository).unwrap();
+        db.execute("INSERT INTO records VALUES(2, 'checkpointed')", [])
+            .unwrap();
+        let old_wal = fs::read(&wal_path).unwrap();
+        assert!(old_wal.len() > 32);
+        let checkpoint: (i64, i64, i64) = db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(checkpoint.0, 0);
+        if new_generation {
+            db.execute("INSERT INTO records VALUES(3, 'new-generation')", [])
+                .unwrap();
+            let current_wal = fs::read(&wal_path).unwrap();
+            assert!(current_wal.len() > 32);
+            assert_ne!(&old_wal[16..24], &current_wal[16..24]);
+        }
+        let expected: Vec<(i64, String)> = db
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let keep_open = if !new_generation {
+            drop(db);
+            assert!(
+                !wal_path.exists(),
+                "SQLite should remove the WAL when the last connection closes"
+            );
+            None
+        } else {
+            // No writes occur during capture; retain this connection so the new
+            // WAL generation stays present until the library reads it.
+            Some(db)
+        };
+        let result = capture_once(&source, &repository, &IsolatedGate).unwrap();
+        assert!(result.txid >= 2);
+        assert_eq!(read_watermark(&repository).unwrap().txid, result.txid);
+        let repeated = capture_once(&source, &repository, &IsolatedGate).unwrap();
+        assert_eq!(repeated.txid, result.txid);
+        assert_eq!(repeated.transactions, 0);
+        let restored = dir.path().join("restored.db");
+        restore_to_target(&repository, &restored, RestoreTarget::Txid(result.txid)).unwrap();
+        let restored_db = Connection::open(&restored).unwrap();
+        let restored_rows: Vec<(i64, String)> = restored_db
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(restored_rows, expected);
+        let integrity: String = restored_db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let source_db = Connection::open(&source).unwrap();
+        let rows_after: Vec<(i64, String)> = source_db
+            .prepare("SELECT id, value FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows_after, expected);
+        drop(keep_open);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn capture_reconciles_checkpointed_changes_when_wal_is_absent() {
+        checkpoint_generation_drill(false);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn capture_reconciles_checkpointed_changes_with_new_wal_generation() {
+        checkpoint_generation_drill(true);
+    }
+
     #[test]
     fn real_sqlite_wal_reconciles_published_delta_and_restores_rows() {
         use rusqlite::Connection;

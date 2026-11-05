@@ -430,6 +430,24 @@ A revisão do checkout irmão observada para esta execução foi novamente
 `f5c0984f069407913365136a10d5962f9a33930d`, com mudanças locais preexistentes;
 dependências por caminho não oferecem uma árvore imutável reproduzível.
 
+Dois testes adicionais usam `capture_once` em Linux x86-64 com SQLite sintético
+real e uma implementação de `WriteGate` sem bloqueio: o próprio teste é o único
+escritor e não escreve durante a captura. Ambos partem de snapshot TXID 1,
+gravam uma linha ainda não capturada e fazem checkpoint `TRUNCATE` bem-sucedido.
+No primeiro, fecham a última conexão SQLite e verificam que o arquivo WAL está
+ausente. No segundo, mantêm a conexão, gravam outra linha e verificam que os
+salts do novo WAL diferem dos anteriores. Em cada caso a captura reconcilia o
+estado, o restore em destino novo contém as mesmas linhas da fonte e passa
+`integrity_check`; uma segunda captura não publica transações adicionais.
+
+Esses testes não simulam perda de um WAL contendo commits não checkpointados:
+o checkpoint anterior concluiu com sucesso. O spool inicial contém apenas o
+snapshot, não um delta parcialmente publicado; as falhas parciais são cobertas
+separadamente acima. Não há concorrência, SIGKILL, substituição de WAL por um
+terceiro, gate real ou validação de dados de aplicação. A comparação verifica
+as linhas observáveis e integridade da cópia restaurada, não uma recuperação de
+host ou uma prova de preservação de todas as transações sob falhas arbitrárias.
+
 **Não é um gate de produção nem uma decisão final de arquitetura.** CLI, web,
 stdio, servidor, métricas, auditoria, OAuth e recuperação ainda não o usam;
 um processo não cooperativo pode escrever diretamente no banco. O fixture não
