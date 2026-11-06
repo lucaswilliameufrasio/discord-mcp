@@ -23,6 +23,13 @@ const MAX_OBJECT: u64 = MAX_SNAPSHOT + 1024 * 1024;
 #[derive(Debug)]
 pub struct BackupError;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ObjectObservation {
+    Found,
+    NotFound,
+    Unavailable,
+}
+
 impl fmt::Display for BackupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("encrypted backup or restore failed; no sensitive details are exposed")
@@ -43,6 +50,34 @@ pub struct ServiceBackup {
 }
 
 impl ServiceBackup {
+    /// Observe only the currently configured bucket; this does not verify the
+    /// object, bind it to an attempt, or prove that a pending PUT has finished.
+    pub async fn observe(&self, id: &str) -> ObjectObservation {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return ObjectObservation::Unavailable;
+        }
+        let Ok(_permit) = self.admission.try_lock() else {
+            return ObjectObservation::Unavailable;
+        };
+        let request = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(format!("service-backups/{id}.age"))
+            .send();
+        match tokio::time::timeout(Duration::from_secs(10), request).await {
+            Ok(Ok(_)) => ObjectObservation::Found,
+            Ok(Err(error)) if error.as_service_error().is_some_and(|e| e.is_not_found()) => {
+                ObjectObservation::NotFound
+            }
+            _ => ObjectObservation::Unavailable,
+        }
+    }
     pub fn destination_description(&self) -> (String, String) {
         (self.bucket.clone(), self.recipient.to_string())
     }
@@ -300,5 +335,47 @@ mod service_tests {
         assert!(service.snapshot("second").await.is_err());
         drop(guard);
         assert!(service.admission.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn denied_probe_is_unavailable_not_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN }),
+            )
+            .await
+            .unwrap();
+        });
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "fixture",
+            ))
+            .build();
+        let service = ServiceBackup::new(
+            Client::from_conf(config),
+            "fixture-bucket".into(),
+            directory.path().join("absent.db"),
+            directory.path().into(),
+            Identity::generate().to_public(),
+        )
+        .unwrap();
+        assert_eq!(
+            service.observe("test").await,
+            ObjectObservation::Unavailable
+        );
+        task.abort();
     }
 }

@@ -74,6 +74,7 @@ pub(crate) fn router_with_cli(
         .route("/admin/observability", get(observability))
         .route("/admin/audit", get(audit))
         .route("/admin/backup-audit", get(backup_audit))
+        .route("/admin/backup-investigate", post(backup_investigate))
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -103,17 +104,70 @@ async fn backup_audit(State(app): State<Shared>, headers: HeaderMap) -> Response
     };
     let mut rows = String::new();
     for entry in entries {
+        let action = if entry.state == "started" || entry.state == "unknown" {
+            format!(
+                "<form method=\"post\" action=\"/admin/backup-investigate\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Investigar destino atual</button></form>",
+                escape(&entry.request_id)
+            )
+        } else {
+            String::new()
+        };
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&entry.backup_id),
             escape(&entry.actor_id),
             entry.started_at,
-            escape(&entry.state)
+            escape(&entry.state),
+            action
         ));
     }
     page(format!(
-        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><table><thead><tr><th>ID</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><table><thead><tr><th>ID</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
     ))
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn backup_investigate(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Form(req): Form<CliRequestId>,
+) -> Response {
+    if !allowed_post(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    let Some(backup) = &app.config.backup else {
+        return error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let id = match store(&app).and_then(|store| store.inconclusive_backup_id(&req.request_id)) {
+        Ok(Some(id)) => id,
+        Ok(None) => return error(StatusCode::NOT_FOUND),
+        Err(crate::channels::StoreError::InvalidInput) => return error(StatusCode::BAD_REQUEST),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let observation = backup.observe(&id).await;
+    let result = match observation {
+        crate::encrypted_backup::ObjectObservation::Found => {
+            "Objeto encontrado no destino atual; integridade, origem e recuperação não foram verificadas."
+        }
+        crate::encrypted_backup::ObjectObservation::NotFound => {
+            "Objeto não encontrado no destino atual; isso não comprova que a tentativa falhou ou que não exista em outro destino."
+        }
+        crate::encrypted_backup::ObjectObservation::Unavailable => {
+            "Consulta indisponível ou inconclusiva; não é possível afirmar se o objeto existe."
+        }
+    };
+    let (bucket, _) = backup.destination_description();
+    page(format!(
+        "<h1>Investigação de backup</h1><p>ID: {}</p><p>Bucket atualmente configurado: {}</p><p>{}</p><p>O destino pode ter mudado desde a tentativa, que também pode estar em andamento. A auditoria não foi alterada; não reenvie automaticamente.</p><p><a href=\"/admin/backup-audit\">Voltar</a></p>",
+        escape(&id),
+        escape(&bucket),
+        result
+    ))
+}
+
+#[cfg(not(feature = "encrypted-s3-backup"))]
+async fn backup_investigate() -> Response {
+    error(StatusCode::NOT_FOUND)
 }
 
 #[cfg(not(feature = "encrypted-s3-backup"))]

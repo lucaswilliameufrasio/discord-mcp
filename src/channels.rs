@@ -128,6 +128,7 @@ pub struct AuditRow {
 
 #[cfg(feature = "encrypted-s3-backup")]
 pub struct BackupAuditRow {
+    pub request_id: String,
     pub backup_id: String,
     pub actor_id: String,
     pub started_at: i64,
@@ -451,7 +452,7 @@ impl ChannelStore {
 
     #[cfg(feature = "encrypted-s3-backup")]
     pub fn recent_backup_audit(&self) -> Result<Vec<BackupAuditRow>, StoreError> {
-        let mut statement = self.db.prepare("SELECT backup_id,actor_id,started_at,state FROM backup_audit ORDER BY rowid DESC LIMIT 100").map_err(|_| StoreError::Storage)?;
+        let mut statement = self.db.prepare("SELECT backup_id,actor_id,started_at,state,request_id FROM backup_audit ORDER BY rowid DESC LIMIT 100").map_err(|_| StoreError::Storage)?;
         let rows = statement
             .query_map([], |row| {
                 Ok(BackupAuditRow {
@@ -459,11 +460,20 @@ impl ChannelStore {
                     actor_id: row.get(1)?,
                     started_at: row.get(2)?,
                     state: row.get(3)?,
+                    request_id: row.get(4)?,
                 })
             })
             .map_err(|_| StoreError::Storage)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| StoreError::Storage)
+    }
+
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn inconclusive_backup_id(&self, request_id: &str) -> Result<Option<String>, StoreError> {
+        if request_id.len() != 64 || !request_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StoreError::InvalidInput);
+        }
+        self.db.query_row("SELECT backup_id FROM backup_audit WHERE request_id=?1 AND state IN ('started','unknown')", [request_id], |row| row.get(0)).optional().map_err(|_| StoreError::Storage)
     }
 
     pub fn recovery_quarantined(&self) -> Result<bool, StoreError> {

@@ -2227,6 +2227,147 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         StatusCode::FORBIDDEN
     );
     println!("PASS backup audit: confirmed and unknown results visible without credentials");
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-investigate"))
+            .form(&[("request_id", duplicate_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-investigate"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", id.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-investigate"))
+            .header(header::COOKIE, &session)
+            .form(&[("request_id", duplicate_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let investigation = browser
+        .post(format!("{origin}/admin/backup-investigate"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", duplicate_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        investigation.contains("Objeto encontrado")
+            && investigation.contains("integridade, origem e recuperação não foram verificadas")
+    );
+    assert!(investigation.contains("O destino pode ter mudado"));
+    assert!(
+        store
+            .recent_backup_audit()
+            .unwrap()
+            .iter()
+            .any(|row| row.request_id == duplicate_id && row.state == "unknown")
+    );
+    let missing_id = "a".repeat(64);
+    store
+        .begin_backup_audit(
+            &missing_id,
+            "absent-fixture",
+            "123",
+            discord_mcp::channels::current_timestamp().unwrap(),
+        )
+        .unwrap();
+    store
+        .finish_backup_audit(
+            &missing_id,
+            false,
+            discord_mcp::channels::current_timestamp().unwrap(),
+        )
+        .unwrap();
+    let missing = browser
+        .post(format!("{origin}/admin/backup-investigate"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", &missing_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(missing.contains("Objeto não encontrado"));
+    let corrupt_id = "b".repeat(64);
+    store
+        .begin_backup_audit(
+            &corrupt_id,
+            "corrupt-fixture",
+            "123",
+            discord_mcp::channels::current_timestamp().unwrap(),
+        )
+        .unwrap();
+    store
+        .finish_backup_audit(
+            &corrupt_id,
+            false,
+            discord_mcp::channels::current_timestamp().unwrap(),
+        )
+        .unwrap();
+    s3.put_object()
+        .bucket(&bucket)
+        .key("service-backups/corrupt-fixture.age")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"synthetic corrupt object",
+        ))
+        .send()
+        .await
+        .unwrap();
+    let corrupted = browser
+        .post(format!("{origin}/admin/backup-investigate"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", &corrupt_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        corrupted.contains("Objeto encontrado")
+            && corrupted.contains("integridade, origem e recuperação não foram verificadas")
+    );
+    assert!(
+        encrypted_backup::restore_quarantined(
+            &s3,
+            &bucket,
+            "service-backups/corrupt-fixture.age",
+            &dir.path().join("not-published.db"),
+            &identity,
+            &key,
+            90
+        )
+        .await
+        .is_err()
+    );
+    assert!(!dir.path().join("not-published.db").exists());
+    println!(
+        "PASS authorized investigation: found, missing, corrupt object, no inferred integrity or state change"
+    );
     let sql = rusqlite::Connection::open(&database).unwrap();
     let third: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
         .json(&json!({"backup_id":"audit-failure", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();

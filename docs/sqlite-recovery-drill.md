@@ -194,6 +194,19 @@ job nem um protocolo de reconciliação; `started` e `unknown` exigem inspeção
 objeto e não autorizam reenvio cego. Uma falha ao registrar resultado é sinalizada
 no processo, mas interrupção abrupta pode impedir aviso adicional.
 
+Na página `/admin/backup-audit`, o administrador autenticado pode solicitar
+uma investigação por POST para uma tentativa `started` ou `unknown`; o serviço
+verifica apenas a presença da chave no **bucket atualmente configurado** usando
+HEAD. A operação exige sessão administrativa e validação de origem, não altera
+a auditoria, não baixa nem descriptografa o objeto e não faz retry. Ela apresenta
+encontrado, não encontrado ou consulta indisponível; encontrado não confirma
+conteúdo, autoria, integridade ou recuperabilidade. Como a auditoria antiga não
+registra uma identidade imutável do destino, não se comprova que a configuração
+atual corresponda à da tentativa. Uma gravação ainda pode estar em andamento e
+um 404 também não prova falha definitiva. A consulta não substitui restauração
+isolada, nem autoriza reenviar ou excluir o objeto. O teste Floci inclui objeto
+corrompido que aparece como encontrado, mas é rejeitado na restauração.
+
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
 ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci
