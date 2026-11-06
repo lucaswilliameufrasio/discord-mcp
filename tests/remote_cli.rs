@@ -2617,6 +2617,31 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         divergent.contains("diverge do compromisso") && divergent.contains("continua inconclusiva")
     );
     assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-record-evidence"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[
+                ("request_id", duplicate_id),
+                ("confirmation", "record-match")
+            ])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(
+        store
+            .recent_backup_audit()
+            .unwrap()
+            .iter()
+            .find(|row| row.request_id == duplicate_id)
+            .unwrap()
+            .evidence_at
+            .is_none()
+    );
+    assert_eq!(
         before_comparison,
         store
             .recent_backup_audit()
@@ -3494,6 +3519,119 @@ async fn lost_put_response_authorized_comparison_with_floci() {
         .map(|row| (row.request_id, row.state))
         .collect::<Vec<_>>();
     assert_eq!(before, after);
+    assert!(compared.contains("Registrar evidência desta comparação"));
+    let evidence_form = [("request_id", id), ("confirmation", "record-match")];
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-record-evidence"))
+            .form(&evidence_form)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-record-evidence"))
+            .header(header::COOKIE, &session)
+            .form(&evidence_form)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-record-evidence"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", id), ("confirmation", "wrong")])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let failing_audit = rusqlite::Connection::open(dir.path().join("service.db")).unwrap();
+    failing_audit.execute_batch("CREATE TRIGGER synthetic_evidence_failure BEFORE INSERT ON backup_reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-record-evidence"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&evidence_form)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        store
+            .recent_backup_audit()
+            .unwrap()
+            .iter()
+            .find(|row| row.request_id == id)
+            .unwrap()
+            .evidence_at
+            .is_none()
+    );
+    failing_audit
+        .execute_batch("DROP TRIGGER synthetic_evidence_failure")
+        .unwrap();
+    let recorded = browser
+        .post(format!("{origin}/admin/backup-record-evidence"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&evidence_form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recorded.status(), StatusCode::OK);
+    let recorded_html = recorded.text().await.unwrap();
+    assert!(
+        recorded_html.contains("Evidência registrada")
+            && recorded_html.contains("recuperabilidade não foram comprovadas")
+    );
+    let audited = store.recent_backup_audit().unwrap();
+    let entry = audited.iter().find(|row| row.request_id == id).unwrap();
+    assert_eq!(entry.state, "unknown");
+    assert!(entry.evidence_at.is_some());
+    assert_eq!(entry.evidence_actor.as_deref(), Some("123"));
+    let audit_db = rusqlite::Connection::open(dir.path().join("service.db")).unwrap();
+    let stored: (Vec<u8>, i64) = audit_db.query_row("SELECT ciphertext_sha256,byte_length FROM backup_reconciliation_evidence WHERE request_id=?1", [id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(stored.0, commitment.0);
+    assert_eq!(stored.1 as u64, commitment.1);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-record-evidence"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&evidence_form)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let audit_html = browser
+        .get(format!("{origin}/admin/backup-audit"))
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        audit_html.contains("Ciphertext coincidente observado")
+            && audit_html.contains("não comprova recuperação")
+    );
+    println!(
+        "PASS explicit authorized evidence: one recorded observation, original outcome unknown"
+    );
     let after_object = s3
         .get_object()
         .bucket(&bucket)

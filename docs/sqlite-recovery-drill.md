@@ -284,6 +284,18 @@ registro legado sem compromisso. Isso simula a perda daquela resposta na rede
 local; não demonstra comportamento de provedores reais, perda de energia ou
 reconciliação automática.
 
+Após uma comparação coincidente, a página apresenta uma ação separada para
+**registrar evidência**. Ela exige sessão administrativa, origem válida e
+confirmação explícita; refaz o download e a comparação antes da gravação. Uma
+única linha por tentativa registra horário, administrador, fingerprint do destino,
+SHA-256 e tamanho observados; a inserção só ocorre se a tentativa continuar
+inconclusiva e o vínculo e compromisso permanecerem iguais. Repetição, mudanças
+concorrentes, divergência ou falha de auditoria não registram sucesso. A página
+de auditoria indica a observação, mas não muda `started` ou `unknown`. O registro
+é uma evidência pontual de bytes coincidentes, não atesta autoria, versão futura
+do objeto, autenticação do servidor, decriptação ou recuperabilidade. Não há
+aprovação para excluir registros ou objetos e nenhuma limpeza automática.
+
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
 ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci

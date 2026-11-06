@@ -133,6 +133,8 @@ pub struct BackupAuditRow {
     pub actor_id: String,
     pub started_at: i64,
     pub state: String,
+    pub evidence_at: Option<i64>,
+    pub evidence_actor: Option<String>,
 }
 
 /// Read-only point-in-time counts, not permission or a plan to delete records.
@@ -411,6 +413,8 @@ impl ChannelStore {
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_target_binding (request_id TEXT PRIMARY KEY NOT NULL REFERENCES backup_audit(request_id), fingerprint BLOB NOT NULL CHECK(length(fingerprint)=32));").map_err(|_| StoreError::Storage)?;
         #[cfg(feature = "encrypted-s3-backup")]
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_ciphertext_commitment (request_id TEXT PRIMARY KEY NOT NULL REFERENCES backup_audit(request_id), sha256 BLOB NOT NULL CHECK(length(sha256)=32), byte_length INTEGER NOT NULL CHECK(byte_length>0));").map_err(|_| StoreError::Storage)?;
+        #[cfg(feature = "encrypted-s3-backup")]
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_reconciliation_evidence (request_id TEXT PRIMARY KEY NOT NULL REFERENCES backup_audit(request_id), observed_at INTEGER NOT NULL, actor_id TEXT NOT NULL, target_fingerprint BLOB NOT NULL CHECK(length(target_fingerprint)=32), ciphertext_sha256 BLOB NOT NULL CHECK(length(ciphertext_sha256)=32), byte_length INTEGER NOT NULL CHECK(byte_length>0));").map_err(|_| StoreError::Storage)?;
         Ok(store)
     }
 
@@ -519,9 +523,32 @@ impl ChannelStore {
         }
     }
 
+    /// Preserve exactly one authenticated point-in-time observation per attempt.
+    /// This never transitions the attempt to a successful or recoverable state.
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn record_backup_match_evidence(
+        &self,
+        request_id: &str,
+        actor: &str,
+        now: i64,
+        target: &[u8; 32],
+        digest: &[u8; 32],
+        length: u64,
+    ) -> Result<(), StoreError> {
+        validate_audit(AuditActor::Discord(actor), now, self.audit_retention_days)?;
+        if length == 0 || length > crate::encrypted_backup::MAX_ENCRYPTED_OBJECT {
+            return Err(StoreError::InvalidInput);
+        }
+        let changed = self.db.execute("INSERT OR IGNORE INTO backup_reconciliation_evidence(request_id,observed_at,actor_id,target_fingerprint,ciphertext_sha256,byte_length) SELECT a.request_id,?2,?3,t.fingerprint,c.sha256,c.byte_length FROM backup_audit a JOIN backup_target_binding t ON t.request_id=a.request_id JOIN backup_ciphertext_commitment c ON c.request_id=a.request_id WHERE a.request_id=?1 AND a.state IN ('started','unknown') AND t.fingerprint=?4 AND c.sha256=?5 AND c.byte_length=?6 AND NOT EXISTS (SELECT 1 FROM recovery_control WHERE id=1 AND quarantined=1)", params![request_id, now, actor, target.as_slice(), digest.as_slice(), length as i64]).map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "encrypted-s3-backup")]
     pub fn recent_backup_audit(&self) -> Result<Vec<BackupAuditRow>, StoreError> {
-        let mut statement = self.db.prepare("SELECT backup_id,actor_id,started_at,state,request_id FROM backup_audit ORDER BY rowid DESC LIMIT 100").map_err(|_| StoreError::Storage)?;
+        let mut statement = self.db.prepare("SELECT a.backup_id,a.actor_id,a.started_at,a.state,a.request_id,e.observed_at,e.actor_id FROM backup_audit a LEFT JOIN backup_reconciliation_evidence e ON e.request_id=a.request_id ORDER BY a.rowid DESC LIMIT 100").map_err(|_| StoreError::Storage)?;
         let rows = statement
             .query_map([], |row| {
                 Ok(BackupAuditRow {
@@ -530,6 +557,8 @@ impl ChannelStore {
                     started_at: row.get(2)?,
                     state: row.get(3)?,
                     request_id: row.get(4)?,
+                    evidence_at: row.get(5)?,
+                    evidence_actor: row.get(6)?,
                 })
             })
             .map_err(|_| StoreError::Storage)?;

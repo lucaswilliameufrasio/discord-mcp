@@ -76,6 +76,10 @@ pub(crate) fn router_with_cli(
         .route("/admin/backup-audit", get(backup_audit))
         .route("/admin/backup-investigate", post(backup_investigate))
         .route("/admin/backup-compare", post(backup_compare))
+        .route(
+            "/admin/backup-record-evidence",
+            post(backup_record_evidence),
+        )
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -198,6 +202,13 @@ async fn backup_audit(
     };
     let mut rows = String::new();
     for entry in entries {
+        let evidence = match (entry.evidence_at, entry.evidence_actor.as_deref()) {
+            (Some(time), Some(actor)) => format!(
+                "Ciphertext coincidente observado em {time} por {} (não comprova recuperação)",
+                escape(actor)
+            ),
+            _ => "—".into(),
+        };
         let action = if entry.state == "started" || entry.state == "unknown" {
             format!(
                 "<form method=\"post\" action=\"/admin/backup-investigate\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Investigar destino atual</button></form><form method=\"post\" action=\"/admin/backup-compare\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Comparar ciphertext com compromisso</button></form>",
@@ -208,17 +219,17 @@ async fn backup_audit(
             String::new()
         };
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&entry.backup_id),
             escape(&entry.request_id),
             escape(&entry.actor_id),
             entry.started_at,
-            escape(&entry.state),
+            escape(&entry.state), evidence,
             action
         ));
     }
     page(format!(
-        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><form method=\"get\" action=\"/admin/backup-audit\"><label for=\"days\">Pré-visualizar confirmações com mais de quantos dias?</label><input id=\"days\" name=\"days\" type=\"number\" min=\"1\" max=\"36500\" required><button>Pré-visualizar</button></form>{preview}<table><thead><tr><th>ID</th><th>Tentativa</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><form method=\"get\" action=\"/admin/backup-audit\"><label for=\"days\">Pré-visualizar confirmações com mais de quantos dias?</label><input id=\"days\" name=\"days\" type=\"number\" min=\"1\" max=\"36500\" required><button>Pré-visualizar</button></form>{preview}<table><thead><tr><th>ID</th><th>Tentativa</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Evidência</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
     ))
 }
 
@@ -231,6 +242,45 @@ async fn backup_compare(
     if !allowed_post(&app, &headers) {
         return error(StatusCode::FORBIDDEN);
     }
+    backup_compare_inner(app, req, false).await
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+#[derive(Deserialize)]
+struct BackupEvidenceRequest {
+    request_id: String,
+    confirmation: String,
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn backup_record_evidence(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Form(req): Form<BackupEvidenceRequest>,
+) -> Response {
+    if !allowed_post(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    if req.confirmation != "record-match" {
+        return error(StatusCode::BAD_REQUEST);
+    }
+    backup_compare_inner(
+        app,
+        CliRequestId {
+            request_id: req.request_id,
+        },
+        true,
+    )
+    .await
+}
+
+#[cfg(not(feature = "encrypted-s3-backup"))]
+async fn backup_record_evidence() -> Response {
+    error(StatusCode::NOT_FOUND)
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn backup_compare_inner(app: Shared, req: CliRequestId, record: bool) -> Response {
     let Some(backup) = &app.config.backup else {
         return error(StatusCode::SERVICE_UNAVAILABLE);
     };
@@ -270,13 +320,50 @@ async fn backup_compare(
     }
     use sha2::{Digest, Sha256};
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    let result = if digest == expected.0 && bytes.len() as u64 == expected.1 {
+    let matched = digest == expected.0 && bytes.len() as u64 == expected.1;
+    if record {
+        if !matched {
+            return error(StatusCode::CONFLICT);
+        }
+        let Ok(now) = current_timestamp() else {
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        match store(&app).and_then(|store| {
+            store.record_backup_match_evidence(
+                &req.request_id,
+                &app.config.admin_user_id,
+                now,
+                &backup.destination_binding(),
+                &digest,
+                bytes.len() as u64,
+            )
+        }) {
+            Ok(()) => {}
+            Err(crate::channels::StoreError::AuthorizationDenied) => {
+                return error(StatusCode::CONFLICT);
+            }
+            Err(_) => {
+                app.config.auth.audit.mark_failure();
+                return error(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+        return page("<h1>Evidência registrada</h1><p>O ciphertext coincidiu na observação. A tentativa continua inconclusiva; autoria e recuperabilidade não foram comprovadas.</p>".into());
+    }
+    let result = if matched {
         "O ciphertext observado coincide com o compromisso pré-envio."
     } else {
         "O ciphertext observado diverge do compromisso pré-envio."
     };
+    let action = if matched {
+        format!(
+            "<form method=\"post\" action=\"/admin/backup-record-evidence\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><input type=\"hidden\" name=\"confirmation\" value=\"record-match\"><button>Registrar evidência desta comparação</button></form>",
+            escape(&req.request_id)
+        )
+    } else {
+        String::new()
+    };
     page(format!(
-        "<h1>Comparação de backup</h1><p>ID: {}</p><p>{result}</p><p>A correspondência não comprova quem gravou o objeto, sua integridade semântica ou recuperabilidade. O servidor pode ter sido substituído. A tentativa continua inconclusiva; nenhum registro ou objeto foi alterado. Não reenvie automaticamente.</p><p><a href=\"/admin/backup-audit\">Voltar</a></p>",
+        "<h1>Comparação de backup</h1><p>ID: {}</p><p>{result}</p><p>A correspondência não comprova quem gravou o objeto, sua integridade semântica ou recuperabilidade. O servidor pode ter sido substituído. A tentativa continua inconclusiva; nenhum registro ou objeto foi alterado. Não reenvie automaticamente.</p>{action}<p><a href=\"/admin/backup-audit\">Voltar</a></p>",
         escape(&id)
     ))
 }

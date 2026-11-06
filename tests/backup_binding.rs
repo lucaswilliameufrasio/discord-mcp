@@ -131,3 +131,60 @@ fn ciphertext_commitment_is_insert_once_and_old_attempts_remain_unbound() {
     );
     assert_eq!(store.backup_ciphertext_commitment(&legacy).unwrap(), None);
 }
+
+#[test]
+fn reconciliation_evidence_requires_current_inconclusive_bound_commitment_and_is_insert_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("evidence.db");
+    let store = ChannelStore::open(&database, &[8; 32]).unwrap();
+    let id = "d".repeat(64);
+    store
+        .begin_backup_audit(&id, "fixture", "123", 10, &[1; 32])
+        .unwrap();
+    store.commit_backup_ciphertext(&id, &[2; 32], 100).unwrap();
+    assert!(
+        store
+            .record_backup_match_evidence(&id, "123", 11, &[9; 32], &[2; 32], 100)
+            .is_err()
+    );
+    assert!(
+        store
+            .record_backup_match_evidence(&id, "123", 11, &[1; 32], &[9; 32], 100)
+            .is_err()
+    );
+    assert!(
+        store
+            .record_backup_match_evidence(&id, "123", 11, &[1; 32], &[2; 32], 101)
+            .is_err()
+    );
+    assert!(
+        store.recent_backup_audit().unwrap()[0]
+            .evidence_at
+            .is_none()
+    );
+    store
+        .record_backup_match_evidence(&id, "123", 11, &[1; 32], &[2; 32], 100)
+        .unwrap();
+    assert!(
+        store
+            .record_backup_match_evidence(&id, "123", 12, &[1; 32], &[2; 32], 100)
+            .is_err()
+    );
+    let rows = store.recent_backup_audit().unwrap();
+    assert_eq!(rows[0].state, "started");
+    assert_eq!(rows[0].evidence_at, Some(11));
+    assert_eq!(rows[0].evidence_actor.as_deref(), Some("123"));
+    let confirmed = "e".repeat(64);
+    store
+        .begin_backup_audit(&confirmed, "confirmed", "123", 13, &[1; 32])
+        .unwrap();
+    store
+        .commit_backup_ciphertext(&confirmed, &[2; 32], 100)
+        .unwrap();
+    store.finish_backup_audit(&confirmed, true, 14).unwrap();
+    assert!(
+        store
+            .record_backup_match_evidence(&confirmed, "123", 15, &[1; 32], &[2; 32], 100)
+            .is_err()
+    );
+}
