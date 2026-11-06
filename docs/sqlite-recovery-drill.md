@@ -107,6 +107,14 @@ publica uma cópia em quarentena e invalida a concessão; uma terceira execuçã
 recusa sobrescrever essa cópia e preserva seus bytes. O teste não cobre crash,
 custódia de chave, recuperação de backup real ou ativação em produção.
 
+O teste `activation_cli_rejects_reintroduced_authority_and_preserves_source`
+prepara três cópias sintéticas em quarentena e simula, separadamente, um escritor
+externo reintroduzindo uma permissão, um token ou um código. Em cada caso,
+`recovery-activate --confirm` falha, a quarentena e o registro injetado são
+preservados e não há auditoria de ativação bem-sucedida; a fonte offline é
+comparada byte a byte. Esse teste não autoriza corrigir dados reais manualmente
+nem comprova isolamento contra o escritor que introduziu os registros.
+
 Duas execuções adicionais incluíram prefixos exclusivos com o manifesto presente
 mas LTX ausente, e com o mesmo manifesto mais LTX truncado. Cada restore retornou
 erro e não publicou banco nem sidecars no destino. Em outro cenário, um endpoint

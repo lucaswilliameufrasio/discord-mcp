@@ -362,6 +362,103 @@ fn recovery_prepare_cli_wrong_key_cleans_staging_and_allows_safe_retry() {
 }
 
 #[test]
+fn activation_cli_rejects_reintroduced_authority_and_preserves_source() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let source = dir.path().join("source.db");
+    let key = [151_u8; 32];
+    let store = ChannelStore::open(&source, &key).unwrap();
+    store.put_bot("alerts", "123", "synthetic-token").unwrap();
+    store.set_permissions("101", "alerts", true, false).unwrap();
+    drop(store);
+    let source_baseline = std::fs::read(&source).unwrap();
+    let cases = [
+        (
+            "permission",
+            "INSERT INTO channel_permissions VALUES ('102','alerts',1,0)",
+            "channel_permissions",
+        ),
+        (
+            "token",
+            "INSERT INTO mcp_access_tokens VALUES (x'01','102','https://example.invalid/mcp',9999999999)",
+            "mcp_access_tokens",
+        ),
+        (
+            "code",
+            "INSERT INTO mcp_authorization_codes VALUES (x'01','client','http://127.0.0.1/callback','https://example.invalid/mcp','102','synthetic',1,9999999999)",
+            "mcp_authorization_codes",
+        ),
+    ];
+    for (name, inject, table) in cases {
+        let destination = dir.path().join(format!("{name}.db"));
+        let prepare = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .args([
+                std::ffi::OsStr::new("recovery-prepare"),
+                source.as_os_str(),
+                destination.as_os_str(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            prepare.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepare.stderr)
+        );
+        {
+            // Simulate an external non-cooperating writer on this disposable copy.
+            let db = rusqlite::Connection::open(&destination).unwrap();
+            db.execute(inject, []).unwrap();
+        }
+        let activate = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .env("DISCORD_MCP_DB", &destination)
+            .args(["recovery-activate", "--confirm"])
+            .output()
+            .unwrap();
+        assert!(!activate.status.success(), "{name}");
+        assert!(
+            String::from_utf8_lossy(&activate.stderr).contains("InvalidInput"),
+            "{name}"
+        );
+        let recovered = ChannelStore::open(&destination, &key).unwrap();
+        assert!(recovered.recovery_quarantined().unwrap(), "{name}");
+        assert!(matches!(
+            recovered.get_channel("alerts"),
+            Err(StoreError::RecoveryPending)
+        ));
+        assert!(
+            recovered
+                .audit_events(None, Some("recovery_activated"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        drop(recovered);
+        let db = rusqlite::Connection::open(&destination).unwrap();
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "{name}");
+        drop(db);
+        assert_eq!(std::fs::read(&source).unwrap(), source_baseline, "{name}");
+    }
+    let original = ChannelStore::open(&source, &key).unwrap();
+    assert!(
+        original
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+}
+
+#[test]
 fn refuses_missing_key_marker_triggers_and_source_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]
