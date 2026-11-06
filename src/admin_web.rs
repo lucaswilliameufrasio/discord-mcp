@@ -87,10 +87,65 @@ pub(crate) fn router_with_cli(
         .route("/v1/cli/bot-requests", post(cli_begin_bot))
         .route("/v1/cli/delete-requests", post(cli_begin_delete))
         .route("/v1/cli/backup-requests", post(cli_begin_backup))
+        .route(
+            "/v1/cli/backup-verification-requests",
+            post(cli_begin_backup_verification),
+        )
         .route("/v1/cli/execute", post(cli_execute))
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+#[derive(Deserialize)]
+struct CliBeginBackupVerification {
+    attempt_id: String,
+    challenge: String,
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn cli_begin_backup_verification(
+    State(app): State<Shared>,
+    Json(req): Json<CliBeginBackupVerification>,
+) -> Response {
+    let Some(backup) = &app.config.backup else {
+        return error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Ok(challenge) = hex::decode(&req.challenge)
+        .and_then(|v| <[u8; 32]>::try_from(v).map_err(|_| hex::FromHexError::InvalidStringLength))
+    else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let (id, binding) = match store(&app)
+        .and_then(|store| store.inconclusive_backup_target(&req.attempt_id))
+    {
+        Ok(Some((id, Some(binding)))) => (id, binding),
+        Ok(_) => return error(StatusCode::NOT_FOUND),
+        Err(crate::channels::StoreError::InvalidInput) => return error(StatusCode::BAD_REQUEST),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    if binding.as_slice() != backup.destination_binding() {
+        return error(StatusCode::CONFLICT);
+    }
+    let id = match app.cli.begin_backup_verification(
+        req.attempt_id,
+        id,
+        backup.destination_binding(),
+        challenge,
+        Instant::now(),
+    ) {
+        Ok(id) => id,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id":id})).into_response();
+    headers(&mut response);
+    response
+}
+
+#[cfg(not(feature = "encrypted-s3-backup"))]
+async fn cli_begin_backup_verification() -> Response {
+    error(StatusCode::NOT_FOUND)
 }
 
 #[cfg(feature = "encrypted-s3-backup")]
@@ -151,8 +206,9 @@ async fn backup_audit(
             String::new()
         };
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&entry.backup_id),
+            escape(&entry.request_id),
             escape(&entry.actor_id),
             entry.started_at,
             escape(&entry.state),
@@ -160,7 +216,7 @@ async fn backup_audit(
         ));
     }
     page(format!(
-        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><form method=\"get\" action=\"/admin/backup-audit\"><label for=\"days\">Pré-visualizar confirmações com mais de quantos dias?</label><input id=\"days\" name=\"days\" type=\"number\" min=\"1\" max=\"36500\" required><button>Pré-visualizar</button></form>{preview}<table><thead><tr><th>ID</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><form method=\"get\" action=\"/admin/backup-audit\"><label for=\"days\">Pré-visualizar confirmações com mais de quantos dias?</label><input id=\"days\" name=\"days\" type=\"number\" min=\"1\" max=\"36500\" required><button>Pré-visualizar</button></form>{preview}<table><thead><tr><th>ID</th><th>Tentativa</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
     ))
 }
 
@@ -531,6 +587,24 @@ async fn cli_consent(
                 escape(&recipient)
             )
         }
+        #[cfg(feature = "encrypted-s3-backup")]
+        CliOperation::VerifyBackup {
+            attempt_id,
+            backup_id,
+            ..
+        } => {
+            let Some(backup) = &app.config.backup else {
+                return error(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            let (bucket, recipient) = backup.destination_description();
+            format!(
+                "Autorizar download criptografado para verificação isolada<br>Tentativa: {}<br>ID: {}<br>Bucket: {}<br>Destinatário age: {}<br>O objeto pode não ter sido criado por esta tentativa; verificação não altera a auditoria.",
+                escape(&attempt_id),
+                escape(&backup_id),
+                escape(&bucket),
+                escape(&recipient)
+            )
+        }
         CliOperation::PermissionChange(operation) => format!(
             "Alterar permissão<br>Usuário: {}<br>Canal: {}<br>Leitura: {}<br>Envio: {}",
             escape(&operation.user_id),
@@ -642,6 +716,32 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                 StatusCode::NO_CONTENT.into_response()
             } else {
                 error(StatusCode::BAD_GATEWAY)
+            };
+        }
+        #[cfg(feature = "encrypted-s3-backup")]
+        CliOperation::VerifyBackup {
+            attempt_id,
+            backup_id,
+            binding,
+        } => {
+            let Some(backup) = &app.config.backup else {
+                return error(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            let current =
+                store(&app).and_then(|store| store.inconclusive_backup_target(&attempt_id));
+            if !matches!(current, Ok(Some((ref id, Some(ref current_binding))) ) if id == &backup_id && current_binding.as_slice() == binding && binding == backup.destination_binding())
+            {
+                return error(StatusCode::CONFLICT);
+            }
+            return match backup.fetch_ciphertext(&backup_id).await {
+                Ok(bytes) => {
+                    let mut response =
+                        ([(header::CONTENT_TYPE, "application/octet-stream")], bytes)
+                            .into_response();
+                    headers(&mut response);
+                    response
+                }
+                Err(_) => error(StatusCode::BAD_GATEWAY),
             };
         }
         CliOperation::PermissionChange(operation) => operation,

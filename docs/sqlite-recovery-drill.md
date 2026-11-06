@@ -239,12 +239,27 @@ trabalho síncrono durante a cópia ou criptografia.
 O teste Floci usa processos reais, chaves sintéticas, objeto ausente e corrompido,
 identidade age e chave da aplicação incorretas. Também verifica um objeto com ID
 de tentativa `unknown` e compara bytes do objeto e linhas da auditoria antes e
-depois. **Esta verificação ainda não faz parte do consentimento Discord nem
-comprova a associação de um objeto a uma tentativa específica**: o operador
-local seleciona manualmente o destino e o ID, e o vínculo da auditoria não é
-verificado pela CLI. Trata-se de evidência sobre a cópia examinada, não de
-reconciliação automática, garantia de recuperação de host ou validação da
-atividade após ativação. Não use essa interface para dados reais.
+depois. Essa CLI local escolhe manualmente o destino e o ID, sem verificar o
+vínculo da auditoria.
+
+Para verificação mediada experimental existe também `remote-verify-backup
+ORIGIN ATTEMPT_ID PRIVATE_STAGING --confirm-isolated`. O ID da tentativa aparece
+em `/admin/backup-audit`. A solicitação só aceita tentativa `started` ou
+`unknown` com fingerprint de destino coincidente; o administrador autoriza a
+tentativa, o ID de backup, o bucket e o destinatário na tela Discord, e o
+verificador é de uso único. Na execução, o serviço confere novamente estado e
+fingerprint, baixa somente ciphertext limitado e o envia à CLI com `no-store`.
+Após a confirmação, a CLI lê identidade age e chave da aplicação por stdin
+protegido, sem enviá-las ao serviço, e verifica uma cópia em quarentena como
+acima. Não usa banco local ativo nem modifica objeto ou auditoria.
+
+Essa associação consulta a chave de objeto associada à tentativa e a
+configuração registrada, **mas não prova que o objeto foi criado por ela**:
+uma tentativa duplicada pode encontrar um objeto anterior e o endereço Floci
+pode ter sido reutilizado. Não há digest de ciphertext ou versão do objeto
+persistido antes do envio. É evidência sobre a cópia examinada, não reconciliação
+automática, prova de origem, garantia de recuperação de host ou validação após
+ativação. O fluxo é somente para Floci e Discord sintéticos, não dados reais.
 
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e

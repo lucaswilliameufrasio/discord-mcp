@@ -87,7 +87,8 @@ pub async fn restore(
     Ok(())
 }
 
-fn read_recovery_input() -> Result<(age::x25519::Identity, [u8; 32]), Box<dyn std::error::Error>> {
+pub(crate) fn read_recovery_input()
+-> Result<(age::x25519::Identity, [u8; 32]), Box<dyn std::error::Error>> {
     if std::io::stdin().is_terminal() {
         return Err(
             "supply recovery identity and application key on protected non-terminal stdin".into(),
@@ -133,27 +134,8 @@ pub async fn verify(
         return Err("invalid backup ID".into());
     }
     let client = client(endpoint)?;
-    let parent = Path::new(parent);
-    let metadata = std::fs::symlink_metadata(parent)?;
-    if !metadata.is_dir() {
-        return Err("private staging directory required".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err("private staging directory required".into());
-        }
-    }
     let (identity, key) = read_recovery_input()?;
-    let staging = tempfile::Builder::new()
-        .prefix(".discord-mcp-verify-")
-        .tempdir_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
-    }
+    let staging = create_verification_staging(parent)?;
     let destination = staging.path().join("quarantined.db");
     let object = format!("service-backups/{id}.age");
     let report = tokio::time::timeout(
@@ -169,7 +151,59 @@ pub async fn verify(
         ),
     )
     .await??;
-    let store = discord_mcp::channels::ChannelStore::open_recovery_copy(&destination, &key)?;
+    finish_verification(staging, &key, report)
+}
+
+fn create_verification_staging(
+    parent: &str,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let parent = Path::new(parent);
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.is_dir() {
+        return Err("private staging directory required".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("private staging directory required".into());
+        }
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".discord-mcp-verify-")
+        .tempdir_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(staging)
+}
+
+pub(crate) fn verify_ciphertext(
+    encrypted: &[u8],
+    parent: &str,
+    identity: &age::x25519::Identity,
+    key: &[u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let staging = create_verification_staging(parent)?;
+    let report = discord_mcp::encrypted_backup::restore_ciphertext_quarantined(
+        encrypted,
+        &staging.path().join("quarantined.db"),
+        identity,
+        key,
+        90,
+    )?;
+    finish_verification(staging, key, report)
+}
+
+fn finish_verification(
+    staging: tempfile::TempDir,
+    key: &[u8; 32],
+    report: discord_mcp::channels::RecoveryInvalidations,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let destination = staging.path().join("quarantined.db");
+    let store = discord_mcp::channels::ChannelStore::open_recovery_copy(&destination, key)?;
     if !store.recovery_quarantined()?
         || !matches!(
             store.list_active(),

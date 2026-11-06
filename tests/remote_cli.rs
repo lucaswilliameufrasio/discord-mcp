@@ -2331,6 +2331,225 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
             .iter()
             .any(|row| row.request_id == duplicate_id && row.state == "unknown")
     );
+    use age::secrecy::ExposeSecret;
+    let baseline = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    let object_before = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("service-backups/backup-2.age")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let mut verify_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &cli_database)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-verify-backup", &origin, duplicate_id])
+        .arg(dir.path())
+        .arg("--confirm-isolated")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let malformed = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &cli_database)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-verify-backup", &origin, duplicate_id])
+        .output()
+        .await
+        .unwrap();
+    assert!(!malformed.status.success());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("--confirm-isolated"));
+    assert!(!cli_database.exists());
+    let mut verify_stderr = BufReader::new(verify_cli.stderr.take().unwrap());
+    let mut verify_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        verify_stderr.read_line(&mut verify_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let verify_consent =
+        reqwest::Url::parse(verify_line.split_whitespace().last().unwrap()).unwrap();
+    let verify_id = verify_consent
+        .query_pairs()
+        .find(|(key, _)| key == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let verify_page = browser
+        .get(verify_consent)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        verify_page.contains(duplicate_id)
+            && verify_page.contains("backup-2")
+            && verify_page.contains(&bucket)
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &verify_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let mut input = verify_cli.stdin.take().unwrap();
+    input
+        .write_all(
+            format!(
+                "\n{}\n{}\n",
+                identity.to_string().expose_secret(),
+                hex::encode(key)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    drop(input);
+    let output = timeout(Duration::from_secs(30), verify_cli.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "verification CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Synthetic verification passed"));
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(identity.to_string().expose_secret())
+    );
+    assert!(!cli_database.exists());
+    let after = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    assert_eq!(baseline, after);
+    assert_eq!(
+        object_before,
+        s3.get_object()
+            .bucket(&bucket)
+            .key("service-backups/backup-2.age")
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+    );
+    println!(
+        "PASS remote authorized isolated verification: attempt binding, audit and object unchanged"
+    );
+    let verification_request: Value = browser
+        .post(format!("{origin}/v1/cli/backup-verification-requests"))
+        .json(&json!({"attempt_id":duplicate_id,"challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let verification_id = verification_request["request_id"].as_str().unwrap();
+    let verification_execute =
+        json!({"request_id":verification_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&verification_execute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", verification_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let verification_wrong =
+        json!({"request_id":verification_id,"verifier":hex::encode([45_u8; 32])});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&verification_wrong)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let binding_db = rusqlite::Connection::open(&database).unwrap();
+    binding_db
+        .execute(
+            "UPDATE backup_target_binding SET fingerprint=?2 WHERE request_id=?1",
+            rusqlite::params![duplicate_id, [99_u8; 32].as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&verification_execute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&verification_execute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    binding_db
+        .execute(
+            "UPDATE backup_target_binding SET fingerprint=?2 WHERE request_id=?1",
+            rusqlite::params![duplicate_id, binding.as_slice()],
+        )
+        .unwrap();
+    println!(
+        "PASS remote verification: unapproved, wrong verifier, changed binding and replay refused"
+    );
     let missing_id = "a".repeat(64);
     store
         .begin_backup_audit(
@@ -2436,6 +2655,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         mismatch.contains("destino configurado diverge")
             && mismatch.contains("Nenhuma consulta ao armazenamento")
     );
+    assert_eq!(browser.post(format!("{alternate_origin}/v1/cli/backup-verification-requests")).json(&json!({"attempt_id":duplicate_id,"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().status(), StatusCode::CONFLICT);
     alternate_task.abort();
     let binding_sql = rusqlite::Connection::open(&database).unwrap();
     binding_sql
@@ -2458,6 +2678,18 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     assert!(
         legacy.contains("Registro antigo sem vínculo")
             && legacy.contains("Nenhuma consulta ao armazenamento")
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/backup-verification-requests"))
+            .json(
+                &json!({"attempt_id":missing_id,"challenge":hex::encode(Sha256::digest(verifier))})
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
     );
     assert!(
         store
@@ -2571,7 +2803,6 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     sql.execute_batch("DROP TRIGGER synthetic_backup_finish_failure")
         .unwrap();
     println!("PASS backup audit: lost result after upload leaves durable inconclusive intent");
-    use age::secrecy::ExposeSecret;
     let saved_object = s3
         .get_object()
         .bucket(&bucket)

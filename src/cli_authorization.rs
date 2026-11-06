@@ -31,6 +31,12 @@ pub struct PermissionChange {
 pub enum CliOperation {
     #[cfg(feature = "encrypted-s3-backup")]
     Backup(String),
+    #[cfg(feature = "encrypted-s3-backup")]
+    VerifyBackup {
+        attempt_id: String,
+        backup_id: String,
+        binding: [u8; 32],
+    },
     PermissionChange(PermissionChange),
     ListChannels,
     ShowPermissions(String),
@@ -74,6 +80,31 @@ pub struct CliAuthorizations {
 }
 
 impl CliAuthorizations {
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn begin_backup_verification(
+        &self,
+        attempt_id: String,
+        backup_id: String,
+        binding: [u8; 32],
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        if attempt_id.len() != 64
+            || !attempt_id.bytes().all(|b| b.is_ascii_hexdigit())
+            || !valid_channel(&backup_id)
+        {
+            return Err("invalid operation");
+        }
+        self.begin_operation(
+            CliOperation::VerifyBackup {
+                attempt_id,
+                backup_id,
+                binding,
+            },
+            challenge,
+            now,
+        )
+    }
     #[cfg(feature = "encrypted-s3-backup")]
     pub fn begin_backup(
         &self,

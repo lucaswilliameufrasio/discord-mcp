@@ -19,7 +19,8 @@ use tokio::io::AsyncReadExt;
 use crate::{channels::RecoveryInvalidations, recovery::prepare_restored_copy};
 
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
-const MAX_OBJECT: u64 = MAX_SNAPSHOT + 1024 * 1024;
+pub const MAX_ENCRYPTED_OBJECT: u64 = MAX_SNAPSHOT + 1024 * 1024;
+const MAX_OBJECT: u64 = MAX_ENCRYPTED_OBJECT;
 
 #[derive(Debug)]
 pub struct BackupError;
@@ -52,6 +53,51 @@ pub struct ServiceBackup {
 }
 
 impl ServiceBackup {
+    /// Only ciphertext is returned; existence is not provenance or integrity.
+    pub async fn fetch_ciphertext(&self, id: &str) -> Result<Vec<u8>, BackupError> {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(BackupError);
+        }
+        let _permit = self.admission.try_lock().map_err(|_| BackupError)?;
+        let object = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(format!("service-backups/{id}.age"))
+                .send(),
+        )
+        .await
+        .map_err(|_| BackupError)?
+        .map_err(|_| BackupError)?;
+        if object
+            .content_length()
+            .is_some_and(|n| n < 0 || n as u64 > MAX_OBJECT)
+        {
+            return Err(BackupError);
+        }
+        let mut encrypted = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            object
+                .body
+                .into_async_read()
+                .take(MAX_OBJECT + 1)
+                .read_to_end(&mut encrypted),
+        )
+        .await
+        .map_err(|_| BackupError)?
+        .map_err(|_| BackupError)?;
+        if encrypted.is_empty() || encrypted.len() as u64 > MAX_OBJECT {
+            return Err(BackupError);
+        }
+        Ok(encrypted)
+    }
     pub fn destination_binding(&self) -> [u8; 32] {
         self.binding
     }
@@ -301,7 +347,32 @@ pub async fn restore_quarantined(
     if encrypted.len() as u64 > MAX_OBJECT {
         return Err(BackupError);
     }
-    let decryptor = age::Decryptor::new(encrypted.as_slice()).map_err(|_| BackupError)?;
+    restore_ciphertext_quarantined(
+        &encrypted,
+        destination,
+        identity,
+        application_key,
+        retention_days,
+    )
+}
+
+/// Authenticate a bounded ciphertext and prepare a fresh quarantined copy.
+pub fn restore_ciphertext_quarantined(
+    encrypted: &[u8],
+    destination: &Path,
+    identity: &Identity,
+    application_key: &[u8; 32],
+    retention_days: u16,
+) -> Result<RecoveryInvalidations, BackupError> {
+    if encrypted.is_empty() || encrypted.len() as u64 > MAX_OBJECT {
+        return Err(BackupError);
+    }
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(BackupError)?;
+    private_dir(parent)?;
+    let decryptor = age::Decryptor::new(encrypted).map_err(|_| BackupError)?;
     let reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|_| BackupError)?;

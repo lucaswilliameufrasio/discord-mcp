@@ -176,6 +176,22 @@ impl ServerHandler for DiscordMcp {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(feature = "encrypted-s3-backup")]
+    if let [command, origin, attempt, staging, confirm] = args.as_slice()
+        && command == "remote-verify-backup"
+        && confirm == "--confirm-isolated"
+    {
+        return remote_operation(origin, RemoteOperation::VerifyBackup(attempt, staging)).await;
+    }
+    #[cfg(feature = "encrypted-s3-backup")]
+    if args
+        .first()
+        .is_some_and(|command| command == "remote-verify-backup")
+    {
+        return Err(
+            "use remote-verify-backup ORIGIN ATTEMPT_ID PRIVATE_STAGING --confirm-isolated".into(),
+        );
+    }
+    #[cfg(feature = "encrypted-s3-backup")]
     if let [command, endpoint, bucket, id, staging, confirm] = args.as_slice()
         && command == "verify-floci"
         && confirm == "--confirm-isolated"
@@ -300,6 +316,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "Synthetic loopback Floci only: backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT | restore-floci ADDRESS BUCKET OBJECT DESTINATION | verify-floci ADDRESS BUCKET ID PRIVATE_STAGING --confirm-isolated"
             );
+            #[cfg(feature = "encrypted-s3-backup")]
+            println!(
+                "Mediated verification: remote-verify-backup ORIGIN ATTEMPT_ID PRIVATE_STAGING --confirm-isolated"
+            );
             return Ok(());
         }
         let storage = storage.ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY")?;
@@ -422,6 +442,8 @@ fn read_remote_secret() -> Result<String, Box<dyn std::error::Error>> {
 #[derive(Clone, Copy)]
 enum RemoteOperation<'a> {
     #[cfg(feature = "encrypted-s3-backup")]
+    VerifyBackup(&'a str, &'a str),
+    #[cfg(feature = "encrypted-s3-backup")]
     Backup(&'a str),
     SetPermission(&'a str, &'a str, &'a str),
     ListChannels,
@@ -458,7 +480,10 @@ async fn remote_operation(
     getrandom::fill(&mut verifier)?;
     let challenge = hex::encode(Sha256::digest(verifier));
     #[cfg(feature = "encrypted-s3-backup")]
-    let timeout_secs = if matches!(operation, RemoteOperation::Backup(_)) {
+    let timeout_secs = if matches!(
+        operation,
+        RemoteOperation::Backup(_) | RemoteOperation::VerifyBackup(..)
+    ) {
         90
     } else {
         15
@@ -470,6 +495,11 @@ async fn remote_operation(
         .timeout(Duration::from_secs(timeout_secs))
         .build()?;
     let (endpoint, body) = match operation {
+        #[cfg(feature = "encrypted-s3-backup")]
+        RemoteOperation::VerifyBackup(attempt, _) => (
+            "/v1/cli/backup-verification-requests",
+            rmcp::serde_json::json!({"attempt_id":attempt,"challenge":challenge}),
+        ),
         #[cfg(feature = "encrypted-s3-backup")]
         RemoteOperation::Backup(id) => (
             "/v1/cli/backup-requests",
@@ -537,6 +567,15 @@ async fn remote_operation(
     if std::io::stdin().read_line(&mut input)? == 0 {
         return Err("confirmation input closed before authorization".into());
     }
+    #[cfg(feature = "encrypted-s3-backup")]
+    let recovery = if matches!(operation, RemoteOperation::VerifyBackup(..)) {
+        eprintln!(
+            "Forneça identidade age e chave da aplicação em stdin protegido; não serão enviadas ao servidor."
+        );
+        Some(local_backup::read_recovery_input()?)
+    } else {
+        None
+    };
     let mut execution = rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)});
     if let RemoteOperation::RegisterWebhook(_, webhook) = operation {
         execution["webhook"] = webhook.into();
@@ -550,6 +589,33 @@ async fn remote_operation(
         .send()
         .await?;
     match operation {
+        #[cfg(feature = "encrypted-s3-backup")]
+        RemoteOperation::VerifyBackup(_, staging) => {
+            if response.status() != reqwest::StatusCode::OK {
+                return Err("verification download denied or unavailable".into());
+            }
+            if response
+                .content_length()
+                .is_some_and(|n| n > discord_mcp::encrypted_backup::MAX_ENCRYPTED_OBJECT)
+            {
+                return Err("verification ciphertext exceeds limit".into());
+            }
+            let mut response = response;
+            let mut ciphertext = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if ciphertext.len().saturating_add(chunk.len())
+                    > discord_mcp::encrypted_backup::MAX_ENCRYPTED_OBJECT as usize
+                {
+                    return Err("verification ciphertext exceeds limit".into());
+                }
+                ciphertext.extend_from_slice(&chunk);
+            }
+            let (identity, key) = recovery.ok_or("missing recovery input")?;
+            local_backup::verify_ciphertext(&ciphertext, staging, &identity, &key)?;
+            eprintln!(
+                "A cópia verificada pode não ter sido produzida pela tentativa selecionada; auditoria inalterada."
+            );
+        }
         #[cfg(feature = "encrypted-s3-backup")]
         RemoteOperation::Backup(_) => {
             if response.status() != reqwest::StatusCode::NO_CONTENT {
