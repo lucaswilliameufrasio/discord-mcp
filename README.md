@@ -46,6 +46,14 @@ stdio e utiliza o mesmo banco. Não protege contra outro processo com os mesmos
 privilégios do usuário que consiga ler a chave ou controlar o navegador.
 Na remoção, a confirmação é vinculada à versão do canal exibida; se o canal
 for substituído antes da confirmação, a interface recusa e pede nova revisão.
+Nos formulários de cadastro, o estado dos canais é registrado quando a página
+é carregada e verificado na transação de gravação. Se um canal for criado,
+substituído ou removido nesse intervalo, a gravação é recusada. O formulário
+vale por cinco minutos e é de uso único; carregar outra página autenticada
+invalida formulários anteriores, inclusive em outras abas. Em caso de conflito,
+volte à lista e informe a credencial novamente. O estado temporário contém nomes
+e versões dos registros cifrados, não URLs nem tokens. A interface recusa gerar
+o formulário se houver mais de 10.000 canais.
 
 ### Servidor HTTP experimental
 

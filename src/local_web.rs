@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -26,6 +27,13 @@ struct App {
     origin: String,
     host: String,
     access: Mutex<Access>,
+    form_snapshot: Mutex<Option<FormSnapshot>>,
+}
+
+struct FormSnapshot {
+    id: String,
+    versions: HashMap<String, [u8; 32]>,
+    expires: Instant,
 }
 
 type Shared = Arc<App>;
@@ -49,6 +57,7 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
             expires: Instant::now() + Duration::from_secs(300),
             session: None,
         }),
+        form_snapshot: Mutex::new(None),
     });
     // The code is shown only to the local operator, never sent to the browser or logs by the server.
     eprintln!(
@@ -155,7 +164,7 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
             );
         }
     };
-    let names = match store.list() {
+    let versions = match store.local_form_snapshot() {
         Ok(names) => names,
         Err(_) => {
             return page(
@@ -164,6 +173,33 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
             );
         }
     };
+    let snapshot = match random_token() {
+        Ok(value) => value,
+        Err(_) => {
+            return page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "<p>Não foi possível iniciar o formulário.</p>".into(),
+            );
+        }
+    };
+    let mut names = Vec::with_capacity(versions.len());
+    let mut entries = HashMap::with_capacity(versions.len());
+    for (name, version) in versions {
+        names.push(name.clone());
+        entries.insert(name, version);
+    }
+    let Ok(mut saved) = app.form_snapshot.lock() else {
+        return page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "<p>Não foi possível iniciar o formulário.</p>".into(),
+        );
+    };
+    *saved = Some(FormSnapshot {
+        id: snapshot.clone(),
+        versions: entries,
+        expires: Instant::now() + Duration::from_secs(300),
+    });
+    drop(saved);
     let mut list = String::new();
     for name in names {
         let name = escape_html(&name);
@@ -175,7 +211,7 @@ async fn home(State(app): State<Shared>, headers: HeaderMap) -> Response {
     page(
         StatusCode::OK,
         format!(
-            r#"<p>Gerencie os destinos locais. Webhooks e tokens cadastrados não são exibidos novamente.</p><section><h2>Canais cadastrados</h2><ul>{list}</ul></section><section><h2>Cadastrar ou substituir webhook</h2><p class="note">Use letras, números, hífen ou sublinhado no nome. Um nome existente será substituído.</p><form method="post" action="/channels"><label for="name">Nome do canal</label><input id="name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="webhook">URL do webhook do Discord</label><input id="webhook" name="webhook" type="password" autocomplete="off" required><button>Salvar webhook</button></form></section><section><h2>Cadastrar ou substituir bot</h2><p>O bot precisa estar instalado no servidor e ter permissões de leitura e envio para o canal. Um nome existente será substituído.</p><form method="post" action="/channels/bot"><label for="bot-name">Nome do canal</label><input id="bot-name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="channel-id">ID do canal Discord</label><input id="channel-id" name="channel_id" inputmode="numeric" pattern="[0-9]+" required><label for="bot-token">Token do bot</label><input id="bot-token" name="token" type="password" autocomplete="off" required><button>Salvar bot</button></form></section>"#
+            r#"<p>Gerencie os destinos locais. Webhooks e tokens cadastrados não são exibidos novamente.</p><section><h2>Canais cadastrados</h2><ul>{list}</ul></section><section><h2>Cadastrar ou substituir webhook</h2><p class="note">Use letras, números, hífen ou sublinhado no nome. Um nome existente será substituído.</p><form method="post" action="/channels"><input type="hidden" name="snapshot" value="{snapshot}"><label for="name">Nome do canal</label><input id="name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="webhook">URL do webhook do Discord</label><input id="webhook" name="webhook" type="password" autocomplete="off" required><button>Salvar webhook</button></form></section><section><h2>Cadastrar ou substituir bot</h2><p>O bot precisa estar instalado no servidor e ter permissões de leitura e envio para o canal. Um nome existente será substituído.</p><form method="post" action="/channels/bot"><input type="hidden" name="snapshot" value="{snapshot}"><label for="bot-name">Nome do canal</label><input id="bot-name" name="name" maxlength="64" pattern="[A-Za-z0-9_-]+" required><label for="channel-id">ID do canal Discord</label><input id="channel-id" name="channel_id" inputmode="numeric" pattern="[0-9]+" required><label for="bot-token">Token do bot</label><input id="bot-token" name="token" type="password" autocomplete="off" required><button>Salvar bot</button></form></section>"#
         ),
     )
 }
@@ -225,6 +261,8 @@ async fn login(State(app): State<Shared>, headers: HeaderMap, Form(form): Form<L
 struct ChannelForm {
     name: String,
     webhook: String,
+    #[serde(default)]
+    snapshot: String,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +270,31 @@ struct BotForm {
     name: String,
     channel_id: String,
     token: String,
+    #[serde(default)]
+    snapshot: String,
+}
+
+fn take_form_snapshot(app: &App, id: &str, name: &str) -> Result<Option<[u8; 32]>, ()> {
+    let mut pending = app.form_snapshot.lock().map_err(|_| ())?;
+    let snapshot = pending.as_ref().ok_or(())?;
+    if snapshot.expires <= Instant::now() {
+        *pending = None;
+        return Err(());
+    }
+    if !same_secret(&snapshot.id, id) {
+        return Err(());
+    }
+    let snapshot = pending.take().ok_or(())?;
+    Ok(snapshot.versions.get(name).copied())
+}
+
+fn save_result(result: Result<(), discord_mcp::channels::StoreError>) -> Response {
+    match result {
+        Ok(()) => (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response(),
+        Err(discord_mcp::channels::StoreError::AuthorizationDenied) => page(StatusCode::CONFLICT, "<p>O canal foi alterado. Volte à lista e confira novamente.</p><p><a href=\"/\">Voltar aos canais</a></p>".into()),
+        Err(discord_mcp::channels::StoreError::RecoveryPending) => page(StatusCode::SERVICE_UNAVAILABLE, "<p>Banco em quarentena.</p>".into()),
+        Err(_) => page(StatusCode::UNPROCESSABLE_ENTITY, "<p>Não foi possível salvar. Confira os dados e o banco.</p><p><a href=\"/\">Voltar aos canais</a></p>".into()),
+    }
 }
 
 async fn save_bot(
@@ -242,15 +305,13 @@ async fn save_bot(
     if !allowed_post(&app, &headers) || !authenticated(&app, &headers) {
         return denied();
     }
-    if app
-        .storage
-        .open()
-        .and_then(|store| store.put_bot(&form.name, &form.channel_id, &form.token))
-        .is_err()
-    {
-        return page(StatusCode::UNPROCESSABLE_ENTITY, "<p>Não foi possível salvar o bot. Confira nome, ID, token e banco.</p><p><a href=\"/\">Voltar aos canais</a></p>".into());
-    }
-    (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response()
+    let Ok(version) = take_form_snapshot(&app, &form.snapshot, &form.name) else {
+        return page(StatusCode::CONFLICT, "<p>Formulário expirado ou substituído por outra página. Volte à lista e tente novamente.</p><p><a href=\"/\">Voltar aos canais</a></p>".into());
+    };
+    let result = app.storage.open().and_then(|store| {
+        store.put_bot_if_version(&form.name, &form.channel_id, &form.token, version)
+    });
+    save_result(result)
 }
 
 async fn save(
@@ -261,14 +322,14 @@ async fn save(
     if !allowed_post(&app, &headers) || !authenticated(&app, &headers) {
         return denied();
     }
+    let Ok(version) = take_form_snapshot(&app, &form.snapshot, &form.name) else {
+        return page(StatusCode::CONFLICT, "<p>Formulário expirado ou substituído por outra página. Volte à lista e tente novamente.</p><p><a href=\"/\">Voltar aos canais</a></p>".into());
+    };
     let result = app
         .storage
         .open()
-        .and_then(|store| store.put_webhook(&form.name, &form.webhook));
-    if result.is_err() {
-        return page(StatusCode::UNPROCESSABLE_ENTITY, "<p>Não foi possível salvar. Confira o nome, a URL e a configuração do banco.</p><p><a href=\"/\">Voltar aos canais</a></p>".into());
-    }
-    (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response()
+        .and_then(|store| store.put_webhook_if_version(&form.name, &form.webhook, version));
+    save_result(result)
 }
 
 #[derive(Deserialize)]
@@ -346,6 +407,25 @@ mod tests {
     use super::*;
     use reqwest::Client;
 
+    async fn snapshot(client: &Client, origin: &str, cookie: &str) -> String {
+        let html = client
+            .get(origin)
+            .header(header::COOKIE, cookie)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        html.split("name=\"snapshot\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
     #[tokio::test]
     async fn local_web_requires_session_and_origin_and_manages_real_sqlite() {
         let dir = tempfile::tempdir().unwrap();
@@ -368,8 +448,11 @@ mod tests {
                 expires: Instant::now() + Duration::from_secs(60),
                 session: None,
             }),
+            form_snapshot: Mutex::new(None),
         });
-        let server = tokio::spawn(async move { axum::serve(listener, router(app)).await.unwrap() });
+        let server_app = app.clone();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(server_app)).await.unwrap() });
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -422,13 +505,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::FORBIDDEN);
-        let saved = post("/channels", form.into())
+        let store = storage.open().unwrap();
+        store
+            .put_bot("race_save", "123", "synthetic-token")
+            .unwrap();
+        let page_snapshot = snapshot(&client, &origin, &cookie).await;
+        store
+            .put_bot("race_save", "456", "replacement-synthetic")
+            .unwrap();
+        let stale = post("/channels", format!("name=race_save&webhook=https%3A%2F%2Fdiscord.com%2Fapi%2Fwebhooks%2F123%2Fsynthetic-token&snapshot={page_snapshot}")).header(header::ORIGIN, &origin).header(header::COOKIE, &cookie).send().await.unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            store.get_channel("race_save"),
+            Ok(discord_mcp::channels::Channel::Bot(_))
+        ));
+        store.delete("race_save").unwrap();
+        for (kind, existed) in [
+            ("webhook", false),
+            ("bot", false),
+            ("webhook", true),
+            ("bot", true),
+        ] {
+            let name = format!("race_{kind}_{existed}");
+            if existed {
+                store.put_bot(&name, "100", "synthetic-token").unwrap();
+            }
+            let before = snapshot(&client, &origin, &cookie).await;
+            store
+                .put_bot(&name, "200", "replacement-synthetic")
+                .unwrap();
+            store.set_permissions("101", &name, true, false).unwrap();
+            let audit_before = store
+                .audit_events(None, Some("channel_configured"), 100)
+                .unwrap()
+                .len();
+            let (path, body) = if kind == "bot" {
+                (
+                    "/channels/bot",
+                    format!(
+                        "name={name}&channel_id=300&token=synthetic-bot-token&snapshot={before}"
+                    ),
+                )
+            } else {
+                (
+                    "/channels",
+                    format!(
+                        "name={name}&webhook=https%3A%2F%2Fdiscord.com%2Fapi%2Fwebhooks%2F123%2Fsynthetic-token&snapshot={before}"
+                    ),
+                )
+            };
+            let rejected = post(path, body)
+                .header(header::ORIGIN, &origin)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::CONFLICT);
+            assert!(
+                store
+                    .is_permitted("101", &name, discord_mcp::channels::ChannelAction::Read)
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .audit_events(None, Some("channel_configured"), 100)
+                    .unwrap()
+                    .len(),
+                audit_before
+            );
+            store.delete(&name).unwrap();
+        }
+        let concurrent = snapshot(&client, &origin, &cookie).await;
+        let first = post(
+            "/channels/bot",
+            format!("name=one&channel_id=123&token=synthetic-token&snapshot={concurrent}"),
+        )
+        .header(header::ORIGIN, &origin)
+        .header(header::COOKIE, &cookie)
+        .send();
+        let second = post(
+            "/channels/bot",
+            format!("name=two&channel_id=123&token=synthetic-token&snapshot={concurrent}"),
+        )
+        .header(header::ORIGIN, &origin)
+        .header(header::COOKIE, &cookie)
+        .send();
+        let (first, second) = tokio::join!(first, second);
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert!(
+            statuses.contains(&StatusCode::SEE_OTHER) && statuses.contains(&StatusCode::CONFLICT)
+        );
+        let names = store.list().unwrap();
+        assert_ne!(
+            names.contains(&"one".to_owned()),
+            names.contains(&"two".to_owned())
+        );
+        let winner = if names.contains(&"one".to_owned()) {
+            "one"
+        } else {
+            "two"
+        };
+        store.delete(winner).unwrap();
+        let expired = snapshot(&client, &origin, &cookie).await;
+        app.form_snapshot.lock().unwrap().as_mut().unwrap().expires = Instant::now();
+        assert_eq!(
+            post("/channels", format!("{form}&snapshot={expired}"))
+                .header(header::ORIGIN, &origin)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let first = snapshot(&client, &origin, &cookie).await;
+        let current = snapshot(&client, &origin, &cookie).await;
+        assert_eq!(
+            post("/channels", format!("{form}&snapshot={first}"))
+                .header(header::ORIGIN, &origin)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post("/channels", format!("{form}&snapshot={current}"))
+                .header(header::ORIGIN, "http://evil.invalid")
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let saved = post("/channels", format!("{form}&snapshot={current}"))
             .header(header::ORIGIN, &origin)
             .header(header::COOKIE, &cookie)
             .send()
             .await
             .unwrap();
         assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            post("/channels", format!("{form}&snapshot={current}"))
+                .header(header::ORIGIN, &origin)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
         let store = storage.open().unwrap();
         store.put_bot("race", "123", "synthetic-token").unwrap();
         let html = post("/delete", "name=race".into())
@@ -467,9 +695,10 @@ mod tests {
                 .any(|row| row.channel.as_deref() == Some("race"))
         );
         store.delete("race").unwrap();
+        let current = snapshot(&client, &origin, &cookie).await;
         let bot_saved = post(
             "/channels/bot",
-            "name=robot&channel_id=123&token=synthetic-bot-token".into(),
+            format!("name=robot&channel_id=123&token=synthetic-bot-token&snapshot={current}"),
         )
         .header(header::ORIGIN, &origin)
         .header(header::COOKIE, &cookie)

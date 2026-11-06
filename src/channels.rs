@@ -392,6 +392,32 @@ impl ChannelStore {
         self.put_secret(name, &bot.encode(), AuditActor::LocalOperator, None)
     }
 
+    pub fn put_webhook_if_version(
+        &self,
+        name: &str,
+        url: &str,
+        version: Option<[u8; 32]>,
+    ) -> Result<(), StoreError> {
+        WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
+        self.put_secret(name, url, AuditActor::LocalOperator, Some(version))
+    }
+
+    pub fn put_bot_if_version(
+        &self,
+        name: &str,
+        channel_id: &str,
+        token: &str,
+        version: Option<[u8; 32]>,
+    ) -> Result<(), StoreError> {
+        let bot = BotChannel::new(channel_id, token).ok_or(StoreError::InvalidInput)?;
+        self.put_secret(
+            name,
+            &bot.encode(),
+            AuditActor::LocalOperator,
+            Some(version),
+        )
+    }
+
     pub fn put_webhook_as_discord(
         &self,
         name: &str,
@@ -572,6 +598,42 @@ impl ChannelStore {
         let names = self.list()?;
         transaction.commit().map_err(|_| StoreError::Storage)?;
         Ok(names)
+    }
+
+    /// Bounded version snapshot for the local administrative form.
+    pub fn local_form_snapshot(&self) -> Result<Vec<(String, [u8; 32])>, StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let mut statement = self
+            .db
+            .prepare("SELECT name,nonce,ciphertext FROM channels ORDER BY name LIMIT 10001")
+            .map_err(|_| StoreError::Storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|_| StoreError::Storage)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (name, nonce, ciphertext) = row.map_err(|_| StoreError::Storage)?;
+            let mut digest = Sha256::new();
+            digest.update(nonce);
+            digest.update(ciphertext);
+            result.push((name, digest.finalize().into()));
+        }
+        drop(statement);
+        if result.len() > 10000 {
+            return Err(StoreError::Storage);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(result)
     }
 
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
