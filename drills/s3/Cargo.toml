@@ -19,6 +19,7 @@ sqlite-replication-ltx = { version = "0.1.0", path = "../../../sqlite-replicatio
 sqlite-replication-wal = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/wal" }
 sqlite-replication-storage-fs = { version = "0.1.0", path = "../../../sqlite-replication/rust/crates/storage-fs" }
 age = "=0.12.1"
+hex = "0.4.3"
 
 [dev-dependencies]
 rusqlite = { version = "0.41.1", features = ["bundled"] }

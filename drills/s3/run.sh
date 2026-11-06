@@ -9,6 +9,7 @@ security="$("${docker[@]}" info --format '{{json .SecurityOptions}}')"
 [[ "$security" == *name=rootless* ]] || { printf '%s\n' 'Rootless daemon required.' >&2; exit 1; }
 "${docker[@]}" image inspect "$image" --format '{{.Id}}' >/dev/null
 cargo build --locked --manifest-path "$manifest" --target-dir "$root/target/s3-drill"
+cargo build --locked --manifest-path "$root/Cargo.toml" --features encrypted-s3-backup --bin discord-mcp --target-dir "$root/target/s3-drill"
 container=''
 cleanup() {
     result=$?
@@ -46,4 +47,5 @@ else:
     raise SystemExit('Fixture did not become ready')
 PY
 timeout 120s env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp/opencode}" \
+    DISCORD_MCP_DRILL_BINARY="$root/target/s3-drill/debug/discord-mcp" \
     "$root/target/s3-drill/debug/discord-mcp-s3-drill" "$address"

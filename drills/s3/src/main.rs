@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use age::secrecy::ExposeSecret;
 use aws_credential_types::Credentials;
 use discord_mcp::{
     channels::{AuthorizationExchange, AuthorizationGrant, ChannelAction, ChannelStore},
@@ -13,7 +14,7 @@ use discord_mcp::{
 };
 use sqlite_replication_core::{RestoreTarget, restore_from_s3, snapshot, sync_to_s3};
 use sqlite_replication_storage_s3::S3Store;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn assert_source_unchanged(store: &ChannelStore, token: &str, resource: &str) {
     assert_eq!(store.list().unwrap(), vec!["support"]);
@@ -113,6 +114,85 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     store.set_permissions("101", "support", false, false)?;
     store.revoke_access_token(&token)?;
     assert_source_unchanged(&store, &token, resource);
+    let binary = std::env::var_os("DISCORD_MCP_DRILL_BINARY").ok_or("missing CLI binary")?;
+    let denied = tokio::process::Command::new(&binary)
+        .env_clear()
+        .args([
+            "restore-floci",
+            "192.0.2.1:4566",
+            "discord-mcp-synthetic-drill",
+            "cli/snapshot.age",
+        ])
+        .arg(directory.join("remote-denied.db"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await?;
+    assert!(!denied.status.success());
+    assert_no_destination(&directory.join("remote-denied.db"));
+    let cli_identity = age::x25519::Identity::generate();
+    let cli_recipient = cli_identity.to_public().to_string();
+    let backup_output = tokio::process::Command::new(&binary)
+        .env_clear()
+        .env("DISCORD_MCP_DB", &source)
+        .env("DISCORD_MCP_KEY", hex::encode(key))
+        .args([
+            "backup-floci",
+            &address.to_string(),
+            "discord-mcp-synthetic-drill",
+            "cli/snapshot.age",
+            &cli_recipient,
+        ])
+        .output()
+        .await?;
+    assert!(
+        backup_output.status.success(),
+        "CLI backup failed: {}",
+        String::from_utf8_lossy(&backup_output.stderr)
+    );
+    let cli_destination = directory.join("cli-restored.db");
+    let mut child = tokio::process::Command::new(&binary)
+        .env_clear()
+        .args([
+            "restore-floci",
+            &address.to_string(),
+            "discord-mcp-synthetic-drill",
+            "cli/snapshot.age",
+        ])
+        .arg(&cli_destination)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("missing CLI stdin")?;
+    let recovery_input = format!(
+        "{}\n{}\n",
+        cli_identity.to_string().expose_secret(),
+        hex::encode(key)
+    );
+    stdin.write_all(recovery_input.as_bytes()).await?;
+    drop(stdin);
+    let result = child.wait_with_output().await?;
+    assert!(
+        result.status.success(),
+        "CLI restore failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&result.stdout).contains(cli_identity.to_string().expose_secret())
+    );
+    let cli_store = ChannelStore::open(&cli_destination, &key)?;
+    assert!(cli_store.recovery_quarantined()?);
+    cli_store.activate_recovered_copy()?;
+    assert!(!cli_store.is_permitted("101", "support", ChannelAction::Read)?);
+    assert!(
+        cli_store
+            .verify_access_token(&token, resource, 1001)?
+            .is_none()
+    );
+    assert_source_unchanged(&store, &token, resource);
+    println!(
+        "PASS real CLI: local encrypted backup, stdin recovery, quarantine and revoked authority"
+    );
 
     // Exercise the application's reusable feature directly against Floci.
     let backup_identity = age::x25519::Identity::generate();

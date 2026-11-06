@@ -125,7 +125,26 @@ em staging privado, cifra a imagem completa para um destinatário X25519 age e
 envia um único objeto com `If-None-Match: *`. `restore_quarantined` limita o
 download, autentica age antes de gravar e chama `prepare_restored_copy`, que
 publica somente em destino novo e em quarentena. O cliente S3 e as identidades
-são fornecidos pelo chamador; não há operação automática nem comandos CLI.
+são fornecidos pelo chamador; não há operação automática.
+
+Com a feature habilitada, `backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT`
+e `restore-floci ADDRESS BUCKET OBJECT DESTINATION` exercitam a aplicação real
+exclusivamente no Floci sintético: `ADDRESS` deve ser IPv4 `127.0.0.1:porta` e
+as credenciais S3 são fixas de teste. Para backup, a configuração existente
+`DISCORD_MCP_DB` e `DISCORD_MCP_KEY` é exigida e o lock cooperativo recusa
+acesso se o processo HTTP estiver ativo; não se cria banco ausente. O destino e
+o diretório de staging devem ter diretório pai privado. A restauração não abre
+o banco ativo e recebe duas linhas pelo stdin não interativo: identidade age e
+chave da aplicação em hexadecimal. Não coloque valores reais no terminal,
+argumentos ou repositório. Há timeout de 60 segundos, mas o trabalho síncrono
+de snapshot e criptografia não é preemptível por esse timeout.
+
+O exercício `bash drills/s3/run.sh` compila o executável com a feature e valida
+os dois comandos em processos reais, em ambiente limpo e com dados sintéticos;
+também verifica que um endereço fora do loopback é rejeitado. A restauração
+permanece em quarentena até ativação explícita. Os comandos são uma interface
+local de teste, não um cliente para S3 real nem administração remota mediada;
+custódia real e integração Ciphera não foram implementadas.
 
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e

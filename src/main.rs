@@ -3,6 +3,8 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(feature = "encrypted-s3-backup")]
+mod local_backup;
 mod local_web;
 #[cfg(target_os = "linux")]
 mod process_guard;
@@ -173,6 +175,12 @@ impl ServerHandler for DiscordMcp {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "encrypted-s3-backup")]
+    if let [command, endpoint, bucket, object, destination] = args.as_slice()
+        && command == "restore-floci"
+    {
+        return local_backup::restore(endpoint, bucket, object, destination).await;
+    }
     if let [command, origin, user, channel, permission] = args.as_slice()
         && command == "remote-set-permission"
     {
@@ -264,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(process_guard::acquire(
             &config.path,
             args.as_slice() == ["serve"],
-            !recovery_activation,
+            !recovery_activation && args.first().is_none_or(|command| command != "backup-floci"),
         )?)
     } else {
         None
@@ -275,9 +283,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|remote-add-bot ORIGIN CHANNEL DISCORD_CHANNEL_ID|remote-delete-channel ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
+            #[cfg(feature = "encrypted-s3-backup")]
+            println!(
+                "Synthetic loopback Floci only: backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT | restore-floci ADDRESS BUCKET OBJECT DESTINATION"
+            );
             return Ok(());
         }
         let storage = storage.ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY")?;
+        #[cfg(feature = "encrypted-s3-backup")]
+        if let [command, endpoint, bucket, object, recipient] = args.as_slice()
+            && command == "backup-floci"
+        {
+            return local_backup::backup(endpoint, bucket, object, recipient, &storage).await;
+        }
         if args.as_slice() == ["web"] {
             if storage.open()?.recovery_quarantined()? {
                 return Err(

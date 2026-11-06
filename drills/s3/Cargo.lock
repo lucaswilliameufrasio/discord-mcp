@@ -1058,6 +1058,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "discord-mcp",
+ "hex",
  "rusqlite",
  "sqlite-replication-core",
  "sqlite-replication-ltx",
