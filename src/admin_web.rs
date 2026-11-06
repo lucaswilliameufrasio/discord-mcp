@@ -73,6 +73,7 @@ pub(crate) fn router_with_cli(
         .route("/admin/channels", get(channels))
         .route("/admin/observability", get(observability))
         .route("/admin/audit", get(audit))
+        .route("/admin/backup-audit", get(backup_audit))
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -89,6 +90,35 @@ pub(crate) fn router_with_cli(
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn backup_audit(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if !authorized(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    let entries = match store(&app).and_then(|store| store.recent_backup_audit()) {
+        Ok(entries) => entries,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let mut rows = String::new();
+    for entry in entries {
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape(&entry.backup_id),
+            escape(&entry.actor_id),
+            entry.started_at,
+            escape(&entry.state)
+        ));
+    }
+    page(format!(
+        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><table><thead><tr><th>ID</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th></tr></thead><tbody>{rows}</tbody></table>"
+    ))
+}
+
+#[cfg(not(feature = "encrypted-s3-backup"))]
+async fn backup_audit() -> Response {
+    error(StatusCode::NOT_FOUND)
 }
 
 #[cfg(feature = "encrypted-s3-backup")]
@@ -476,12 +506,36 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
             let Some(backup) = &app.config.backup else {
                 return error(StatusCode::SERVICE_UNAVAILABLE);
             };
-            if store(&app).and_then(|store| store.list_active()).is_err() {
+            let Ok(now) = current_timestamp() else {
+                return error(StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            if store(&app)
+                .and_then(|store| {
+                    store.begin_backup_audit(&req.request_id, &id, &app.config.admin_user_id, now)
+                })
+                .is_err()
+            {
+                app.config.auth.audit.mark_failure();
                 return error(StatusCode::SERVICE_UNAVAILABLE);
             }
-            return match backup.snapshot(&id).await {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(_) => error(StatusCode::BAD_GATEWAY),
+            let result = backup.snapshot(&id).await;
+            let Ok(finished) = current_timestamp() else {
+                app.config.auth.audit.mark_failure();
+                return error(StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            if store(&app)
+                .and_then(|store| {
+                    store.finish_backup_audit(&req.request_id, result.is_ok(), finished)
+                })
+                .is_err()
+            {
+                app.config.auth.audit.mark_failure();
+                return error(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            return if result.is_ok() {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                error(StatusCode::BAD_GATEWAY)
             };
         }
         CliOperation::PermissionChange(operation) => operation,
@@ -968,6 +1022,9 @@ async fn audit(
     } else {
         ""
     };
+    #[cfg(feature = "encrypted-s3-backup")]
+    let warning =
+        format!("{warning}<p><a href=\"/admin/backup-audit\">Auditoria de backups</a></p>");
     page(format!(
         r#"<p><a href="/admin">Voltar à visão geral</a></p><h1>Auditoria</h1>{warning}<p>Registra resultados do login Discord após validação da tentativa, alterações de canais locais e permissões bem-sucedidas. Não registra conteúdo de mensagens ou credenciais. Dados anteriores à ativação e tentativas rejeitadas antes da validação não estão incluídos.</p><form method="get" action="/admin/audit"><label for="kind">Tipo de evento</label><select id="kind" name="kind"><option value="">Todos</option><option value="admin_login">Login administrativo</option><option value="mcp_login">Login MCP</option><option value="permission_change">Alteração de permissão</option><option value="channel_configured">Canal cadastrado ou alterado</option><option value="channel_deleted">Canal removido</option><option value="channel_grants_revoked">Revogação ao alterar canal</option></select><button>Filtrar</button></form><div class="table-scroll"><table><thead><tr><th>Horário</th><th>Evento</th><th>Resultado</th><th>Ator</th><th>Canal</th><th>Usuário afetado</th><th>Permissões</th></tr></thead><tbody>{rows}</tbody></table></div>{next}"#
     ))

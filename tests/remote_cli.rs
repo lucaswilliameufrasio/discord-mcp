@@ -1948,7 +1948,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     .with_test_base(provider_url);
     let admin = admin_web::AdminConfig {
         auth: AuthState {
-            database_path: database,
+            database_path: database.clone(),
             encryption_key: key,
             resource: format!("{origin}/mcp"),
             metrics: Default::default(),
@@ -2190,6 +2190,185 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
             .status(),
         StatusCode::FORBIDDEN
     );
+    let audit_rows = store.recent_backup_audit().unwrap();
+    assert!(
+        audit_rows
+            .iter()
+            .any(|row| row.backup_id == "backup-1" && row.state == "confirmed")
+    );
+    assert!(
+        audit_rows
+            .iter()
+            .any(|row| row.backup_id == "backup-2" && row.state == "confirmed")
+    );
+    assert!(
+        audit_rows
+            .iter()
+            .any(|row| row.backup_id == "backup-2" && row.state == "unknown")
+    );
+    let audit_html = browser
+        .get(format!("{origin}/admin/backup-audit"))
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(audit_html.contains("backup-1") && audit_html.contains("unknown"));
+    assert!(!audit_html.contains("synthetic-token"));
+    assert_eq!(
+        browser
+            .get(format!("{origin}/admin/backup-audit"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    println!("PASS backup audit: confirmed and unknown results visible without credentials");
+    let sql = rusqlite::Connection::open(&database).unwrap();
+    let third: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
+        .json(&json!({"backup_id":"audit-failure", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let third_id = third["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", third_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    sql.execute_batch("CREATE TRIGGER synthetic_backup_finish_failure BEFORE UPDATE ON backup_audit BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    let third_execution = json!({"request_id":third_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&third_execution)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        s3.get_object()
+            .bucket(&bucket)
+            .key("service-backups/audit-failure.age")
+            .send()
+            .await
+            .is_ok()
+    );
+    assert!(
+        store
+            .recent_backup_audit()
+            .unwrap()
+            .iter()
+            .any(|row| row.backup_id == "audit-failure" && row.state == "started")
+    );
+    sql.execute_batch("DROP TRIGGER synthetic_backup_finish_failure")
+        .unwrap();
+    println!("PASS backup audit: lost result after upload leaves durable inconclusive intent");
+    let fourth: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
+        .json(&json!({"backup_id":"audit-start-failure", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let fourth_id = fourth["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", fourth_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    sql.execute_batch("CREATE TRIGGER synthetic_backup_start_failure BEFORE INSERT ON backup_audit BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    let fourth_execution = json!({"request_id":fourth_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&fourth_execution)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(
+        s3.get_object()
+            .bucket(&bucket)
+            .key("service-backups/audit-start-failure.age")
+            .send()
+            .await
+            .is_err()
+    );
+    sql.execute_batch("DROP TRIGGER synthetic_backup_start_failure")
+        .unwrap();
+    println!("PASS backup audit: failed intent prevents upload");
+    let lost: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
+        .json(&json!({"backup_id":"response-lost", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let lost_id = lost["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", lost_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let payload = json!({"request_id":lost_id,"verifier":hex::encode(verifier)}).to_string();
+    let mut socket = tokio::net::TcpStream::connect(
+        reqwest::Url::parse(&origin)
+            .unwrap()
+            .socket_addrs(|| None)
+            .unwrap()[0],
+    )
+    .await
+    .unwrap();
+    socket.write_all(format!("POST /v1/cli/execute HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).as_bytes()).await.unwrap();
+    let mut observed = false;
+    for _ in 0..100 {
+        let rows = store.recent_backup_audit().unwrap();
+        if rows.iter().any(|row| row.backup_id == "response-lost") {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        observed,
+        "service did not record intent before client disconnect"
+    );
+    drop(socket);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rows = store.recent_backup_audit().unwrap();
+    let state = &rows
+        .iter()
+        .find(|row| row.backup_id == "response-lost")
+        .unwrap()
+        .state;
+    assert!(["started", "confirmed", "unknown"].contains(&state.as_str()));
+    if state == "confirmed" {
+        assert!(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("service-backups/response-lost.age")
+                .send()
+                .await
+                .is_ok()
+        );
+    }
+    println!("PASS backup audit: client disconnect preserves state={state}");
     println!("PASS backup approval: denied before consent, wrong verifier denied, replay denied");
     println!(
         "PASS remote CLI consent -> service-owned encrypted backup -> Floci -> quarantined restore"

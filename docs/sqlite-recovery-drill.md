@@ -170,9 +170,29 @@ consentimento, upload Floci e recuperação em quarentena; também testa recusa
 antes de consentir, verificador errado, replay e duplicata. O binário de servidor
 usa o lock cooperativo já existente, mas o executor não impõe a propriedade do
 SQLite sozinho. Cancelamento ou resposta perdida pode deixar resultado remoto
-desconhecido. A operação não tem job durável nem evento de auditoria próprio;
-há I/O e criptografia síncronos no executor async. Sem resolver esses limites,
+desconhecido. A operação não tem job durável; há I/O e criptografia síncronos
+no executor async. Sem resolver esses limites,
 custódia, coordenação e política de recuperação, não usar em produção.
+
+Após a autorização ser consumida, o serviço grava em SQLite uma intenção
+`started` antes de iniciar qualquer upload. Se a gravação falhar, não faz upload.
+Registra `confirmed` somente quando o cliente S3 retorna sucesso e `unknown`
+para erros não classificados: não se presume que um erro signifique ausência
+do objeto. Se houver interrupção ou falha ao gravar o resultado, `started`
+permanece inconclusivo. Se a resposta HTTP se perder depois da confirmação,
+o registro pode estar `confirmed` mesmo que a CLI tenha relatado falha.
+O administrador autenticado consulta os 100 registros mais recentes em
+`/admin/backup-audit`. O registro contém ID de backup, ID do administrador,
+tempos, estado e ID interno da solicitação, sem credenciais, chaves, verificador
+ou corpo. IDs de backup são dados operacionais: não coloque segredos neles.
+
+Há limite de 10.000 registros e nenhuma remoção automática nessa tabela;
+ao atingi-lo novas tentativas são recusadas até existir uma política de retenção
+e manutenção aprovada. A cópia de snapshot pode conter o próprio registro ainda
+em `started`, pois a confirmação ocorre após a captura. A auditoria não é um
+job nem um protocolo de reconciliação; `started` e `unknown` exigem inspeção do
+objeto e não autorizam reenvio cego. Uma falha ao registrar resultado é sinalizada
+no processo, mas interrupção abrupta pode impedir aviso adicional.
 
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e

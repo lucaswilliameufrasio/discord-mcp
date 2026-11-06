@@ -126,6 +126,14 @@ pub struct AuditRow {
     pub can_send: Option<bool>,
 }
 
+#[cfg(feature = "encrypted-s3-backup")]
+pub struct BackupAuditRow {
+    pub backup_id: String,
+    pub actor_id: String,
+    pub started_at: i64,
+    pub state: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoveryInvalidations {
     pub permissions: usize,
@@ -382,7 +390,80 @@ impl ChannelStore {
             )
             .map_err(|_| StoreError::Storage)?;
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS recovery_control (id INTEGER PRIMARY KEY CHECK(id=1), quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)));").map_err(|_| StoreError::Storage)?;
+        #[cfg(feature = "encrypted-s3-backup")]
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_audit (request_id TEXT PRIMARY KEY NOT NULL, backup_id TEXT NOT NULL, actor_id TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, state TEXT NOT NULL CHECK(state IN ('started','confirmed','unknown')));").map_err(|_| StoreError::Storage)?;
         Ok(store)
+    }
+
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn begin_backup_audit(
+        &self,
+        request_id: &str,
+        backup_id: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        if request_id.len() != 64
+            || !request_id.bytes().all(|b| b.is_ascii_hexdigit())
+            || backup_id.is_empty()
+            || backup_id.len() > 64
+            || !backup_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        validate_audit(AuditActor::Discord(actor), now, self.audit_retention_days)?;
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        let count: i64 = transaction
+            .query_row("SELECT count(*) FROM backup_audit", [], |row| row.get(0))
+            .map_err(|_| StoreError::Storage)?;
+        if count >= 10000 {
+            return Err(StoreError::Storage);
+        }
+        let changed = transaction.execute("INSERT INTO backup_audit(request_id,backup_id,actor_id,started_at,state) SELECT ?1,?2,?3,?4,'started' WHERE NOT EXISTS (SELECT 1 FROM recovery_control WHERE id=1 AND quarantined=1)", params![request_id, backup_id, actor, now]).map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::RecoveryPending);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn finish_backup_audit(
+        &self,
+        request_id: &str,
+        confirmed: bool,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        if now < 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let state = if confirmed { "confirmed" } else { "unknown" };
+        let changed = self.db.execute("UPDATE backup_audit SET state=?2,finished_at=?3 WHERE request_id=?1 AND state='started'", params![request_id, state, now]).map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::Storage);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn recent_backup_audit(&self) -> Result<Vec<BackupAuditRow>, StoreError> {
+        let mut statement = self.db.prepare("SELECT backup_id,actor_id,started_at,state FROM backup_audit ORDER BY rowid DESC LIMIT 100").map_err(|_| StoreError::Storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(BackupAuditRow {
+                    backup_id: row.get(0)?,
+                    actor_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    state: row.get(3)?,
+                })
+            })
+            .map_err(|_| StoreError::Storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Storage)
     }
 
     pub fn recovery_quarantined(&self) -> Result<bool, StoreError> {
