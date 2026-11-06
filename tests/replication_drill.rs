@@ -201,6 +201,7 @@ async fn snapshot_and_restore_isolated_synthetic_wal_database() {
             .is_none()
     );
     let blocked = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
         .env("DISCORD_MCP_DB", &prepared)
         .env("DISCORD_MCP_KEY", hex::encode(key))
         .env_remove("DISCORD_WEBHOOK_URL")
@@ -209,7 +210,31 @@ async fn snapshot_and_restore_isolated_synthetic_wal_database() {
         .await
         .unwrap();
     assert!(!blocked.status.success());
-    quarantine.activate_recovered_copy().unwrap();
+    drop(quarantine);
+    let activation = timeout(
+        Duration::from_secs(10),
+        Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_DB", &prepared)
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .args(["recovery-activate", "--confirm"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(activation.status.success(), "synthetic activation failed");
+    let quarantine = ChannelStore::open(&prepared, &key).unwrap();
+    assert!(!quarantine.recovery_quarantined().unwrap());
+    assert_eq!(
+        quarantine
+            .audit_events(None, Some("recovery_activated"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(
         !quarantine
             .is_permitted("101", "support", ChannelAction::Read)
@@ -246,6 +271,7 @@ async fn snapshot_and_restore_isolated_synthetic_wal_database() {
 
     // Exercise the restored application without any valid outgoing message/read.
     let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
         .env("DISCORD_MCP_DB", &prepared)
         .env("DISCORD_MCP_KEY", hex::encode(key))
         .env_remove("DISCORD_WEBHOOK_URL")

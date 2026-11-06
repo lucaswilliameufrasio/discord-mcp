@@ -35,6 +35,17 @@ esse resultado não identifica uma árvore reproduzível nem qualifica uma vers�
 publicada. A duração é apenas do teste, não um RTO. O exercício confirma somente
 o cenário local sintético descrito, não perda de host ou recuperação operacional.
 
+Repetição em 2026-11-06, após as alterações de abertura e ativação: o teste
+passou em namespace de rede isolado com loopback próprio, usando o binário já
+disponível `target/replication-drill/debug/examples/snapshot-restore` (SHA-256
+`d4a75c6e46ca99c51d703ae4db6ad2a7a10ac7ff5514c187afd5b291d1a1b004`). O teste
+agora ativa a cópia pelo executável `recovery-activate --confirm`, com ambiente
+limpo, e verifica quarentena, auditoria, invalidação de autoridades e operação
+stdio limitada. O hash identifica o arquivo executado, **não comprova** sua
+origem, versão da biblioteca ou build reproduzível; o binário não foi
+recompilado nesta execução. Não foram usados dados ou serviços reais e isso não
+qualifica recuperação operacional nem captura incremental.
+
 ### Exercício opt-in S3 simulado
 
 `bash drills/s3/run.sh` compila um programa isolado contra os checkouts locais
