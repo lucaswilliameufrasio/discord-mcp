@@ -197,6 +197,64 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     // Exercise the application's reusable feature directly against Floci.
     let backup_identity = age::x25519::Identity::generate();
     let backup_recipient = backup_identity.to_public();
+    let executor = discord_mcp::encrypted_backup::ServiceBackup::new(
+        client.clone(),
+        "discord-mcp-synthetic-drill".to_owned(),
+        source.clone(),
+        directory.to_path_buf(),
+        backup_recipient.clone(),
+    )?;
+    assert!(executor.snapshot("../escape").await.is_err());
+    executor.snapshot("generation-1").await?;
+    assert!(executor.snapshot("generation-1").await.is_err());
+    let service_destination = directory.join("service-backup-restored.db");
+    let service_report = discord_mcp::encrypted_backup::restore_quarantined(
+        &client,
+        "discord-mcp-synthetic-drill",
+        "service-backups/generation-1.age",
+        &service_destination,
+        &backup_identity,
+        &key,
+        90,
+    )
+    .await?;
+    assert_eq!(
+        (
+            service_report.permissions,
+            service_report.tokens,
+            service_report.codes
+        ),
+        (0, 0, 1)
+    );
+    let service_store = ChannelStore::open(&service_destination, &key)?;
+    assert!(service_store.recovery_quarantined()?);
+    service_store.activate_recovered_copy()?;
+    assert!(!service_store.is_permitted("101", "support", ChannelAction::Read)?);
+    assert!(
+        service_store
+            .verify_access_token(&token, resource, 1001)?
+            .is_none()
+    );
+    assert_source_unchanged(&store, &token, resource);
+    println!(
+        "PASS service-owned executor: fixed destination, invalid ID, duplicate and quarantined restore"
+    );
+    let retry_executor = discord_mcp::encrypted_backup::ServiceBackup::new(
+        client.clone(),
+        "discord-mcp-retry-fixture".to_owned(),
+        source.clone(),
+        directory.to_path_buf(),
+        backup_recipient.clone(),
+    )?;
+    assert!(retry_executor.snapshot("after-failure").await.is_err());
+    assert_source_unchanged(&store, &token, resource);
+    client
+        .create_bucket()
+        .bucket("discord-mcp-retry-fixture")
+        .send()
+        .await?;
+    retry_executor.snapshot("after-failure").await?;
+    println!("PASS service-owned executor: failed upload releases admission for retry");
     println!("Starting reusable encrypted S3 upload");
     discord_mcp::encrypted_backup::upload_snapshot(
         &client,

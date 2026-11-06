@@ -146,6 +146,21 @@ permanece em quarentena até ativação explícita. Os comandos são uma interfa
 local de teste, não um cliente para S3 real nem administração remota mediada;
 custódia real e integração Ciphera não foram implementadas.
 
+`ServiceBackup` é um executor preparatório para o processo proprietário do
+banco: o cliente S3, bucket, caminho SQLite, staging e destinatário age são
+fixados no construtor; cada chamada só escolhe um identificador restrito sob
+`service-backups/`. Ele recusa simultaneidade na mesma instância e não mantém
+fila nem chave privada de recuperação. O teste Floci cobre ID inválido,
+repetição de objeto, falha de upload seguida de nova tentativa e recuperação
+em quarentena. Uma falha ou cancelamento de requisição pode ter resultado remoto
+desconhecido; a gravação condicional impede sobrescrita, não comprova que uma
+tentativa de resultado perdido não criou o objeto. Não há persistência de job.
+
+**O executor ainda não está ligado ao servidor HTTP, autenticação Discord,
+consentimento ou CLI remota.** Ele não impõe por si próprio propriedade do
+SQLite nem valida acesso do chamador; não deve ser exposto diretamente. O
+acionamento mediado e a custódia real continuam pendentes.
+
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
 ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci

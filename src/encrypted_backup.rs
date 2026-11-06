@@ -3,7 +3,7 @@
 use std::{
     fmt, fs,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -30,6 +30,64 @@ impl fmt::Display for BackupError {
 }
 
 impl std::error::Error for BackupError {}
+
+/// An executor intended to be owned by the service, not by remote clients.
+/// It does not authenticate callers or provide a durable job queue.
+pub struct ServiceBackup {
+    client: Client,
+    bucket: String,
+    source: PathBuf,
+    staging_parent: PathBuf,
+    recipient: Recipient,
+    admission: tokio::sync::Mutex<()>,
+}
+
+impl ServiceBackup {
+    pub fn new(
+        client: Client,
+        bucket: String,
+        source: PathBuf,
+        staging_parent: PathBuf,
+        recipient: Recipient,
+    ) -> Result<Self, BackupError> {
+        if bucket.is_empty() || bucket.len() > 63 {
+            return Err(BackupError);
+        }
+        private_dir(&staging_parent)?;
+        Ok(Self {
+            client,
+            bucket,
+            source,
+            staging_parent,
+            recipient,
+            admission: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// The ID selects only a new object under the fixed server-side prefix.
+    /// Cancellation or lost responses can leave the remote outcome unknown.
+    pub async fn snapshot(&self, id: &str) -> Result<(), BackupError> {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(BackupError);
+        }
+        let _permit = self.admission.try_lock().map_err(|_| BackupError)?;
+        let object = format!("service-backups/{id}.age");
+        upload_snapshot(
+            &self.client,
+            &self.bucket,
+            &object,
+            &self.source,
+            &self.staging_parent,
+            &self.recipient,
+        )
+        .await
+    }
+}
 
 fn private_dir(path: &Path) -> Result<(), BackupError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| BackupError)?;
@@ -206,4 +264,38 @@ pub async fn restore_quarantined(
     drop(file);
     prepare_restored_copy(&source, destination, application_key, retention_days)
         .map_err(|_| BackupError)
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_submission_is_rejected_without_queueing() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "fixture",
+            ))
+            .build();
+        let service = ServiceBackup::new(
+            Client::from_conf(config),
+            "fixture-bucket".into(),
+            directory.path().join("absent.db"),
+            directory.path().into(),
+            Identity::generate().to_public(),
+        )
+        .unwrap();
+        let guard = service.admission.lock().await;
+        assert!(service.snapshot("second").await.is_err());
+        drop(guard);
+        assert!(service.admission.try_lock().is_ok());
+    }
 }
