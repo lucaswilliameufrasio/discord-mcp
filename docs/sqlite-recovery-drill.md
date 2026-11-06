@@ -99,6 +99,24 @@ S3; o exercício não implementa nem comprova criptografia de backup ou custódi
 independente de chave. Não envie seus snapshots para armazenamento real com
 base nesta evidência.
 
+### Protótipo local de snapshot completo age
+
+O mesmo exercício agora também toma a imagem SQLite sintética já restaurada do
+snapshot online, cifra seus bytes integralmente com `age` 0.12.1 para uma
+identidade X25519 gerada no processo, envia um objeto separado ao Floci e o
+descarrega novamente. Chave errada, alteração do ciphertext e truncamento são
+rejeitados; a imagem autenticada é preparada em quarentena e ativada em destino
+isolado, sem restaurar permissões ou token. O fixture limita o SQLite a 8 MiB e
+o download a 9 MiB. A execução local passou em 0,311 s para o trecho medido.
+
+**Isto ainda não é backup operacional criptografado.** O exercício anterior no
+mesmo bucket também envia LTX sem criptografia integral; contém exclusivamente
+dados sintéticos. A identidade age só existe em memória no processo do teste,
+não há custódia independente, publicação imutável, interface de operação,
+integração Ciphera, limites de produção, política de retenção nem fluxo de backup
+criptografado ligado ao serviço. O arquivo de snapshot temporário é plaintext.
+O teste não demonstra compatibilidade ou segurança de nenhum provedor real.
+
 Execução local em 2026-11-05: `sqlite-replication` na revisão local
 `3553f91cce2535b4fbe521c6582bec64db94477d`, com alterações preexistentes em
 documentação e testes, e Discord MCP em `4dfdde4` mais o subprojeto deste

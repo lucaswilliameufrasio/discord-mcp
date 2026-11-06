@@ -1,5 +1,6 @@
 //! Synthetic Floci-only qualification. Refuses every non-loopback endpoint.
 use std::{
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
     path::Path,
     time::{Duration, Instant},
@@ -44,6 +45,22 @@ fn assert_no_destination(path: &Path) {
             "unexpected published destination or sidecar"
         );
     }
+}
+
+fn decrypt_fixture(
+    ciphertext: &[u8],
+    identity: &age::x25519::Identity,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let decryptor = age::Decryptor::new(ciphertext)?;
+    let reader = decryptor.decrypt(std::iter::once(identity as &dyn age::Identity))?;
+    let mut plaintext = Vec::new();
+    reader
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut plaintext)?;
+    if plaintext.len() > 8 * 1024 * 1024 {
+        return Err("synthetic snapshot exceeds fixture limit".into());
+    }
+    Ok(plaintext)
 }
 
 fn s3_config(address: SocketAddr) -> aws_sdk_s3::Config {
@@ -249,6 +266,85 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     );
     assert_eq!(std::fs::read(&protected)?, sentinel);
     restore_from_s3(&s3, "synthetic", &restored, RestoreTarget::Txid(1)).await?;
+    // Qualify an age-encrypted whole snapshot separately. The pre-existing LTX
+    // exercise above uploads plaintext and remains strictly synthetic.
+    let snapshot_bytes = std::fs::read(&restored)?;
+    assert!(snapshot_bytes.len() <= 8 * 1024 * 1024);
+    let recovery_identity = age::x25519::Identity::generate();
+    let recipient = recovery_identity.to_public();
+    let encryptor = age::Encryptor::with_recipients(std::iter::once(&recipient as _))?;
+    let mut ciphertext = Vec::new();
+    {
+        let mut writer = encryptor.wrap_output(&mut ciphertext)?;
+        writer.write_all(&snapshot_bytes)?;
+        writer.finish()?;
+    }
+    assert!(
+        !ciphertext
+            .windows(16)
+            .any(|part| part == b"SQLite format 3\0")
+    );
+    client
+        .put_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("encrypted/snapshot.age")
+        .body(ciphertext.clone().into())
+        .send()
+        .await?;
+    let object = client
+        .get_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("encrypted/snapshot.age")
+        .send()
+        .await?;
+    assert!(
+        object
+            .content_length()
+            .is_some_and(|n| n > 0 && n <= 9 * 1024 * 1024)
+    );
+    let mut downloaded = Vec::new();
+    object
+        .body
+        .into_async_read()
+        .take(9 * 1024 * 1024 + 1)
+        .read_to_end(&mut downloaded)
+        .await?;
+    assert!(downloaded.len() <= 9 * 1024 * 1024);
+    assert_eq!(downloaded, ciphertext);
+    assert!(decrypt_fixture(&downloaded, &age::x25519::Identity::generate()).is_err());
+    let mut corrupted = downloaded.to_vec();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 1;
+    assert!(decrypt_fixture(&corrupted, &recovery_identity).is_err());
+    assert!(decrypt_fixture(&downloaded[..downloaded.len() - 1], &recovery_identity).is_err());
+    let decrypted = decrypt_fixture(&downloaded, &recovery_identity)?;
+    assert_eq!(decrypted, snapshot_bytes);
+    let encrypted_restored = directory.join("encrypted-restored.db");
+    let encrypted_prepared = directory.join("encrypted-prepared.db");
+    std::fs::write(&encrypted_restored, &decrypted)?;
+    let encrypted_report =
+        prepare_restored_copy(&encrypted_restored, &encrypted_prepared, &key, 90)?;
+    assert_eq!(
+        (
+            encrypted_report.permissions,
+            encrypted_report.tokens,
+            encrypted_report.codes
+        ),
+        (1, 1, 1)
+    );
+    let encrypted_store = ChannelStore::open(&encrypted_prepared, &key)?;
+    assert!(encrypted_store.recovery_quarantined()?);
+    encrypted_store.activate_recovered_copy()?;
+    assert!(!encrypted_store.is_permitted("101", "support", ChannelAction::Read)?);
+    assert!(
+        encrypted_store
+            .verify_access_token(&token, resource, 1001)?
+            .is_none()
+    );
+    assert_source_unchanged(&store, &token, resource);
+    println!(
+        "PASS age encrypted snapshot via Floci: wrong key, tampering, truncation and isolated quarantine"
+    );
     // The S3 restore is not directly usable: preparation must verify the
     // independent application key before publishing a quarantined copy.
     let restored_before = std::fs::read(&restored)?;
