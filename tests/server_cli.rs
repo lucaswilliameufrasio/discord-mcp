@@ -112,6 +112,16 @@ async fn cli_starts_loopback_server_enforces_permissions_and_drains_on_term() {
         .args(["set-permission", "123", "alerts", "none"])
         .output()
         .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        assert!(!revoked.status.success());
+        // Simulate an uncooperative SQLite client to retain the independent
+        // MCP permission-revocation check; the process lock is advisory.
+        store
+            .set_permissions("123", "alerts", false, false)
+            .unwrap();
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(revoked.status.success());
     let response: Value = client.post(&resource).bearer_auth(&token)
         .header(reqwest::header::ACCEPT, "application/json, text/event-stream")

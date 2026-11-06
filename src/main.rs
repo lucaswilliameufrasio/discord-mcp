@@ -1,6 +1,8 @@
 use std::{io::Read, path::PathBuf};
 
 mod local_web;
+#[cfg(target_os = "linux")]
+mod process_guard;
 mod server;
 
 use discord_mcp::{
@@ -177,6 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let [command, source, destination] = args.as_slice()
         && command == "recovery-prepare"
     {
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(std::path::Path::new(source), true, false)?;
         let key = std::env::var("DISCORD_MCP_KEY").map_err(|_| "missing DISCORD_MCP_KEY")?;
         let key: [u8; 32] = hex::decode(key)?
             .try_into()
@@ -201,6 +205,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let storage = StorageConfig::from_environment()?;
+    // The lock is cooperative: it separates this program's remote and local
+    // processes, but does not confine other programs or protect replication.
+    #[cfg(target_os = "linux")]
+    let _guard = if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
+        None
+    } else if let Some(config) = &storage {
+        Some(process_guard::acquire(
+            &config.path,
+            args.as_slice() == ["serve"],
+            true,
+        )?)
+    } else {
+        None
+    };
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(

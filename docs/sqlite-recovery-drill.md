@@ -119,10 +119,14 @@ processo do serviço. `remote-set-permission` entra antes de carregar a
 configuração SQLite e usa HTTP; o teste `cli_real_router_discord_login_and_consent`
 exercita a CLI real e o roteador de produção com Discord sintético, inclusive
 expiração depois do consentimento mediante um hook compilado somente em testes.
-Já os comandos locais, o modo stdio e `web` continuam podendo abrir o mesmo
-caminho, assim como ferramentas externas com acesso ao arquivo e à chave.
-Nenhum mecanismo atual impõe que o processo HTTP seja o único proprietário do
-SQLite. A preparação de recuperação também opera diretamente em cópias e exige
+No Linux, processos do binário agora obtêm um lock consultivo no inode do banco:
+`serve` exige exclusividade e processos locais usam locks compartilhados. Um
+teste com processos reais verifica exclusão mútua, liberação e coexistência de
+duas instâncias stdio. A exclusividade é apenas cooperativa: SQLite aberto por
+outra ferramenta ignora o lock, a substituição do arquivo pode contorná-lo e
+outras plataformas não usam essa proteção. Portanto ela não impõe propriedade
+global nem permite liberar captura incremental. A preparação de recuperação
+também opera diretamente em cópias e exige
 manter a separação documentada entre cópia privada e banco ativo. Não tratar a
 mediação de uma operação como prova de exclusividade global.
 

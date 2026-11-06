@@ -55,6 +55,16 @@ proxy HTTPS configurado pelo operador, que preserve o `Host` público correto e
 proteja logs de URLs de callback, códigos OAuth, cookies e cabeçalhos de
 autorização. O proxy e sua configuração não são fornecidos aqui.
 
+No Linux, processos desta aplicação usam um lock consultivo no arquivo SQLite:
+`serve` exige exclusividade, enquanto múltiplas instâncias stdio e comandos
+locais podem coexistir. Outros processos desta aplicação recusam acesso enquanto
+`serve` está ativo, e vice-versa. O lock é liberado ao encerrar o processo.
+Ele **não é uma fronteira de segurança**: outras ferramentas SQLite podem
+ignorá-lo, processos com acesso ao diretório podem substituir o arquivo, e o
+mecanismo não é aplicado a outras plataformas. Restrinja arquivo, diretório e
+chave ao serviço por isolamento de sistema operacional adequado. Esse lock
+não habilita nem protege captura incremental ou recuperação operacional.
+
 Além de `DISCORD_MCP_DB` e `DISCORD_MCP_KEY`, configure:
 
 | Variável | Finalidade |
