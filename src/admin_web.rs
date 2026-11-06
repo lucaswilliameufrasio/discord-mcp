@@ -78,10 +78,40 @@ pub(crate) fn router_with_cli(
         .route("/admin/logout", post(logout))
         .route("/v1/cli/requests", post(cli_begin))
         .route("/v1/cli/list-requests", post(cli_begin_list))
+        .route("/v1/cli/permission-requests", post(cli_begin_permissions))
         .route("/v1/cli/execute", post(cli_execute))
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[derive(Deserialize)]
+struct CliBeginPermissions {
+    challenge: String,
+    channel: String,
+}
+
+async fn cli_begin_permissions(
+    State(app): State<Shared>,
+    Json(req): Json<CliBeginPermissions>,
+) -> Response {
+    let Ok(bytes) = hex::decode(req.challenge) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let Ok(challenge) = <[u8; 32]>::try_from(bytes) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let id = match app
+        .cli
+        .begin_show_permissions(req.channel, challenge, Instant::now())
+    {
+        Ok(id) => id,
+        Err("invalid operation") => return error(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id": id})).into_response();
+    headers(&mut response);
+    response
 }
 
 #[derive(Deserialize)]
@@ -162,6 +192,9 @@ async fn cli_consent(
             operation.send
         ),
         CliOperation::ListChannels => "Consultar nomes dos canais cadastrados".to_owned(),
+        CliOperation::ShowPermissions(channel) => {
+            format!("Consultar permissões do canal: {}", escape(&channel))
+        }
     };
     page(format!(
         "<h1>Autorizar solicitação da CLI</h1><p>{description}</p><form method=\"post\" action=\"/admin/cli\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Autorizar esta operação</button></form>",
@@ -209,6 +242,24 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                 Err(crate::channels::StoreError::RecoveryPending) => {
                     error(StatusCode::SERVICE_UNAVAILABLE)
                 }
+                Err(_) => {
+                    app.config.auth.audit.mark_failure();
+                    error(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            };
+        }
+        CliOperation::ShowPermissions(channel) => {
+            return match store(&app).and_then(|store| store.list_active_permissions(&channel)) {
+                Ok(permissions) => {
+                    let mut response =
+                        Json(rmcp::serde_json::json!({"permissions": permissions})).into_response();
+                    headers(&mut response);
+                    response
+                }
+                Err(crate::channels::StoreError::RecoveryPending) => {
+                    error(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                Err(crate::channels::StoreError::NotFound) => error(StatusCode::NOT_FOUND),
                 Err(_) => {
                     app.config.auth.audit.mark_failure();
                     error(StatusCode::INTERNAL_SERVER_ERROR)

@@ -29,6 +29,15 @@ pub struct PermissionChange {
 pub enum CliOperation {
     PermissionChange(PermissionChange),
     ListChannels,
+    ShowPermissions(String),
+}
+
+fn valid_channel(channel: &str) -> bool {
+    !channel.is_empty()
+        && channel.len() <= 64
+        && channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 struct Entry {
@@ -60,12 +69,7 @@ impl CliAuthorizations {
         if operation.user_id.is_empty()
             || operation.user_id.len() > 20
             || !operation.user_id.bytes().all(|b| b.is_ascii_digit())
-            || operation.channel.is_empty()
-            || operation.channel.len() > 64
-            || !operation
-                .channel
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !valid_channel(&operation.channel)
         {
             return Err("invalid operation");
         }
@@ -74,6 +78,18 @@ impl CliAuthorizations {
 
     pub fn begin_list(&self, challenge: [u8; 32], now: Instant) -> Result<String, &'static str> {
         self.begin_operation(CliOperation::ListChannels, challenge, now)
+    }
+
+    pub fn begin_show_permissions(
+        &self,
+        channel: String,
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        if !valid_channel(&channel) {
+            return Err("invalid operation");
+        }
+        self.begin_operation(CliOperation::ShowPermissions(channel), challenge, now)
     }
 
     fn begin_operation(

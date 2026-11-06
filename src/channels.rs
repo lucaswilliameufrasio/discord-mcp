@@ -24,6 +24,7 @@ pub enum ChannelAction {
     Send,
 }
 
+#[derive(serde::Serialize)]
 pub struct ChannelPermission {
     pub user_id: String,
     pub can_read: bool,
@@ -837,6 +838,21 @@ impl ChannelStore {
             .map_err(|_| StoreError::Storage)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| StoreError::Storage)
+    }
+
+    /// Read recovery state, channel existence and permissions in one snapshot.
+    pub fn list_active_permissions(
+        &self,
+        channel: &str,
+    ) -> Result<Vec<ChannelPermission>, StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let permissions = self.list_permissions(channel)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(permissions)
     }
 
     /// One SQLite statement provides a consistent point-in-time view.

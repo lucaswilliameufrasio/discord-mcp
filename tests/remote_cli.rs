@@ -111,7 +111,7 @@ async fn cli_real_router_discord_login_and_consent() {
     .with_test_base(provider_base);
     let config = admin_web::AdminConfig {
         auth: AuthState {
-            database_path: database,
+            database_path: database.clone(),
             encryption_key: key,
             resource: format!("{origin}/mcp"),
             metrics: Default::default(),
@@ -447,6 +447,240 @@ async fn cli_real_router_discord_login_and_consent() {
             .unwrap()
             .status(),
         StatusCode::NOT_FOUND
+    );
+    let mut permission_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &forbidden_db)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-show-permissions", &origin, "alerts"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut permission_stderr = BufReader::new(permission_cli.stderr.take().unwrap());
+    let mut permission_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        permission_stderr.read_line(&mut permission_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let permission_url =
+        reqwest::Url::parse(permission_line.split_whitespace().last().unwrap()).unwrap();
+    let permission_id = permission_url
+        .query_pairs()
+        .find(|(k, _)| k == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let html = browser
+        .get(permission_url)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Consultar permissões do canal: alerts"));
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &permission_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    permission_cli
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .await
+        .unwrap();
+    let output = timeout(Duration::from_secs(10), permission_cli.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "101\tread=true\tsend=false\n"
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &permission_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let missing: Value = browser
+        .post(format!("{origin}/v1/cli/permission-requests"))
+        .json(&json!({"channel":"missing","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let missing_id = missing["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", missing_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":missing_id,"verifier":hex::encode(verifier)}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let request: Value = browser
+        .post(format!("{origin}/v1/cli/permission-requests"))
+        .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request_id = request["request_id"].as_str().unwrap();
+    let execute_permissions = |proof: String| {
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":request_id,"verifier":proof}))
+    };
+    assert_eq!(
+        execute_permissions(hex::encode(verifier))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let expired: Value = browser
+        .post(format!("{origin}/v1/cli/permission-requests"))
+        .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expired_permission_id = expired["request_id"].as_str().unwrap();
+    cli_requests.expire_for_test(expired_permission_id);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", expired_permission_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", request_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        execute_permissions(hex::encode([74_u8; 32]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = execute_permissions(hex::encode(verifier))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body["permissions"],
+        json!([{"user_id":"101","can_read":true,"can_send":false}])
+    );
+    assert_eq!(
+        execute_permissions(hex::encode(verifier))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let request: Value = browser
+        .post(format!("{origin}/v1/cli/permission-requests"))
+        .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let quarantine_id = request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", quarantine_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":quarantine_id,"verifier":hex::encode(verifier)}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
     assert!(!forbidden_db.exists());
     service.abort();

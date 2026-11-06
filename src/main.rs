@@ -173,13 +173,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let [command, origin, user, channel, permission] = args.as_slice()
         && command == "remote-set-permission"
     {
-        remote_operation(origin, Some((user, channel, permission))).await?;
+        remote_operation(
+            origin,
+            RemoteOperation::SetPermission(user, channel, permission),
+        )
+        .await?;
         return Ok(());
     }
     if let [command, origin] = args.as_slice()
         && command == "remote-list-channels"
     {
-        remote_operation(origin, None).await?;
+        remote_operation(origin, RemoteOperation::ListChannels).await?;
+        return Ok(());
+    }
+    if let [command, origin, channel] = args.as_slice()
+        && command == "remote-show-permissions"
+    {
+        remote_operation(origin, RemoteOperation::ShowPermissions(channel)).await?;
         return Ok(());
     }
     if let [command, source, destination] = args.as_slice()
@@ -228,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
@@ -325,9 +335,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum RemoteOperation<'a> {
+    SetPermission(&'a str, &'a str, &'a str),
+    ListChannels,
+    ShowPermissions(&'a str),
+}
+
 async fn remote_operation(
     origin: &str,
-    permission_change: Option<(&str, &str, &str)>,
+    operation: RemoteOperation<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use sha2::{Digest, Sha256};
     use std::time::Duration;
@@ -355,23 +372,28 @@ async fn remote_operation(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()?;
-    let (endpoint, body) = if let Some((user, channel, permission)) = permission_change {
-        let (read, send) = match permission {
-            "none" => (false, false),
-            "read" => (true, false),
-            "send" => (false, true),
-            "both" => (true, true),
-            _ => return Err("permission must be none, read, send or both".into()),
-        };
-        (
-            "/v1/cli/requests",
-            rmcp::serde_json::json!({"user_id":user,"channel":channel,"read":read,"send":send,"challenge":challenge}),
-        )
-    } else {
-        (
+    let (endpoint, body) = match operation {
+        RemoteOperation::SetPermission(user, channel, permission) => {
+            let (read, send) = match permission {
+                "none" => (false, false),
+                "read" => (true, false),
+                "send" => (false, true),
+                "both" => (true, true),
+                _ => return Err("permission must be none, read, send or both".into()),
+            };
+            (
+                "/v1/cli/requests",
+                rmcp::serde_json::json!({"user_id":user,"channel":channel,"read":read,"send":send,"challenge":challenge}),
+            )
+        }
+        RemoteOperation::ListChannels => (
             "/v1/cli/list-requests",
             rmcp::serde_json::json!({"challenge":challenge}),
-        )
+        ),
+        RemoteOperation::ShowPermissions(channel) => (
+            "/v1/cli/permission-requests",
+            rmcp::serde_json::json!({"channel":channel,"challenge":challenge}),
+        ),
     };
     let response = client
         .post(url.join(endpoint)?)
@@ -397,22 +419,47 @@ async fn remote_operation(
         .json(&rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)}))
         .send()
         .await?;
-    if permission_change.is_some() {
-        if response.status() != reqwest::StatusCode::NO_CONTENT {
-            return Err("authorization denied, expired, consumed or operation failed".into());
+    match operation {
+        RemoteOperation::SetPermission(..) => {
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err("authorization denied, expired, consumed or operation failed".into());
+            }
+            eprintln!("Channel permissions updated by remote service.");
         }
-        eprintln!("Channel permissions updated by remote service.");
-    } else {
-        if response.status() != reqwest::StatusCode::OK {
-            return Err("authorization denied, expired, consumed or operation failed".into());
+        RemoteOperation::ListChannels => {
+            if response.status() != reqwest::StatusCode::OK {
+                return Err("authorization denied, expired, consumed or operation failed".into());
+            }
+            #[derive(serde::Deserialize)]
+            struct Channels {
+                channels: Vec<String>,
+            }
+            let result: Channels = response.json().await?;
+            for channel in result.channels {
+                println!("{channel}");
+            }
         }
-        #[derive(serde::Deserialize)]
-        struct Channels {
-            channels: Vec<String>,
-        }
-        let result: Channels = response.json().await?;
-        for channel in result.channels {
-            println!("{channel}");
+        RemoteOperation::ShowPermissions(_) => {
+            if response.status() != reqwest::StatusCode::OK {
+                return Err("authorization denied, expired, consumed or operation failed".into());
+            }
+            #[derive(serde::Deserialize)]
+            struct Permission {
+                user_id: String,
+                can_read: bool,
+                can_send: bool,
+            }
+            #[derive(serde::Deserialize)]
+            struct Permissions {
+                permissions: Vec<Permission>,
+            }
+            let result: Permissions = response.json().await?;
+            for permission in result.permissions {
+                println!(
+                    "{}\tread={}\tsend={}",
+                    permission.user_id, permission.can_read, permission.can_send
+                );
+            }
         }
     }
     Ok(())

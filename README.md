@@ -120,6 +120,12 @@ Essa é uma autorização distinta, também de uso único: ela não concede
 permissão para alterar canais nem retorna tokens, webhooks ou credenciais. A
 consulta é recusada se o banco estiver em quarentena.
 
+Para consultar as concessões de um canal específico, use
+`discord-mcp remote-show-permissions ORIGEM CANAL` e confirme a consulta no
+navegador. O consentimento é limitado ao canal informado e não autoriza
+alterações; a saída contém IDs Discord e permissões de leitura e envio. Um
+canal inexistente ou um banco em quarentena produz erro, não uma lista vazia.
+
 Em `/admin/observability`, a conta administradora pode consultar as últimas 24
 horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
 envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,
