@@ -1,6 +1,7 @@
 pub mod admin_web;
 pub mod bot;
 pub mod channels;
+pub mod cli_authorization;
 pub mod discord_login;
 pub mod http_auth;
 pub mod http_mcp;
