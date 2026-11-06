@@ -79,3 +79,95 @@ fn permission_revisions_serialize_per_channel_and_detect_aba() {
         Err(StoreError::AuthorizationDenied)
     ));
 }
+
+#[test]
+fn exhausted_revision_rejects_permission_changes_atomically() {
+    use discord_mcp::channels::{ChannelAction, current_timestamp};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exhausted.db");
+    let key = [80_u8; 32];
+    let store = ChannelStore::open(&path, &key).unwrap();
+    store.put_bot("alerts", "123", "synthetic-token").unwrap();
+    store.put_bot("other", "456", "synthetic-token").unwrap();
+    store.set_permissions("101", "alerts", true, false).unwrap();
+    let external = rusqlite::Connection::open(&path).unwrap();
+    external
+        .execute(
+            "UPDATE channel_permission_revisions SET revision=?1 WHERE channel_name='alerts'",
+            [i64::MAX - 1],
+        )
+        .unwrap();
+    let (version, revision) = store.permission_context("alerts").unwrap();
+    assert_eq!(revision, i64::MAX - 1);
+    let audit_context = || AuditContext {
+        actor: AuditActor::Discord("123"),
+        now: current_timestamp().unwrap(),
+        retention_days: 90,
+    };
+    store
+        .set_permissions_audited_if_version(
+            "101",
+            "alerts",
+            true,
+            false,
+            audit_context(),
+            (version.unwrap(), revision),
+        )
+        .unwrap();
+    assert_eq!(store.permission_context("alerts").unwrap().1, i64::MAX);
+    let audit_before = store
+        .audit_events(None, Some("permission_change"), 100)
+        .unwrap()
+        .len();
+    for (read, send) in [(false, true), (false, false)] {
+        assert!(matches!(
+            store.set_permissions("101", "alerts", read, send),
+            Err(StoreError::Storage)
+        ));
+        assert!(matches!(
+            store.set_permissions_audited_if_version(
+                "101",
+                "alerts",
+                read,
+                send,
+                audit_context(),
+                (version.unwrap(), i64::MAX)
+            ),
+            Err(StoreError::Storage)
+        ));
+    }
+    assert!(
+        store
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_permitted("101", "alerts", ChannelAction::Send)
+            .unwrap()
+    );
+    let revision: (i64, String) = external.query_row("SELECT revision, typeof(revision) FROM channel_permission_revisions WHERE channel_name='alerts'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(revision, (i64::MAX, "integer".to_owned()));
+    assert_eq!(
+        store
+            .audit_events(None, Some("permission_change"), 100)
+            .unwrap()
+            .len(),
+        audit_before
+    );
+    store.set_permissions("102", "other", true, false).unwrap();
+    assert!(
+        store
+            .is_permitted("102", "other", ChannelAction::Read)
+            .unwrap()
+    );
+    drop(store);
+    let reopened = ChannelStore::open(&path, &key).unwrap();
+    assert_eq!(reopened.permission_context("alerts").unwrap().1, i64::MAX);
+    assert!(
+        reopened
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+}

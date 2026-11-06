@@ -138,6 +138,13 @@ O lock consultivo não protege contra esse cliente; o controle concorrente
 depende de todos os escritores usarem a aplicação atual e de um limite de
 acesso apropriado no sistema operacional.
 
+O teste sintético `exhausted_revision_rejects_permission_changes_atomically`
+confirma que a revisão pode chegar ao máximo de INTEGER do SQLite, mas não é
+incrementada além dele: alterações e revogações subsequentes, com ou sem
+comparação otimista, falham sem modificar concessões ou auditar sucesso. Outro
+canal continua operável. O teste não estabelece procedimento operacional para
+recuperar um canal cuja revisão esteja esgotada.
+
 O teste `invalid_revision_blocks_admin_form_and_approved_real_cli` exercita o
 roteador administrativo e a CLI executável com Discord sintético: após abrir
 o formulário e aprovar a CLI, um cliente SQLite escreve revisão negativa em
