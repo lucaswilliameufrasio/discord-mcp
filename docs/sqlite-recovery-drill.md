@@ -90,6 +90,15 @@ para reproduzir o resultado.
 
 ### Falhas sintéticas — 2026-11-05
 
+O teste local `corrupt_channel_ciphertext_rejects_staged_restore_without_touching_source`
+qualifica separadamente a verificação de credenciais do preparo offline: em um
+banco sintético com dois canais, substitui o ciphertext de um deles mantendo o
+`integrity_check` do SQLite válido. Com a chave correta, a preparação retorna
+`InvalidKeyOrData`, não publica destino nem sidecars, remove o staging normal e
+preserva byte a byte a fonte; o outro canal e sua permissão seguem acessíveis.
+Esse teste não exercita queda brusca, fonte ativa, perda de chave ou recuperação
+de infraestrutura e não demonstra disponibilidade de backups reais.
+
 Duas execuções adicionais incluíram prefixos exclusivos com o manifesto presente
 mas LTX ausente, e com o mesmo manifesto mais LTX truncado. Cada restore retornou
 erro e não publicou banco nem sidecars no destino. Em outro cenário, um endpoint

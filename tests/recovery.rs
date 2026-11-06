@@ -220,6 +220,69 @@ fn failures_never_publish_or_overwrite_the_destination() {
 }
 
 #[test]
+fn corrupt_channel_ciphertext_rejects_staged_restore_without_touching_source() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let source = dir.path().join("source.db");
+    let destination = dir.path().join("prepared.db");
+    let key = [148; 32];
+    let store = ChannelStore::open(&source, &key).unwrap();
+    store.put_bot("valid", "123", "synthetic-token").unwrap();
+    store.put_bot("damaged", "456", "synthetic-token").unwrap();
+    store.set_permissions("101", "valid", true, false).unwrap();
+    drop(store);
+    {
+        let db = rusqlite::Connection::open(&source).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE channels SET ciphertext=zeroblob(length(ciphertext)) WHERE name='damaged'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    let baseline = std::fs::read(&source).unwrap();
+    assert!(matches!(
+        prepare_restored_copy(&source, &destination, &key, 90),
+        Err(discord_mcp::recovery::RecoveryError::InvalidKeyOrData)
+    ));
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), baseline);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!dir.path().join(format!("prepared.db{suffix}")).exists());
+    }
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".discord-mcp-recovery-")
+    }));
+    let source_store = ChannelStore::open(&source, &key).unwrap();
+    assert!(
+        source_store
+            .is_permitted("101", "valid", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(source_store.get_channel("valid").is_ok());
+    assert!(matches!(
+        source_store.get_channel("damaged"),
+        Err(StoreError::Decryption)
+    ));
+}
+
+#[test]
 fn refuses_missing_key_marker_triggers_and_source_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]
