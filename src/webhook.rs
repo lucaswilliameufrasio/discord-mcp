@@ -9,6 +9,13 @@ use rmcp::serde_json::json;
 pub struct WebhookUrl(Url);
 
 impl WebhookUrl {
+    /// Public Discord webhook identifier, without the secret token.
+    pub fn id(&self) -> &str {
+        self.0
+            .path_segments()
+            .and_then(|mut segments| segments.nth(2))
+            .expect("validated webhook URL")
+    }
     pub fn parse(value: &str) -> Result<Self, WebhookError> {
         let url = Url::parse(value).map_err(|_| WebhookError::InvalidWebhook)?;
         let segments: Vec<_> = url

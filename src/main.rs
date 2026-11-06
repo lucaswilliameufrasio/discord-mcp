@@ -1,4 +1,7 @@
-use std::{io::Read, path::PathBuf};
+use std::{
+    io::{BufRead, IsTerminal, Read},
+    path::PathBuf,
+};
 
 mod local_web;
 #[cfg(target_os = "linux")]
@@ -192,6 +195,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         remote_operation(origin, RemoteOperation::ShowPermissions(channel)).await?;
         return Ok(());
     }
+    if let [command, origin, channel] = args.as_slice()
+        && command == "remote-add-webhook"
+    {
+        if std::io::stdin().is_terminal() {
+            return Err(
+                "provide the webhook on a protected non-terminal stdin, not as an argument".into(),
+            );
+        }
+        let mut input = String::new();
+        std::io::stdin().lock().take(4097).read_line(&mut input)?;
+        if input.len() > 4096 || !input.ends_with('\n') {
+            return Err("invalid webhook input".into());
+        }
+        let webhook = input.trim_end_matches(['\r', '\n']);
+        remote_operation(origin, RemoteOperation::RegisterWebhook(channel, webhook)).await?;
+        return Ok(());
+    }
     if let [command, source, destination] = args.as_slice()
         && command == "recovery-prepare"
     {
@@ -238,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
@@ -340,6 +360,7 @@ enum RemoteOperation<'a> {
     SetPermission(&'a str, &'a str, &'a str),
     ListChannels,
     ShowPermissions(&'a str),
+    RegisterWebhook(&'a str, &'a str),
 }
 
 async fn remote_operation(
@@ -394,6 +415,13 @@ async fn remote_operation(
             "/v1/cli/permission-requests",
             rmcp::serde_json::json!({"channel":channel,"challenge":challenge}),
         ),
+        RemoteOperation::RegisterWebhook(channel, webhook) => {
+            let parsed = WebhookUrl::parse(webhook)?;
+            (
+                "/v1/cli/webhook-requests",
+                rmcp::serde_json::json!({"channel":channel,"webhook_id":parsed.id(),"commitment":hex::encode(Sha256::digest(webhook.as_bytes())),"challenge":challenge}),
+            )
+        }
     };
     let response = client
         .post(url.join(endpoint)?)
@@ -413,10 +441,16 @@ async fn remote_operation(
         "Abra no navegador, entre com Discord e autorize a operação: {consent}\nDepois pressione Enter nesta CLI."
     );
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    if std::io::stdin().read_line(&mut input)? == 0 {
+        return Err("confirmation input closed before authorization".into());
+    }
+    let mut execution = rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)});
+    if let RemoteOperation::RegisterWebhook(_, webhook) = operation {
+        execution["webhook"] = webhook.into();
+    }
     let response = client
         .post(url.join("/v1/cli/execute")?)
-        .json(&rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)}))
+        .json(&execution)
         .send()
         .await?;
     match operation {
@@ -460,6 +494,12 @@ async fn remote_operation(
                     permission.user_id, permission.can_read, permission.can_send
                 );
             }
+        }
+        RemoteOperation::RegisterWebhook(..) => {
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err("authorization denied, expired, consumed or operation failed".into());
+            }
+            eprintln!("Webhook channel configured by remote service.");
         }
     }
     Ok(())

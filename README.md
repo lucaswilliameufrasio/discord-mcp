@@ -126,6 +126,26 @@ navegador. O consentimento é limitado ao canal informado e não autoriza
 alterações; a saída contém IDs Discord e permissões de leitura e envio. Um
 canal inexistente ou um banco em quarentena produz erro, não uma lista vazia.
 
+Para cadastrar ou substituir um webhook remotamente, use
+`discord-mcp remote-add-webhook ORIGEM CANAL`. Forneça a URL em uma linha por
+stdin protegido **não conectado a um terminal**; mantenha o stdin aberto para
+enviar uma segunda linha após o consentimento. Por exemplo, em um shell POSIX,
+com um arquivo privado contendo a URL e uma quebra de linha:
+
+```sh
+{ cat /caminho/privado/webhook; read -r _ </dev/tty; printf '\n'; } | discord-mcp remote-add-webhook https://servidor.exemplo CANAL
+```
+
+Abra o link exibido, entre como administrador, reabra o link, confira o nome e
+o ID do webhook e autorize; então pressione Enter. Substituir um canal revoga
+suas permissões anteriores. A credencial é enviada ao serviço no corpo HTTPS
+após o Enter na CLI, nunca na URL, nos argumentos ou no consentimento; se o
+administrador ainda não tiver autorizado, o serviço recusará a operação.
+Quando armazenada, a credencial é cifrada no banco. O proxy não deve registrar
+corpos de requisições. Uma
+falha ou perda da resposta após consumo exige verificar o estado e a auditoria
+antes de tentar novamente. Esse comando cadastra webhook, não token de bot.
+
 Em `/admin/observability`, a conta administradora pode consultar as últimas 24
 horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
 envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,

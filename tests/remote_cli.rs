@@ -18,7 +18,7 @@ use tokio::{
 
 // Compile the production router and Discord client with their existing
 // cfg(test) provider injection; no provider override is enabled in production.
-pub use discord_mcp::{channels, http_auth};
+pub use discord_mcp::{channels, http_auth, webhook};
 #[path = "../src/admin_web.rs"]
 mod admin_web;
 #[path = "../src/cli_authorization.rs"]
@@ -558,6 +558,110 @@ async fn cli_real_router_discord_login_and_consent() {
             .status(),
         StatusCode::NOT_FOUND
     );
+    let synthetic_webhook = "https://discord.com/api/webhooks/888/synthetic-secret";
+    let mut register = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &forbidden_db)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-add-webhook", &origin, "new_channel"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    register
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{synthetic_webhook}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut register_stderr = BufReader::new(register.stderr.take().unwrap());
+    let mut register_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        register_stderr.read_line(&mut register_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!register_line.contains("synthetic-secret"));
+    let register_url =
+        reqwest::Url::parse(register_line.split_whitespace().last().unwrap()).unwrap();
+    let register_id = register_url
+        .query_pairs()
+        .find(|(k, _)| k == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let html = browser
+        .get(register_url)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("new_channel") && html.contains("888") && html.contains("revoga"));
+    assert!(!html.contains("synthetic-secret"));
+    assert!(!store.list().unwrap().contains(&"new_channel".to_owned()));
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &register_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    register
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .await
+        .unwrap();
+    let output = timeout(Duration::from_secs(10), register.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-secret"));
+    assert!(
+        store.get_webhook("new_channel").unwrap()
+            == webhook::WebhookUrl::parse(synthetic_webhook).unwrap()
+    );
+    let audit = store
+        .audit_events(None, Some("channel_configured"), 10)
+        .unwrap();
+    assert!(audit.iter().any(|entry| entry.actor_kind == "discord"
+        && entry.actor_id.as_deref() == Some("123")
+        && entry.channel.as_deref() == Some("new_channel")));
+    let db_bytes = std::fs::read(&database).unwrap();
+    assert!(
+        !db_bytes
+            .windows("synthetic-secret".len())
+            .any(|part| part == b"synthetic-secret")
+    );
+    let ciphertext: Vec<u8> = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT ciphertext FROM channels WHERE name='new_channel'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !ciphertext
+            .windows("synthetic-secret".len())
+            .any(|part| part == b"synthetic-secret")
+    );
+    assert!(!forbidden_db.exists());
     let request: Value = browser
         .post(format!("{origin}/v1/cli/permission-requests"))
         .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
@@ -580,6 +684,95 @@ async fn cli_real_router_discord_login_and_consent() {
             .unwrap()
             .status(),
         StatusCode::FORBIDDEN
+    );
+    store
+        .put_bot("replace_me", "123", "synthetic-token")
+        .unwrap();
+    store
+        .set_permissions("102", "replace_me", true, false)
+        .unwrap();
+    let request: Value = browser.post(format!("{origin}/v1/cli/webhook-requests"))
+        .json(&json!({"channel":"replace_me","webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let replacement_id = request["request_id"].as_str().unwrap();
+    let replacement_payload = json!({"request_id":replacement_id,"verifier":hex::encode(verifier),"webhook":synthetic_webhook});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&replacement_payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", replacement_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":replacement_id,"verifier":hex::encode(verifier),"webhook":"https://discord.com/api/webhooks/888/different-synthetic"})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&replacement_payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        store
+            .is_permitted("102", "replace_me", ChannelAction::Read)
+            .unwrap()
+    );
+    let request: Value = browser.post(format!("{origin}/v1/cli/webhook-requests"))
+        .json(&json!({"channel":"replace_me","webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let replacement_id = request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", replacement_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let payload = json!({"request_id":replacement_id,"verifier":hex::encode(verifier),"webhook":synthetic_webhook});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        !store
+            .is_permitted("102", "replace_me", ChannelAction::Read)
+            .unwrap()
     );
     let expired: Value = browser
         .post(format!("{origin}/v1/cli/permission-requests"))
@@ -682,6 +875,23 @@ async fn cli_real_router_discord_login_and_consent() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    let quarantined_webhook: Value = browser.post(format!("{origin}/v1/cli/webhook-requests"))
+        .json(&json!({"channel":"quarantined","webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let quarantined_webhook_id = quarantined_webhook["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", quarantined_webhook_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":quarantined_webhook_id,"verifier":hex::encode(verifier),"webhook":synthetic_webhook})).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!store.list().unwrap().contains(&"quarantined".to_owned()));
     assert!(!forbidden_db.exists());
     service.abort();
     provider_task.abort();

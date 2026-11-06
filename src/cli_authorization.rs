@@ -30,6 +30,11 @@ pub enum CliOperation {
     PermissionChange(PermissionChange),
     ListChannels,
     ShowPermissions(String),
+    RegisterWebhook {
+        channel: String,
+        webhook_id: String,
+        commitment: [u8; 32],
+    },
 }
 
 fn valid_channel(channel: &str) -> bool {
@@ -90,6 +95,32 @@ impl CliAuthorizations {
             return Err("invalid operation");
         }
         self.begin_operation(CliOperation::ShowPermissions(channel), challenge, now)
+    }
+
+    pub fn begin_register_webhook(
+        &self,
+        channel: String,
+        webhook_id: String,
+        commitment: [u8; 32],
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        if !valid_channel(&channel)
+            || webhook_id.is_empty()
+            || webhook_id.len() > 20
+            || !webhook_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err("invalid operation");
+        }
+        self.begin_operation(
+            CliOperation::RegisterWebhook {
+                channel,
+                webhook_id,
+                commitment,
+            },
+            challenge,
+            now,
+        )
     }
 
     fn begin_operation(

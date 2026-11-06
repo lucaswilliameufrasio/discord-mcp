@@ -384,15 +384,28 @@ impl ChannelStore {
 
     pub fn put_webhook(&self, name: &str, url: &str) -> Result<(), StoreError> {
         WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
-        self.put_secret(name, url)
+        self.put_secret(name, url, AuditActor::LocalOperator)
     }
 
     pub fn put_bot(&self, name: &str, channel_id: &str, token: &str) -> Result<(), StoreError> {
         let bot = BotChannel::new(channel_id, token).ok_or(StoreError::InvalidInput)?;
-        self.put_secret(name, &bot.encode())
+        self.put_secret(name, &bot.encode(), AuditActor::LocalOperator)
     }
 
-    fn put_secret(&self, name: &str, url: &str) -> Result<(), StoreError> {
+    pub fn put_webhook_as_discord(
+        &self,
+        name: &str,
+        url: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        if !valid_user_id(actor) {
+            return Err(StoreError::InvalidInput);
+        }
+        WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
+        self.put_secret(name, url, AuditActor::Discord(actor))
+    }
+
+    fn put_secret(&self, name: &str, url: &str, actor: AuditActor<'_>) -> Result<(), StoreError> {
         if name.is_empty()
             || name.len() > 64
             || !name
@@ -433,7 +446,7 @@ impl ChannelStore {
                 self.audit_retention_days,
                 "channel_grants_revoked",
                 "success",
-                AuditActor::LocalOperator,
+                actor,
                 Some(name),
                 None,
                 None,
@@ -446,7 +459,7 @@ impl ChannelStore {
             self.audit_retention_days,
             "channel_configured",
             "success",
-            AuditActor::LocalOperator,
+            actor,
             Some(name),
             None,
             None,
