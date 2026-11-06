@@ -296,6 +296,14 @@ de auditoria indica a observação, mas não muda `started` ou `unknown`. O regi
 do objeto, autenticação do servidor, decriptação ou recuperabilidade. Não há
 aprovação para excluir registros ou objetos e nenhuma limpeza automática.
 
+O exercício Floci também cria um segundo snapshot online **após** registrar
+essa evidência, restaura-o em um novo caminho e compara todos os campos da
+observação histórica com a origem. A tentativa restaurada permanece `unknown`,
+a cópia permanece em quarentena e uma permissão, um token e um código sintéticos
+são invalidados. O teste compara a evidência original e os dois objetos antes e
+depois e verifica a integridade SQLite. Isso qualifica apenas esse cenário local;
+o primeiro snapshot, anterior à observação, não pode conter essa evidência.
+
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
 ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci

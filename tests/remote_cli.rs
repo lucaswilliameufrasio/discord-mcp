@@ -3629,6 +3629,122 @@ async fn lost_put_response_authorized_comparison_with_floci() {
         audit_html.contains("Ciphertext coincidente observado")
             && audit_html.contains("não comprova recuperação")
     );
+    // The first snapshot predates the observation. Capture a second online
+    // snapshot after it, with active synthetic authority to invalidate.
+    let resource = "https://example.invalid/mcp";
+    let token = store.issue_access_token("101", resource, 1000, 60).unwrap();
+    let _code = store
+        .issue_authorization_code(
+            &channels::AuthorizationGrant {
+                user_id: "101",
+                client_id: "fixture",
+                redirect_uri: "http://127.0.0.1:8765/callback",
+                resource,
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            },
+            1000,
+        )
+        .unwrap();
+    let evidence_query = "SELECT observed_at,actor_id,target_fingerprint,ciphertext_sha256,byte_length FROM backup_reconciliation_evidence WHERE request_id=?1";
+    let original_evidence: (i64, String, Vec<u8>, Vec<u8>, i64) = audit_db
+        .query_row(evidence_query, [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap();
+    encrypted_backup::upload_snapshot(
+        &s3,
+        &bucket,
+        "recovery/with-evidence.age",
+        &dir.path().join("service.db"),
+        dir.path(),
+        &identity.to_public(),
+    )
+    .await
+    .unwrap();
+    let second_before = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("recovery/with-evidence.age")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let restored_path = dir.path().join("evidence-restored.db");
+    let report = encrypted_backup::restore_quarantined(
+        &s3,
+        &bucket,
+        "recovery/with-evidence.age",
+        &restored_path,
+        &identity,
+        &key,
+        90,
+    )
+    .await
+    .unwrap();
+    assert_eq!((report.permissions, report.tokens, report.codes), (1, 1, 1));
+    let restored_store = ChannelStore::open_recovery_copy(&restored_path, &key).unwrap();
+    assert!(restored_store.recovery_quarantined().unwrap());
+    assert!(matches!(
+        restored_store.list_active(),
+        Err(channels::StoreError::RecoveryPending)
+    ));
+    let historical = restored_store.recent_backup_audit().unwrap();
+    let restored_attempt = historical.iter().find(|row| row.request_id == id).unwrap();
+    assert_eq!(restored_attempt.state, "unknown");
+    assert_eq!(restored_attempt.evidence_at, Some(original_evidence.0));
+    assert_eq!(restored_attempt.evidence_actor.as_deref(), Some("123"));
+    let restored_db = rusqlite::Connection::open_with_flags(
+        &restored_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let recovered_evidence: (i64, String, Vec<u8>, Vec<u8>, i64) = restored_db
+        .query_row(evidence_query, [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap();
+    assert_eq!(original_evidence, recovered_evidence);
+    let remaining: (i64,i64,i64) = restored_db.query_row("SELECT (SELECT count(*) FROM channel_permissions),(SELECT count(*) FROM mcp_access_tokens),(SELECT count(*) FROM mcp_authorization_codes)", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(remaining, (0, 0, 0));
+    assert_eq!(
+        restored_db
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert!(
+        store
+            .verify_access_token(&token, resource, 1001)
+            .unwrap()
+            .is_some()
+    );
+    let source_after: (i64, String, Vec<u8>, Vec<u8>, i64) = audit_db
+        .query_row(evidence_query, [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap();
+    assert_eq!(original_evidence, source_after);
+    assert_eq!(
+        second_before,
+        s3.get_object()
+            .bucket(&bucket)
+            .key("recovery/with-evidence.age")
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+    );
+    println!(
+        "PASS later Floci snapshot restores reconciliation evidence unchanged, stays quarantined and invalidates permissions, tokens and codes"
+    );
     println!(
         "PASS explicit authorized evidence: one recorded observation, original outcome unknown"
     );
