@@ -63,6 +63,210 @@ async fn browser_login(browser: &reqwest::Client, origin: &str) -> reqwest::Resp
 }
 
 #[tokio::test]
+async fn invalid_revision_blocks_admin_form_and_approved_real_cli() {
+    use axum::http::header;
+    use discord_mcp::channels::{ChannelAction, ChannelStore};
+    use discord_mcp::http_auth::AuthState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("service.db");
+    let cli_database = dir.path().join("cli.db");
+    let key = [83_u8; 32];
+    let initial = ChannelStore::open(&database, &key).unwrap();
+    initial.put_bot("alerts", "123", "synthetic-token").unwrap();
+    initial
+        .set_permissions("101", "alerts", true, false)
+        .unwrap();
+    drop(initial);
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer.execute_batch("DROP TABLE channel_permission_revisions; CREATE TABLE channel_permission_revisions (channel_name TEXT PRIMARY KEY NOT NULL REFERENCES channels(name) ON DELETE CASCADE, revision INTEGER NOT NULL); INSERT INTO channel_permission_revisions VALUES ('alerts', 3);").unwrap();
+    let store = ChannelStore::open(&database, &key).unwrap();
+    let provider = Router::new()
+        .route(
+            "/api/oauth2/token",
+            post(|| async { Json(json!({"access_token":"synthetic","token_type":"Bearer"})) }),
+        )
+        .route(
+            "/api/v10/users/@me",
+            axum::routing::get(|| async { Json(json!({"id":"123","username":"Admin"})) }),
+        );
+    let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_url = reqwest::Url::parse(&format!(
+        "http://{}/",
+        provider_listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let provider_task =
+        tokio::spawn(async move { axum::serve(provider_listener, provider).await.unwrap() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let discord = discord_login::DiscordLoginClient::new(
+        "123",
+        "synthetic-secret",
+        &format!("{origin}/admin/discord/callback"),
+    )
+    .unwrap()
+    .with_test_base(provider_url);
+    let config = admin_web::AdminConfig {
+        auth: AuthState {
+            database_path: database.clone(),
+            encryption_key: key,
+            resource: format!("{origin}/mcp"),
+            metrics: Default::default(),
+            audit: Default::default(),
+        },
+        public_origin: origin.clone(),
+        admin_user_id: "123".into(),
+        discord,
+    };
+    let service = tokio::spawn(async move {
+        axum::serve(listener, admin_web::router(config).unwrap())
+            .await
+            .unwrap()
+    });
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let login = browser_login(&browser, &origin).await;
+    assert_eq!(login.status(), StatusCode::SEE_OTHER);
+    let session = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let page = browser
+        .get(format!("{origin}/admin/channel?name=alerts"))
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = page.text().await.unwrap();
+    let extract = |name: &str| {
+        html.split(&format!("name=\"{name}\" value=\""))
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let version = extract("version");
+    let revision = extract("revision");
+
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &cli_database)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-set-permission", &origin, "101", "alerts", "send"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(cli.stderr.take().unwrap());
+    let mut line = String::new();
+    timeout(Duration::from_secs(10), stderr.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let consent = reqwest::Url::parse(line.split_whitespace().last().unwrap()).unwrap();
+    let id = consent
+        .query_pairs()
+        .find(|(key, _)| key == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let audit_before: i64 = writer.query_row("SELECT count(*) FROM audit_events WHERE event_type='permission_change' AND outcome='success'", [], |row| row.get(0)).unwrap();
+    writer
+        .execute(
+            "UPDATE channel_permission_revisions SET revision=-1 WHERE channel_name='alerts'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        browser
+            .get(format!("{origin}/admin/channel?name=alerts"))
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let form = [
+        ("channel", "alerts"),
+        ("user_id", "101"),
+        ("permission", "send"),
+        ("version", version.as_str()),
+        ("revision", revision.as_str()),
+    ];
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/permissions"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&form)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    cli.stdin.take().unwrap().write_all(b"\n").await.unwrap();
+    assert!(
+        !timeout(Duration::from_secs(10), cli.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!cli_database.exists());
+    assert!(
+        store
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_permitted("101", "alerts", ChannelAction::Send)
+            .unwrap()
+    );
+    let audit_after: i64 = writer.query_row("SELECT count(*) FROM audit_events WHERE event_type='permission_change' AND outcome='success'", [], |row| row.get(0)).unwrap();
+    assert_eq!(audit_after, audit_before);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    service.abort();
+    provider_task.abort();
+}
+
+#[tokio::test]
 async fn cli_real_router_discord_login_and_consent() {
     use axum::http::header;
     use discord_mcp::channels::{ChannelAction, ChannelStore};

@@ -138,6 +138,14 @@ O lock consultivo não protege contra esse cliente; o controle concorrente
 depende de todos os escritores usarem a aplicação atual e de um limite de
 acesso apropriado no sistema operacional.
 
+O teste `invalid_revision_blocks_admin_form_and_approved_real_cli` exercita o
+roteador administrativo e a CLI executável com Discord sintético: após abrir
+o formulário e aprovar a CLI, um cliente SQLite escreve revisão negativa em
+uma tabela sem `CHECK`. O formulário falha com HTTP 500, a CLI falha sem abrir
+seu próprio banco e as concessões e auditorias de sucesso permanecem iguais.
+Os handlers abrem novas conexões, logo esse teste inclui a validação de abertura;
+o teste de armazenamento com conexão mantida aberta cobre o caso ativo separado.
+
 O exercício filesystem opt-in passou usando o binário já existente em
 `target/replication-drill/debug/examples/snapshot-restore`. Sua proveniência
 não está fixada: o resultado não comprova build reproduzível da biblioteca,
