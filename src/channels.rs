@@ -1553,6 +1553,104 @@ mod token_snapshot_tests {
     }
 
     #[test]
+    fn invalid_revision_committed_before_write_reservation_is_rejected() {
+        use super::{AuditActor, AuditContext, ChannelAction, StoreError, current_timestamp};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic-invalid-revision.db");
+        let key = [147; 32];
+        let initial = ChannelStore::open(&path, &key).unwrap();
+        initial.put_bot("alerts", "123", "synthetic-token").unwrap();
+        initial
+            .set_permissions("101", "alerts", true, false)
+            .unwrap();
+        drop(initial);
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("DROP TABLE channel_permission_revisions; CREATE TABLE channel_permission_revisions (channel_name TEXT PRIMARY KEY NOT NULL REFERENCES channels(name) ON DELETE CASCADE, revision INTEGER NOT NULL); INSERT INTO channel_permission_revisions VALUES ('alerts', 1);").unwrap();
+        let store = ChannelStore::open(&path, &key).unwrap();
+        let (version, revision) = store.permission_context("alerts").unwrap();
+        let prior_audit = store
+            .audit_events(None, Some("permission_change"), 100)
+            .unwrap()
+            .len();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut barrier = Box::new(TraceBarrier {
+                entered: entered_tx,
+                resume: resume_rx,
+                prefix: b"BEGIN IMMEDIATE",
+            });
+            // SAFETY: this thread owns the connection and callback context;
+            // tracing is removed before the context is dropped.
+            let handle = unsafe { store.db.handle() };
+            let registered = unsafe {
+                ffi::sqlite3_trace_v2(
+                    handle,
+                    ffi::SQLITE_TRACE_STMT,
+                    Some(pause_token_statement),
+                    (&mut *barrier as *mut TraceBarrier).cast(),
+                )
+            };
+            assert_eq!(registered, ffi::SQLITE_OK);
+            let result = store.set_permissions_audited_if_version(
+                "101",
+                "alerts",
+                false,
+                true,
+                AuditContext {
+                    actor: AuditActor::Discord("123"),
+                    now: current_timestamp().unwrap(),
+                    retention_days: 90,
+                },
+                (version.unwrap(), revision),
+            );
+            let removed = unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+            assert_eq!(removed, ffi::SQLITE_OK);
+            (store, result)
+        });
+        // Trace fires before stepping BEGIN IMMEDIATE, so the other connection
+        // can commit the injected corruption before the reservation is acquired.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE; UPDATE channel_permission_revisions SET revision=-1 WHERE channel_name='alerts'; COMMIT;").unwrap();
+        let committed: i64 = writer
+            .query_row(
+                "SELECT revision FROM channel_permission_revisions WHERE channel_name='alerts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, -1);
+        resume_tx.send(()).unwrap();
+        let (store, result) = worker.join().unwrap();
+        assert!(matches!(result, Err(StoreError::Storage)));
+        assert!(
+            store
+                .is_permitted("101", "alerts", ChannelAction::Read)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_permitted("101", "alerts", ChannelAction::Send)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .audit_events(None, Some("permission_change"), 100)
+                .unwrap()
+                .len(),
+            prior_audit
+        );
+        let remaining: i64 = writer
+            .query_row(
+                "SELECT revision FROM channel_permission_revisions WHERE channel_name='alerts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, -1);
+    }
+
+    #[test]
     fn permission_transaction_serializes_competing_revision_writer() {
         use super::{AuditActor, AuditContext, ChannelAction, current_timestamp};
         let dir = tempfile::tempdir().unwrap();

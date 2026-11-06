@@ -155,6 +155,13 @@ conexão consegue escrever depois do commit: essa evidência comprova serializa�
 da transação testada, não exclusividade nem proteção contra alterações externas
 posteriores. A pausa e o trace existem apenas no teste e não no runtime.
 
+O teste `invalid_revision_committed_before_write_reservation_is_rejected` cobre
+a ordem inversa: uma tabela sintética sem `CHECK` é corrompida e confirmada por
+outra conexão enquanto a operação real está pausada imediatamente antes de
+executar `BEGIN IMMEDIATE`. Após retomar, a operação recusa a revisão negativa,
+preserva as permissões e não adiciona auditoria de sucesso. O teste não presume
+que o banco esteja protegido contra escritores não cooperativos.
+
 O exercício filesystem opt-in passou usando o binário já existente em
 `target/replication-drill/debug/examples/snapshot-restore`. Sua proveniência
 não está fixada: o resultado não comprova build reproduzível da biblioteca,
