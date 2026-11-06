@@ -557,12 +557,69 @@ impl ChannelStore {
     }
 
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
+        self.delete_checked(name, None, AuditActor::LocalOperator)
+    }
+
+    /// Identify the exact encrypted record, without returning its credential.
+    pub fn channel_version(&self, name: &str) -> Result<Option<[u8; 32]>, StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let version = self.channel_version_in_snapshot(name)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(version)
+    }
+
+    fn channel_version_in_snapshot(&self, name: &str) -> Result<Option<[u8; 32]>, StoreError> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT nonce, ciphertext FROM channels WHERE name=?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        Ok(row.map(|(nonce, ciphertext)| {
+            let mut digest = Sha256::new();
+            digest.update(nonce);
+            digest.update(ciphertext);
+            digest.finalize().into()
+        }))
+    }
+
+    pub fn delete_as_discord_if_version(
+        &self,
+        name: &str,
+        version: [u8; 32],
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        if !valid_user_id(actor) {
+            return Err(StoreError::InvalidInput);
+        }
+        self.delete_checked(name, Some(version), AuditActor::Discord(actor))
+    }
+
+    fn delete_checked(
+        &self,
+        name: &str,
+        version: Option<[u8; 32]>,
+        actor: AuditActor<'_>,
+    ) -> Result<(), StoreError> {
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
+        if let Some(expected) = version {
+            let current = self.channel_version_in_snapshot(name)?;
+            if current != Some(expected) {
+                return Err(StoreError::AuthorizationDenied);
+            }
+        }
         let grants: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM channel_permissions WHERE channel_name=?1",
@@ -582,7 +639,7 @@ impl ChannelStore {
                 self.audit_retention_days,
                 "channel_grants_revoked",
                 "success",
-                AuditActor::LocalOperator,
+                actor,
                 Some(name),
                 None,
                 None,
@@ -594,7 +651,7 @@ impl ChannelStore {
             self.audit_retention_days,
             "channel_deleted",
             "success",
-            AuditActor::LocalOperator,
+            actor,
             Some(name),
             None,
             None,

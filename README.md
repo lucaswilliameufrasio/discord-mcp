@@ -157,6 +157,14 @@ registra o administrador Discord na auditoria; o proxy não deve registrar
 corpos de requisição. O cadastro não verifica o token nem as permissões do bot
 no Discord: isso exige validação posterior no ambiente autorizado.
 
+Para remover a configuração local de um canal e revogar suas concessões, use
+`discord-mcp remote-delete-channel ORIGEM CANAL` e confirme a exclusão no
+navegador. A operação não exclui o canal no Discord. A autorização é de uso
+único e vinculada à versão do registro existente no início da solicitação: se o
+canal for substituído antes da execução, a exclusão é recusada e será preciso
+iniciar outra solicitação. A exclusão e a revogação são auditadas na mesma
+transação. Em caso de resposta perdida, confira o estado antes de tentar outra vez.
+
 Em `/admin/observability`, a conta administradora pode consultar as últimas 24
 horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
 envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,

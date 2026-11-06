@@ -81,10 +81,54 @@ pub(crate) fn router_with_cli(
         .route("/v1/cli/permission-requests", post(cli_begin_permissions))
         .route("/v1/cli/webhook-requests", post(cli_begin_webhook))
         .route("/v1/cli/bot-requests", post(cli_begin_bot))
+        .route("/v1/cli/delete-requests", post(cli_begin_delete))
         .route("/v1/cli/execute", post(cli_execute))
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[derive(Deserialize)]
+struct CliBeginDelete {
+    channel: String,
+    challenge: String,
+}
+
+async fn cli_begin_delete(State(app): State<Shared>, Json(req): Json<CliBeginDelete>) -> Response {
+    let Ok(challenge) = hex::decode(&req.challenge)
+        .and_then(|v| <[u8; 32]>::try_from(v).map_err(|_| hex::FromHexError::InvalidStringLength))
+    else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    if req.channel.is_empty()
+        || req.channel.len() > 64
+        || !req
+            .channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return error(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let version = match store(&app).and_then(|store| store.channel_version(&req.channel)) {
+        Ok(version) => version,
+        Err(crate::channels::StoreError::RecoveryPending) => {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(_) => {
+            app.config.auth.audit.mark_failure();
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let id = match app
+        .cli
+        .begin_delete(req.channel, version, challenge, Instant::now())
+    {
+        Ok(id) => id,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id":id})).into_response();
+    headers(&mut response);
+    response
 }
 
 #[derive(Deserialize)]
@@ -288,6 +332,10 @@ async fn cli_consent(
             escape(&channel),
             escape(&discord_channel_id)
         ),
+        CliOperation::DeleteChannel { channel, .. } => format!(
+            "Excluir canal: {}<br>A credencial local e todas as permissões deste canal serão removidas. Isso não exclui o canal no Discord.",
+            escape(&channel)
+        ),
     };
     page(format!(
         "<h1>Autorizar solicitação da CLI</h1><p>{description}</p><form method=\"post\" action=\"/admin/cli\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Autorizar esta operação</button></form>",
@@ -428,6 +476,26 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                     error(StatusCode::INTERNAL_SERVER_ERROR)
                 }
                 Err(_) => error(StatusCode::UNPROCESSABLE_ENTITY),
+            };
+        }
+        CliOperation::DeleteChannel { channel, version } => {
+            let Some(version) = version else {
+                return error(StatusCode::NOT_FOUND);
+            };
+            return match store(&app).and_then(|store| {
+                store.delete_as_discord_if_version(&channel, version, &app.config.admin_user_id)
+            }) {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::channels::StoreError::AuthorizationDenied) => {
+                    error(StatusCode::CONFLICT)
+                }
+                Err(crate::channels::StoreError::RecoveryPending) => {
+                    error(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                Err(_) => {
+                    app.config.auth.audit.mark_failure();
+                    error(StatusCode::INTERNAL_SERVER_ERROR)
+                }
             };
         }
     };

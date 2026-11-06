@@ -1045,6 +1045,276 @@ async fn cli_real_router_discord_login_and_consent() {
         body["permissions"],
         json!([{"user_id":"101","can_read":true,"can_send":false}])
     );
+    store
+        .put_bot("delete_me", "444", "synthetic-token")
+        .unwrap();
+    store
+        .set_permissions("104", "delete_me", true, false)
+        .unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/delete-requests"))
+            .json(
+                &json!({"channel":"../invalid","challenge":hex::encode(Sha256::digest(verifier))})
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let mut delete_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &forbidden_db)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-delete-channel", &origin, "delete_me"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut delete_stderr = BufReader::new(delete_cli.stderr.take().unwrap());
+    let mut delete_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        delete_stderr.read_line(&mut delete_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let delete_url = reqwest::Url::parse(delete_line.split_whitespace().last().unwrap()).unwrap();
+    let delete_id = delete_url
+        .query_pairs()
+        .find(|(k, _)| k == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let html = browser
+        .get(delete_url)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("Excluir canal: delete_me") && html.contains("não exclui o canal no Discord")
+    );
+    assert!(
+        store
+            .is_permitted("104", "delete_me", ChannelAction::Read)
+            .unwrap()
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &delete_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    delete_cli
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(10), delete_cli.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!store.list().unwrap().contains(&"delete_me".to_owned()));
+    let audit = store
+        .audit_events(None, Some("channel_deleted"), 20)
+        .unwrap();
+    assert!(audit.iter().any(|entry| entry.actor_kind == "discord"
+        && entry.actor_id.as_deref() == Some("123")
+        && entry.channel.as_deref() == Some("delete_me")));
+    let audit = store
+        .audit_events(None, Some("channel_grants_revoked"), 20)
+        .unwrap();
+    assert!(audit.iter().any(
+        |entry| entry.actor_kind == "discord" && entry.channel.as_deref() == Some("delete_me")
+    ));
+    store
+        .put_bot("delete_second", "444", "synthetic-token")
+        .unwrap();
+    let second: Value = browser
+        .post(format!("{origin}/v1/cli/delete-requests"))
+        .json(&json!({"channel":"delete_second","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_id = second["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", second_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":second_id,"verifier":hex::encode([74_u8; 32])}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let second_payload = json!({"request_id":second_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&second_payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&second_payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let missing: Value = browser
+        .post(format!("{origin}/v1/cli/delete-requests"))
+        .json(&json!({"channel":"missing","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let missing_id = missing["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", missing_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":missing_id,"verifier":hex::encode(verifier)}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let expired: Value = browser
+        .post(format!("{origin}/v1/cli/delete-requests"))
+        .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expired_id = expired["request_id"].as_str().unwrap();
+    cli_requests.expire_for_test(expired_id);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", expired_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let request: Value = browser
+        .post(format!("{origin}/v1/cli/delete-requests"))
+        .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let changed_id = request["request_id"].as_str().unwrap();
+    let payload = json!({"request_id":changed_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", changed_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    store
+        .put_bot("alerts", "555", "replacement-synthetic")
+        .unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(store.list().unwrap().contains(&"alerts".to_owned()));
+    assert!(!forbidden_db.exists());
     assert_eq!(
         execute_permissions(hex::encode(verifier))
             .send()
@@ -1075,6 +1345,28 @@ async fn cli_real_router_discord_login_and_consent() {
             .status(),
         StatusCode::OK
     );
+    let pending_delete: Value = browser
+        .post(format!("{origin}/v1/cli/delete-requests"))
+        .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pending_delete_id = pending_delete["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", pending_delete_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     rusqlite::Connection::open(&database)
         .unwrap()
         .execute(
@@ -1092,6 +1384,17 @@ async fn cli_real_router_discord_login_and_consent() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":pending_delete_id,"verifier":hex::encode(verifier)}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(store.list().unwrap().contains(&"alerts".to_owned()));
     let quarantined_webhook: Value = browser.post(format!("{origin}/v1/cli/webhook-requests"))
         .json(&json!({"channel":"quarantined","webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
     let quarantined_webhook_id = quarantined_webhook["request_id"].as_str().unwrap();

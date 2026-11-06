@@ -40,6 +40,10 @@ pub enum CliOperation {
         discord_channel_id: String,
         commitment: [u8; 32],
     },
+    DeleteChannel {
+        channel: String,
+        version: Option<[u8; 32]>,
+    },
 }
 
 fn valid_channel(channel: &str) -> bool {
@@ -149,6 +153,23 @@ impl CliAuthorizations {
                 discord_channel_id,
                 commitment,
             },
+            challenge,
+            now,
+        )
+    }
+
+    pub fn begin_delete(
+        &self,
+        channel: String,
+        version: Option<[u8; 32]>,
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        if !valid_channel(&channel) {
+            return Err("invalid operation");
+        }
+        self.begin_operation(
+            CliOperation::DeleteChannel { channel, version },
             challenge,
             now,
         )

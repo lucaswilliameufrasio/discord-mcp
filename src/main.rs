@@ -195,6 +195,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         remote_operation(origin, RemoteOperation::ShowPermissions(channel)).await?;
         return Ok(());
     }
+    if let [command, origin, channel] = args.as_slice()
+        && command == "remote-delete-channel"
+    {
+        remote_operation(origin, RemoteOperation::DeleteChannel(channel)).await?;
+        return Ok(());
+    }
     if let [command, origin, channel, discord_channel_id] = args.as_slice()
         && command == "remote-add-bot"
     {
@@ -264,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|remote-add-bot ORIGIN CHANNEL DISCORD_CHANNEL_ID|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|remote-add-bot ORIGIN CHANNEL DISCORD_CHANNEL_ID|remote-delete-channel ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
@@ -382,6 +388,7 @@ enum RemoteOperation<'a> {
     ShowPermissions(&'a str),
     RegisterWebhook(&'a str, &'a str),
     RegisterBot(&'a str, &'a str, &'a str),
+    DeleteChannel(&'a str),
 }
 
 async fn remote_operation(
@@ -451,6 +458,10 @@ async fn remote_operation(
                 rmcp::serde_json::json!({"channel":channel,"discord_channel_id":discord_channel_id,"commitment":hex::encode(Sha256::digest(token.as_bytes())),"challenge":challenge}),
             )
         }
+        RemoteOperation::DeleteChannel(channel) => (
+            "/v1/cli/delete-requests",
+            rmcp::serde_json::json!({"channel":channel,"challenge":challenge}),
+        ),
     };
     let response = client
         .post(url.join(endpoint)?)
@@ -538,6 +549,15 @@ async fn remote_operation(
                 return Err("authorization denied, expired, consumed or operation failed".into());
             }
             eprintln!("Bot channel configured by remote service.");
+        }
+        RemoteOperation::DeleteChannel(..) => {
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err(
+                    "authorization denied, expired, consumed, channel changed or operation failed"
+                        .into(),
+                );
+            }
+            eprintln!("Local channel configuration deleted by remote service.");
         }
     }
     Ok(())
