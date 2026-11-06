@@ -108,7 +108,7 @@ async fn invalid_revision_blocks_admin_form_and_approved_real_cli() {
         &format!("{origin}/admin/discord/callback"),
     )
     .unwrap()
-    .with_test_base(provider_url);
+    .with_test_base(provider_url.clone());
     let config = admin_web::AdminConfig {
         auth: AuthState {
             database_path: database.clone(),
@@ -1911,8 +1911,8 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     store.set_permissions("101", "alerts", true, false).unwrap();
     let identity = age::x25519::Identity::generate();
     let executor = Arc::new(
-        encrypted_backup::ServiceBackup::new(
-            s3.clone(),
+        encrypted_backup::ServiceBackup::new_floci(
+            address,
             bucket.clone(),
             database.clone(),
             dir.path().into(),
@@ -1920,6 +1920,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         )
         .unwrap(),
     );
+    let binding = executor.destination_binding();
     let provider = Router::new()
         .route(
             "/api/oauth2/token",
@@ -1945,7 +1946,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         &format!("{origin}/admin/discord/callback"),
     )
     .unwrap()
-    .with_test_base(provider_url);
+    .with_test_base(provider_url.clone());
     let admin = admin_web::AdminConfig {
         auth: AuthState {
             database_path: database.clone(),
@@ -2275,7 +2276,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         investigation.contains("Objeto encontrado")
             && investigation.contains("integridade, origem e recuperação não foram verificadas")
     );
-    assert!(investigation.contains("O destino pode ter mudado"));
+    assert!(investigation.contains("não autentica a identidade do servidor"));
     assert!(
         store
             .recent_backup_audit()
@@ -2290,6 +2291,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
             "absent-fixture",
             "123",
             discord_mcp::channels::current_timestamp().unwrap(),
+            &binding,
         )
         .unwrap();
     store
@@ -2311,6 +2313,113 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         .await
         .unwrap();
     assert!(missing.contains("Objeto não encontrado"));
+    let other_bucket = format!("discord-mcp-other-{}", std::process::id());
+    s3.create_bucket()
+        .bucket(&other_bucket)
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket(&other_bucket)
+        .key("service-backups/backup-2.age")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"other destination object",
+        ))
+        .send()
+        .await
+        .unwrap();
+    let other = encrypted_backup::ServiceBackup::new_floci(
+        address,
+        other_bucket,
+        database.clone(),
+        dir.path().into(),
+        identity.to_public(),
+    )
+    .unwrap();
+    let alternate_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let alternate_origin = format!("http://{}", alternate_listener.local_addr().unwrap());
+    let alternate_discord = discord_login::DiscordLoginClient::new(
+        "123",
+        "synthetic-secret",
+        &format!("{alternate_origin}/admin/discord/callback"),
+    )
+    .unwrap()
+    .with_test_base(provider_url);
+    let alternate_config = admin_web::AdminConfig {
+        auth: AuthState {
+            database_path: database.clone(),
+            encryption_key: key,
+            resource: format!("{alternate_origin}/mcp"),
+            metrics: Default::default(),
+            audit: Default::default(),
+        },
+        public_origin: alternate_origin.clone(),
+        admin_user_id: "123".into(),
+        discord: alternate_discord,
+        backup: Some(Arc::new(other)),
+    };
+    let alternate_task = tokio::spawn(async move {
+        axum::serve(
+            alternate_listener,
+            admin_web::router(alternate_config).unwrap(),
+        )
+        .await
+        .unwrap()
+    });
+    let alternate_login = browser_login(&browser, &alternate_origin).await;
+    let alternate_session = alternate_login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mismatch = browser
+        .post(format!("{alternate_origin}/admin/backup-investigate"))
+        .header(header::COOKIE, &alternate_session)
+        .header(header::ORIGIN, &alternate_origin)
+        .form(&[("request_id", duplicate_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        mismatch.contains("destino configurado diverge")
+            && mismatch.contains("Nenhuma consulta ao armazenamento")
+    );
+    alternate_task.abort();
+    let binding_sql = rusqlite::Connection::open(&database).unwrap();
+    binding_sql
+        .execute(
+            "DELETE FROM backup_target_binding WHERE request_id=?1",
+            [&missing_id],
+        )
+        .unwrap();
+    let legacy = browser
+        .post(format!("{origin}/admin/backup-investigate"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", &missing_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        legacy.contains("Registro antigo sem vínculo")
+            && legacy.contains("Nenhuma consulta ao armazenamento")
+    );
+    assert!(
+        store
+            .recent_backup_audit()
+            .unwrap()
+            .iter()
+            .any(|row| row.request_id == missing_id && row.state == "unknown")
+    );
+    println!("PASS investigation refuses different Floci bucket and legacy unbound record");
     let corrupt_id = "b".repeat(64);
     store
         .begin_backup_audit(
@@ -2318,6 +2427,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
             "corrupt-fixture",
             "123",
             discord_mcp::channels::current_timestamp().unwrap(),
+            &binding,
         )
         .unwrap();
     store

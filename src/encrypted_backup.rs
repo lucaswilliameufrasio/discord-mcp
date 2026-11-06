@@ -3,6 +3,7 @@
 use std::{
     fmt, fs,
     io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -46,10 +47,14 @@ pub struct ServiceBackup {
     source: PathBuf,
     staging_parent: PathBuf,
     recipient: Recipient,
+    binding: [u8; 32],
     admission: tokio::sync::Mutex<()>,
 }
 
 impl ServiceBackup {
+    pub fn destination_binding(&self) -> [u8; 32] {
+        self.binding
+    }
     /// Observe only the currently configured bucket; this does not verify the
     /// object, bind it to an attempt, or prove that a pending PUT has finished.
     pub async fn observe(&self, id: &str) -> ObjectObservation {
@@ -81,23 +86,49 @@ impl ServiceBackup {
     pub fn destination_description(&self) -> (String, String) {
         (self.bucket.clone(), self.recipient.to_string())
     }
-    pub fn new(
-        client: Client,
+    pub fn new_floci(
+        address: SocketAddr,
         bucket: String,
         source: PathBuf,
         staging_parent: PathBuf,
         recipient: Recipient,
     ) -> Result<Self, BackupError> {
-        if bucket.is_empty() || bucket.len() > 63 {
+        if address.ip() != Ipv4Addr::LOCALHOST
+            || address.port() == 0
+            || bucket.is_empty()
+            || bucket.len() > 63
+        {
             return Err(BackupError);
         }
         private_dir(&staging_parent)?;
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"discord-mcp-floci-target-v1\0");
+        for value in [address.to_string(), bucket.clone(), recipient.to_string()] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        let binding = hash.finalize().into();
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test",
+                "test",
+                None,
+                None,
+                "local-floci",
+            ))
+            .build();
         Ok(Self {
-            client,
+            client: Client::from_conf(config),
             bucket,
             source,
             staging_parent,
             recipient,
+            binding,
             admission: tokio::sync::Mutex::new(()),
         })
     }
@@ -308,6 +339,46 @@ pub async fn restore_quarantined(
 mod service_tests {
     use super::*;
 
+    #[test]
+    fn binding_changes_for_endpoint_bucket_or_recipient() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let recipient = Identity::generate().to_public();
+        let make = |address: &str, bucket: &str, recipient: Recipient| {
+            ServiceBackup::new_floci(
+                address.parse().unwrap(),
+                bucket.to_owned(),
+                directory.path().join("source.db"),
+                directory.path().into(),
+                recipient,
+            )
+            .unwrap()
+            .destination_binding()
+        };
+        let reference = make("127.0.0.1:1234", "fixture-one", recipient.clone());
+        assert_eq!(
+            reference,
+            make("127.0.0.1:1234", "fixture-one", recipient.clone())
+        );
+        assert_ne!(
+            reference,
+            make("127.0.0.1:1235", "fixture-one", recipient.clone())
+        );
+        assert_ne!(reference, make("127.0.0.1:1234", "fixture-two", recipient));
+        assert_ne!(
+            reference,
+            make(
+                "127.0.0.1:1234",
+                "fixture-one",
+                Identity::generate().to_public()
+            )
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_submission_is_rejected_without_queueing() {
         let directory = tempfile::tempdir().unwrap();
@@ -316,15 +387,8 @@ mod service_tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "test", "test", None, None, "fixture",
-            ))
-            .build();
-        let service = ServiceBackup::new(
-            Client::from_conf(config),
+        let service = ServiceBackup::new_floci(
+            "127.0.0.1:1".parse().unwrap(),
             "fixture-bucket".into(),
             directory.path().join("absent.db"),
             directory.path().into(),
@@ -346,7 +410,7 @@ mod service_tests {
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -355,17 +419,8 @@ mod service_tests {
             .await
             .unwrap();
         });
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .endpoint_url(endpoint)
-            .force_path_style(true)
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "test", "test", None, None, "fixture",
-            ))
-            .build();
-        let service = ServiceBackup::new(
-            Client::from_conf(config),
+        let service = ServiceBackup::new_floci(
+            endpoint,
             "fixture-bucket".into(),
             directory.path().join("absent.db"),
             directory.path().into(),

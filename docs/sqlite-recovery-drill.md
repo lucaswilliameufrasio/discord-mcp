@@ -200,9 +200,14 @@ verifica apenas a presença da chave no **bucket atualmente configurado** usando
 HEAD. A operação exige sessão administrativa e validação de origem, não altera
 a auditoria, não baixa nem descriptografa o objeto e não faz retry. Ela apresenta
 encontrado, não encontrado ou consulta indisponível; encontrado não confirma
-conteúdo, autoria, integridade ou recuperabilidade. Como a auditoria antiga não
-registra uma identidade imutável do destino, não se comprova que a configuração
-atual corresponda à da tentativa. Uma gravação ainda pode estar em andamento e
+conteúdo, autoria, integridade ou recuperabilidade. Novas tentativas gravam,
+na mesma transação da intenção, um fingerprint versionado SHA-256 do endereço
+IPv4 e porta do Floci, bucket e destinatário público age; o serviço constrói o
+cliente a partir desse mesmo endereço. Se o fingerprint for diferente ou
+estiver ausente em registro antigo, a investigação recusa a consulta sem
+consultar o armazenamento e preserva o estado anterior. O fingerprint não é
+autenticação do servidor nem prova de identidade de uma instância: outro
+processo pode reutilizar o mesmo endereço e porta. Uma gravação ainda pode estar em andamento e
 um 404 também não prova falha definitiva. A consulta não substitui restauração
 isolada, nem autoriza reenviar ou excluir o objeto. O teste Floci inclui objeto
 corrompido que aparece como encontrado, mas é rejeitado na restauração.

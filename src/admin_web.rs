@@ -138,12 +138,20 @@ async fn backup_investigate(
     let Some(backup) = &app.config.backup else {
         return error(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let id = match store(&app).and_then(|store| store.inconclusive_backup_id(&req.request_id)) {
-        Ok(Some(id)) => id,
+    let (id, binding) = match store(&app)
+        .and_then(|store| store.inconclusive_backup_target(&req.request_id))
+    {
+        Ok(Some(value)) => value,
         Ok(None) => return error(StatusCode::NOT_FOUND),
         Err(crate::channels::StoreError::InvalidInput) => return error(StatusCode::BAD_REQUEST),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
     };
+    let Some(binding) = binding else {
+        return page("<h1>Investigação inconclusiva</h1><p>Registro antigo sem vínculo do destino. Nenhuma consulta ao armazenamento foi realizada.</p>".into());
+    };
+    if binding.as_slice() != backup.destination_binding() {
+        return page("<h1>Investigação inconclusiva</h1><p>O destino configurado diverge da tentativa. Nenhuma consulta ao armazenamento foi realizada.</p>".into());
+    }
     let observation = backup.observe(&id).await;
     let result = match observation {
         crate::encrypted_backup::ObjectObservation::Found => {
@@ -158,7 +166,7 @@ async fn backup_investigate(
     };
     let (bucket, _) = backup.destination_description();
     page(format!(
-        "<h1>Investigação de backup</h1><p>ID: {}</p><p>Bucket atualmente configurado: {}</p><p>{}</p><p>O destino pode ter mudado desde a tentativa, que também pode estar em andamento. A auditoria não foi alterada; não reenvie automaticamente.</p><p><a href=\"/admin/backup-audit\">Voltar</a></p>",
+        "<h1>Investigação de backup</h1><p>ID: {}</p><p>Bucket atualmente configurado: {}</p><p>{}</p><p>A configuração coincide, mas não autentica a identidade do servidor; a tentativa pode estar em andamento. A auditoria não foi alterada; não reenvie automaticamente.</p><p><a href=\"/admin/backup-audit\">Voltar</a></p>",
         escape(&id),
         escape(&bucket),
         result
@@ -565,7 +573,13 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
             };
             if store(&app)
                 .and_then(|store| {
-                    store.begin_backup_audit(&req.request_id, &id, &app.config.admin_user_id, now)
+                    store.begin_backup_audit(
+                        &req.request_id,
+                        &id,
+                        &app.config.admin_user_id,
+                        now,
+                        &backup.destination_binding(),
+                    )
                 })
                 .is_err()
             {

@@ -197,8 +197,8 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     // Exercise the application's reusable feature directly against Floci.
     let backup_identity = age::x25519::Identity::generate();
     let backup_recipient = backup_identity.to_public();
-    let executor = discord_mcp::encrypted_backup::ServiceBackup::new(
-        client.clone(),
+    let executor = discord_mcp::encrypted_backup::ServiceBackup::new_floci(
+        address,
         "discord-mcp-synthetic-drill".to_owned(),
         source.clone(),
         directory.to_path_buf(),
@@ -239,8 +239,8 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     println!(
         "PASS service-owned executor: fixed destination, invalid ID, duplicate and quarantined restore"
     );
-    let retry_executor = discord_mcp::encrypted_backup::ServiceBackup::new(
-        client.clone(),
+    let retry_executor = discord_mcp::encrypted_backup::ServiceBackup::new_floci(
+        address,
         "discord-mcp-retry-fixture".to_owned(),
         source.clone(),
         directory.to_path_buf(),

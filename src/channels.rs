@@ -135,6 +135,9 @@ pub struct BackupAuditRow {
     pub state: String,
 }
 
+#[cfg(feature = "encrypted-s3-backup")]
+pub type InconclusiveBackupTarget = (String, Option<Vec<u8>>);
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoveryInvalidations {
     pub permissions: usize,
@@ -393,6 +396,8 @@ impl ChannelStore {
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS recovery_control (id INTEGER PRIMARY KEY CHECK(id=1), quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)));").map_err(|_| StoreError::Storage)?;
         #[cfg(feature = "encrypted-s3-backup")]
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_audit (request_id TEXT PRIMARY KEY NOT NULL, backup_id TEXT NOT NULL, actor_id TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, state TEXT NOT NULL CHECK(state IN ('started','confirmed','unknown')));").map_err(|_| StoreError::Storage)?;
+        #[cfg(feature = "encrypted-s3-backup")]
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_target_binding (request_id TEXT PRIMARY KEY NOT NULL REFERENCES backup_audit(request_id), fingerprint BLOB NOT NULL CHECK(length(fingerprint)=32));").map_err(|_| StoreError::Storage)?;
         Ok(store)
     }
 
@@ -403,6 +408,7 @@ impl ChannelStore {
         backup_id: &str,
         actor: &str,
         now: i64,
+        binding: &[u8; 32],
     ) -> Result<(), StoreError> {
         if request_id.len() != 64
             || !request_id.bytes().all(|b| b.is_ascii_hexdigit())
@@ -429,6 +435,12 @@ impl ChannelStore {
         if changed != 1 {
             return Err(StoreError::RecoveryPending);
         }
+        transaction
+            .execute(
+                "INSERT INTO backup_target_binding(request_id,fingerprint) VALUES(?1,?2)",
+                params![request_id, binding.as_slice()],
+            )
+            .map_err(|_| StoreError::Storage)?;
         transaction.commit().map_err(|_| StoreError::Storage)
     }
 
@@ -469,11 +481,14 @@ impl ChannelStore {
     }
 
     #[cfg(feature = "encrypted-s3-backup")]
-    pub fn inconclusive_backup_id(&self, request_id: &str) -> Result<Option<String>, StoreError> {
+    pub fn inconclusive_backup_target(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<InconclusiveBackupTarget>, StoreError> {
         if request_id.len() != 64 || !request_id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(StoreError::InvalidInput);
         }
-        self.db.query_row("SELECT backup_id FROM backup_audit WHERE request_id=?1 AND state IN ('started','unknown')", [request_id], |row| row.get(0)).optional().map_err(|_| StoreError::Storage)
+        self.db.query_row("SELECT a.backup_id,b.fingerprint FROM backup_audit a LEFT JOIN backup_target_binding b ON b.request_id=a.request_id WHERE a.request_id=?1 AND a.state IN ('started','unknown')", [request_id], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|_| StoreError::Storage)
     }
 
     pub fn recovery_quarantined(&self) -> Result<bool, StoreError> {

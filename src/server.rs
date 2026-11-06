@@ -140,8 +140,8 @@ fn floci_backup(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or("database requires a private parent")?;
-    let backup = discord_mcp::encrypted_backup::ServiceBackup::new(
-        crate::local_backup::client(&address)?,
+    let backup = discord_mcp::encrypted_backup::ServiceBackup::new_floci(
+        address.parse()?,
         bucket,
         storage.path.clone(),
         parent.to_path_buf(),
