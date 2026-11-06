@@ -2332,6 +2332,22 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
             .any(|row| row.request_id == duplicate_id && row.state == "unknown")
     );
     use age::secrecy::ExposeSecret;
+    // Synthetic lost-completion fixture: keep the original pre-PUT commitment
+    // and object, but leave the durable attempt inconclusive.
+    let verification_target = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.backup_id == "backup-1")
+        .unwrap()
+        .request_id;
+    let verification_sql = rusqlite::Connection::open(&database).unwrap();
+    verification_sql
+        .execute(
+            "UPDATE backup_audit SET state='unknown',finished_at=NULL WHERE request_id=?1",
+            [&verification_target],
+        )
+        .unwrap();
     let baseline = store
         .recent_backup_audit()
         .unwrap()
@@ -2341,7 +2357,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     let object_before = s3
         .get_object()
         .bucket(&bucket)
-        .key("service-backups/backup-2.age")
+        .key("service-backups/backup-1.age")
         .send()
         .await
         .unwrap()
@@ -2354,7 +2370,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         .env_clear()
         .env("DISCORD_MCP_DB", &cli_database)
         .env("DISCORD_MCP_KEY", "invalid")
-        .args(["remote-verify-backup", &origin, duplicate_id])
+        .args(["remote-verify-backup", &origin, &verification_target])
         .arg(dir.path())
         .arg("--confirm-isolated")
         .stdin(Stdio::piped())
@@ -2401,8 +2417,8 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         .await
         .unwrap();
     assert!(
-        verify_page.contains(duplicate_id)
-            && verify_page.contains("backup-2")
+        verify_page.contains(&verification_target)
+            && verify_page.contains("backup-1")
             && verify_page.contains(&bucket)
     );
     assert_eq!(
@@ -2455,7 +2471,7 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         object_before,
         s3.get_object()
             .bucket(&bucket)
-            .key("service-backups/backup-2.age")
+            .key("service-backups/backup-1.age")
             .send()
             .await
             .unwrap()
@@ -2547,6 +2563,94 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
             rusqlite::params![duplicate_id, binding.as_slice()],
         )
         .unwrap();
+    let collision: Value = browser
+        .post(format!("{origin}/v1/cli/backup-verification-requests"))
+        .json(&json!({"attempt_id":duplicate_id,"challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let collision_id = collision["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", collision_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":collision_id,"verifier":hex::encode(verifier)}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    println!("PASS preexisting object rejected when ciphertext commitment differs");
+    let legacy_commitment_id = "c".repeat(64);
+    store
+        .begin_backup_audit(
+            &legacy_commitment_id,
+            "legacy-commitment",
+            "123",
+            discord_mcp::channels::current_timestamp().unwrap(),
+            &binding,
+        )
+        .unwrap();
+    store
+        .finish_backup_audit(
+            &legacy_commitment_id,
+            false,
+            discord_mcp::channels::current_timestamp().unwrap(),
+        )
+        .unwrap();
+    s3.put_object()
+        .bucket(&bucket)
+        .key("service-backups/legacy-commitment.age")
+        .body(object_before.clone().into())
+        .send()
+        .await
+        .unwrap();
+    let legacy_request: Value = browser.post(format!("{origin}/v1/cli/backup-verification-requests"))
+        .json(&json!({"attempt_id":legacy_commitment_id,"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let legacy_request_id = legacy_request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", legacy_request_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let legacy_response = browser
+        .post(format!("{origin}/v1/cli/execute"))
+        .json(&json!({"request_id":legacy_request_id,"verifier":hex::encode(verifier)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_response.status(), StatusCode::OK);
+    assert_eq!(
+        legacy_response
+            .headers()
+            .get("x-backup-ciphertext-binding")
+            .unwrap(),
+        "unavailable"
+    );
+    assert_eq!(legacy_response.bytes().await.unwrap(), object_before);
+    println!("PASS legacy attempt remains unbound without changing old audit records");
     println!(
         "PASS remote verification: unapproved, wrong verifier, changed binding and replay refused"
     );
@@ -2803,6 +2907,30 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     sql.execute_batch("DROP TRIGGER synthetic_backup_finish_failure")
         .unwrap();
     println!("PASS backup audit: lost result after upload leaves durable inconclusive intent");
+    let lost_ciphertext = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("service-backups/audit-failure.age")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let (lost_digest, lost_length) = store
+        .backup_ciphertext_commitment(third_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lost_digest.as_slice(),
+        Sha256::digest(&lost_ciphertext).as_slice()
+    );
+    assert_eq!(lost_length, lost_ciphertext.len() as u64);
+    println!(
+        "PASS lost result: pre-PUT commitment matches observed ciphertext without inferring recoverability"
+    );
     let saved_object = s3
         .get_object()
         .bucket(&bucket)
@@ -2916,6 +3044,49 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     sql.execute_batch("DROP TRIGGER synthetic_backup_start_failure")
         .unwrap();
     println!("PASS backup audit: failed intent prevents upload");
+    let commitment_fail: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
+        .json(&json!({"backup_id":"commitment-failure", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let commitment_fail_id = commitment_fail["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", commitment_fail_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    sql.execute_batch("CREATE TRIGGER synthetic_commitment_failure BEFORE INSERT ON backup_ciphertext_commitment BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":commitment_fail_id,"verifier":hex::encode(verifier)}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(
+        s3.get_object()
+            .bucket(&bucket)
+            .key("service-backups/commitment-failure.age")
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .backup_ciphertext_commitment(commitment_fail_id)
+            .unwrap()
+            .is_none()
+    );
+    sql.execute_batch("DROP TRIGGER synthetic_commitment_failure")
+        .unwrap();
+    println!("PASS failed pre-PUT commitment prevents remote object creation");
     let lost: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
         .json(&json!({"backup_id":"response-lost", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
     let lost_id = lost["request_id"].as_str().unwrap();

@@ -96,3 +96,38 @@ fn audit_preview_preserves_all_rows_and_excludes_inconclusive_and_invalid_times(
     };
     assert_eq!(before, after);
 }
+
+#[test]
+fn ciphertext_commitment_is_insert_once_and_old_attempts_remain_unbound() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("commitment.db");
+    let store = ChannelStore::open(&database, &[8; 32]).unwrap();
+    let legacy = "a".repeat(64);
+    store
+        .begin_backup_audit(&legacy, "legacy", "123", 10, &[1; 32])
+        .unwrap();
+    store.finish_backup_audit(&legacy, false, 11).unwrap();
+    assert_eq!(store.backup_ciphertext_commitment(&legacy).unwrap(), None);
+    assert!(
+        store
+            .commit_backup_ciphertext(&legacy, &[2; 32], 50)
+            .is_err()
+    );
+    let current = "b".repeat(64);
+    store
+        .begin_backup_audit(&current, "new", "123", 12, &[3; 32])
+        .unwrap();
+    store
+        .commit_backup_ciphertext(&current, &[4; 32], 100)
+        .unwrap();
+    assert!(
+        store
+            .commit_backup_ciphertext(&current, &[5; 32], 101)
+            .is_err()
+    );
+    assert_eq!(
+        store.backup_ciphertext_commitment(&current).unwrap(),
+        Some(([4; 32], 100))
+    );
+    assert_eq!(store.backup_ciphertext_commitment(&legacy).unwrap(), None);
+}

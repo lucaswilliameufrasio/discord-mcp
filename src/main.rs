@@ -594,6 +594,19 @@ async fn remote_operation(
             if response.status() != reqwest::StatusCode::OK {
                 return Err("verification download denied or unavailable".into());
             }
+            let binding = match response
+                .headers()
+                .get("x-backup-ciphertext-binding")
+                .and_then(|value| value.to_str().ok())
+            {
+                Some("matched") => {
+                    "O ciphertext coincide com o compromisso anterior ao envio; isso não prova quem escreveu o objeto."
+                }
+                Some("unavailable") => {
+                    "Tentativa antiga sem compromisso de ciphertext; não é possível vincular os bytes à tentativa."
+                }
+                _ => return Err("missing or invalid ciphertext binding response".into()),
+            };
             if response
                 .content_length()
                 .is_some_and(|n| n > discord_mcp::encrypted_backup::MAX_ENCRYPTED_OBJECT)
@@ -612,9 +625,7 @@ async fn remote_operation(
             }
             let (identity, key) = recovery.ok_or("missing recovery input")?;
             local_backup::verify_ciphertext(&ciphertext, staging, &identity, &key)?;
-            eprintln!(
-                "A cópia verificada pode não ter sido produzida pela tentativa selecionada; auditoria inalterada."
-            );
+            eprintln!("{binding} Auditoria inalterada.");
         }
         #[cfg(feature = "encrypted-s3-backup")]
         RemoteOperation::Backup(_) => {

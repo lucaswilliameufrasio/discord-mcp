@@ -698,7 +698,18 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                 app.config.auth.audit.mark_failure();
                 return error(StatusCode::SERVICE_UNAVAILABLE);
             }
-            let result = backup.snapshot(&id).await;
+            let result = backup
+                .snapshot_with_commitment(&id, |digest, length| {
+                    store(&app)
+                        .and_then(|store| {
+                            store.commit_backup_ciphertext(&req.request_id, digest, length)
+                        })
+                        .map_err(|_| {
+                            app.config.auth.audit.mark_failure();
+                            crate::encrypted_backup::BackupError
+                        })
+                })
+                .await;
             let Ok(finished) = current_timestamp() else {
                 app.config.auth.audit.mark_failure();
                 return error(StatusCode::INTERNAL_SERVER_ERROR);
@@ -735,10 +746,34 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
             }
             return match backup.fetch_ciphertext(&backup_id).await {
                 Ok(bytes) => {
+                    use sha2::{Digest, Sha256};
+                    let current =
+                        store(&app).and_then(|store| store.inconclusive_backup_target(&attempt_id));
+                    if !matches!(current, Ok(Some((ref id, Some(ref current_binding))) ) if id == &backup_id && current_binding.as_slice() == binding && binding == backup.destination_binding())
+                    {
+                        return error(StatusCode::CONFLICT);
+                    }
+                    let evidence = match store(&app)
+                        .and_then(|store| store.backup_ciphertext_commitment(&attempt_id))
+                    {
+                        Ok(Some((expected, length))) => {
+                            let actual: [u8; 32] = Sha256::digest(&bytes).into();
+                            if actual != expected || length != bytes.len() as u64 {
+                                return error(StatusCode::CONFLICT);
+                            }
+                            "matched"
+                        }
+                        Ok(None) => "unavailable",
+                        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+                    };
                     let mut response =
                         ([(header::CONTENT_TYPE, "application/octet-stream")], bytes)
                             .into_response();
                     headers(&mut response);
+                    response.headers_mut().insert(
+                        "x-backup-ciphertext-binding",
+                        HeaderValue::from_static(evidence),
+                    );
                     response
                 }
                 Err(_) => error(StatusCode::BAD_GATEWAY),

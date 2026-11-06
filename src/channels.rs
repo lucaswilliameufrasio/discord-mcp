@@ -409,6 +409,8 @@ impl ChannelStore {
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_audit (request_id TEXT PRIMARY KEY NOT NULL, backup_id TEXT NOT NULL, actor_id TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, state TEXT NOT NULL CHECK(state IN ('started','confirmed','unknown')));").map_err(|_| StoreError::Storage)?;
         #[cfg(feature = "encrypted-s3-backup")]
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_target_binding (request_id TEXT PRIMARY KEY NOT NULL REFERENCES backup_audit(request_id), fingerprint BLOB NOT NULL CHECK(length(fingerprint)=32));").map_err(|_| StoreError::Storage)?;
+        #[cfg(feature = "encrypted-s3-backup")]
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS backup_ciphertext_commitment (request_id TEXT PRIMARY KEY NOT NULL REFERENCES backup_audit(request_id), sha256 BLOB NOT NULL CHECK(length(sha256)=32), byte_length INTEGER NOT NULL CHECK(byte_length>0));").map_err(|_| StoreError::Storage)?;
         Ok(store)
     }
 
@@ -471,6 +473,50 @@ impl ChannelStore {
             return Err(StoreError::Storage);
         }
         Ok(())
+    }
+
+    /// Insert exactly once, before PUT; a missing or completed attempt cannot be bound.
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn commit_backup_ciphertext(
+        &self,
+        request_id: &str,
+        digest: &[u8; 32],
+        length: u64,
+    ) -> Result<(), StoreError> {
+        if length == 0 || length > crate::encrypted_backup::MAX_ENCRYPTED_OBJECT {
+            return Err(StoreError::InvalidInput);
+        }
+        let changed = self.db.execute("INSERT INTO backup_ciphertext_commitment(request_id,sha256,byte_length) SELECT a.request_id,?2,?3 FROM backup_audit a JOIN backup_target_binding t ON t.request_id=a.request_id WHERE a.request_id=?1 AND a.state='started'", params![request_id, digest.as_slice(), length as i64]).map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::Storage);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn backup_ciphertext_commitment(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<([u8; 32], u64)>, StoreError> {
+        let row: Option<(Vec<u8>, i64)> = self
+            .db
+            .query_row(
+                "SELECT sha256,byte_length FROM backup_ciphertext_commitment WHERE request_id=?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        match row {
+            None => Ok(None),
+            Some((bytes, length))
+                if length > 0 && length as u64 <= crate::encrypted_backup::MAX_ENCRYPTED_OBJECT =>
+            {
+                let digest = bytes.try_into().map_err(|_| StoreError::Storage)?;
+                Ok(Some((digest, length as u64)))
+            }
+            _ => Err(StoreError::Storage),
+        }
     }
 
     #[cfg(feature = "encrypted-s3-backup")]

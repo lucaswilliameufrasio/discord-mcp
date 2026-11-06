@@ -182,6 +182,15 @@ impl ServiceBackup {
     /// The ID selects only a new object under the fixed server-side prefix.
     /// Cancellation or lost responses can leave the remote outcome unknown.
     pub async fn snapshot(&self, id: &str) -> Result<(), BackupError> {
+        self.snapshot_with_commitment(id, |_, _| Ok(())).await
+    }
+
+    /// Persist the ciphertext commitment before any PUT. If persistence fails,
+    /// no external write is attempted; the callback must be durable and atomic.
+    pub async fn snapshot_with_commitment<F>(&self, id: &str, commit: F) -> Result<(), BackupError>
+    where
+        F: FnOnce(&[u8; 32], u64) -> Result<(), BackupError>,
+    {
         if id.is_empty()
             || id.len() > 64
             || !id
@@ -192,15 +201,11 @@ impl ServiceBackup {
         }
         let _permit = self.admission.try_lock().map_err(|_| BackupError)?;
         let object = format!("service-backups/{id}.age");
-        upload_snapshot(
-            &self.client,
-            &self.bucket,
-            &object,
-            &self.source,
-            &self.staging_parent,
-            &self.recipient,
-        )
-        .await
+        let encrypted = prepare_snapshot(&self.source, &self.staging_parent, &self.recipient)?;
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(&encrypted).into();
+        commit(&digest, encrypted.len() as u64)?;
+        put_snapshot(&self.client, &self.bucket, &object, encrypted).await
     }
 }
 
@@ -230,6 +235,15 @@ pub async fn upload_snapshot(
     staging_parent: &Path,
     recipient: &Recipient,
 ) -> Result<(), BackupError> {
+    let encrypted = prepare_snapshot(source, staging_parent, recipient)?;
+    put_snapshot(client, bucket, object_key, encrypted).await
+}
+
+fn prepare_snapshot(
+    source: &Path,
+    staging_parent: &Path,
+    recipient: &Recipient,
+) -> Result<Vec<u8>, BackupError> {
     private_dir(staging_parent)?;
     if !fs::symlink_metadata(source)
         .map_err(|_| BackupError)?
@@ -295,6 +309,15 @@ pub async fn upload_snapshot(
     }
     drop(data);
     drop(staging);
+    Ok(encrypted)
+}
+
+async fn put_snapshot(
+    client: &Client,
+    bucket: &str,
+    object_key: &str,
+    encrypted: Vec<u8>,
+) -> Result<(), BackupError> {
     client
         .put_object()
         .bucket(bucket)

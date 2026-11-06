@@ -256,9 +256,15 @@ acima. Não usa banco local ativo nem modifica objeto ou auditoria.
 Essa associação consulta a chave de objeto associada à tentativa e a
 configuração registrada, **mas não prova que o objeto foi criado por ela**:
 uma tentativa duplicada pode encontrar um objeto anterior e o endereço Floci
-pode ter sido reutilizado. Não há digest de ciphertext ou versão do objeto
-persistido antes do envio. É evidência sobre a cópia examinada, não reconciliação
-automática, prova de origem, garantia de recuperação de host ou validação após
+pode ter sido reutilizado. Novas tentativas persistem SHA-256 e tamanho do
+ciphertext em tabela separada **antes** do PUT condicional; se o registro falha,
+o PUT não ocorre. A verificação autorizada recusa bytes divergentes, informa
+quando coincidem e sinaliza `unavailable` para registros antigos sem compromisso,
+sem alterá-los. O digest vincula os bytes observados aos bytes preparados, mas
+não prova quem gravou o objeto nem, sozinho, sua integridade semântica ou
+recuperabilidade. A validação age e SQLite permanece necessária. Uma falha de
+resposta depois do PUT pode ser investigada comparando esses bytes; não há
+reconciliação automática, garantia de recuperação de host ou validação após
 ativação. O fluxo é somente para Floci e Discord sintéticos, não dados reais.
 
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
