@@ -127,10 +127,13 @@ validação de uma tabela já existente **não exige nem verifica a presença de
 CHECK**. Uma tabela sem ele é aceita se as colunas, a chave primária, a chave
 estrangeira e os dados existentes forem válidos; uma cópia assim também pode ser
 publicada em quarentena. Os testes demonstram que outro cliente SQLite pode
-inserir uma revisão negativa enquanto a conexão permanece aberta e que essa
-conexão pode lê-la. Uma nova abertura ou preparação de cópia recusa os dados
-inválidos, mas isso não detecta nem impede alterações indevidas durante a vida
-de uma conexão já aberta, inclusive valores válidos que burlem a revisão.
+inserir uma revisão inválida enquanto a conexão permanece aberta. Consultas de
+contexto e formulários de permissões e alterações de permissões agora validam
+a revisão do canal no mesmo snapshot ou transação e recusam valores negativos
+ou que não sejam inteiros, sem gravar permissões nem auditoria de sucesso. Uma
+nova abertura ou preparação de cópia também recusa dados inválidos. Isso não
+impede a escrita externa nem detecta valores válidos que burlem a revisão, e
+não é uma validação contínua de todos os canais em toda operação.
 O lock consultivo não protege contra esse cliente; o controle concorrente
 depende de todos os escritores usarem a aplicação atual e de um limite de
 acesso apropriado no sistema operacional.

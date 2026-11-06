@@ -879,9 +879,10 @@ impl ChannelStore {
         )
         .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
+        let current_revision = self.permission_revision_in_snapshot(channel)?;
         if let Some((expected, revision)) = version
             && (self.channel_version_in_snapshot(channel)? != Some(expected)
-                || self.permission_revision_in_snapshot(channel)? != revision)
+                || current_revision != revision)
         {
             return Err(StoreError::AuthorizationDenied);
         }
@@ -1123,7 +1124,20 @@ impl ChannelStore {
     }
 
     fn permission_revision_in_snapshot(&self, channel: &str) -> Result<i64, StoreError> {
-        self.db.query_row("SELECT COALESCE((SELECT revision FROM channel_permission_revisions WHERE channel_name=?1), 0)", [channel], |row| row.get(0)).map_err(|_| StoreError::Storage)
+        let revision: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT revision FROM channel_permission_revisions WHERE channel_name=?1",
+                [channel],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        match revision {
+            Some(value) if value < 0 => Err(StoreError::Storage),
+            Some(value) => Ok(value),
+            None => Ok(0),
+        }
     }
 
     /// Channel identity and permission revision for a pending CLI action.

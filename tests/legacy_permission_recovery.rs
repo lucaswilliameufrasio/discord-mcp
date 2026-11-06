@@ -287,16 +287,62 @@ fn revision_check_is_not_required_on_existing_tables_but_invalid_data_is_rejecte
         .set_permissions("101", "support", true, false)
         .unwrap();
     assert_eq!(store.permission_context("support").unwrap().1, 3);
-    // A non-cooperating SQLite client can violate the invariant while this
-    // connection remains open; reopening checks the persisted rows again.
+    // A non-cooperating client can corrupt a table lacking CHECK while the
+    // store is open. Permission operations must fail without changing grants.
     let outsider = rusqlite::Connection::open(&path).unwrap();
-    outsider
-        .execute(
-            "UPDATE channel_permission_revisions SET revision=-1 WHERE channel_name='support'",
-            [],
-        )
-        .unwrap();
-    assert_eq!(store.permission_context("support").unwrap().1, -1);
+    let (version, revision) = store.permission_context("support").unwrap();
+    let audit_count = store
+        .audit_events(None, Some("permission_change"), 100)
+        .unwrap()
+        .len();
+    for invalid in ["-1", "1.5", "'invalid'"] {
+        outsider.execute(&format!("UPDATE channel_permission_revisions SET revision={invalid} WHERE channel_name='support'"), []).unwrap();
+        assert!(matches!(
+            store.permission_context("support"),
+            Err(StoreError::Storage)
+        ));
+        assert!(matches!(
+            store.permission_view("support"),
+            Err(StoreError::Storage)
+        ));
+        assert!(matches!(
+            store.set_permissions("101", "support", false, true),
+            Err(StoreError::Storage)
+        ));
+        let context = AuditContext {
+            actor: AuditActor::Discord("123"),
+            now: 1000,
+            retention_days: 90,
+        };
+        assert!(matches!(
+            store.set_permissions_audited_if_version(
+                "101",
+                "support",
+                false,
+                true,
+                context,
+                (version.unwrap(), revision)
+            ),
+            Err(StoreError::Storage)
+        ));
+        assert!(
+            store
+                .is_permitted("101", "support", ChannelAction::Read)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_permitted("101", "support", ChannelAction::Send)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .audit_events(None, Some("permission_change"), 100)
+                .unwrap()
+                .len(),
+            audit_count
+        );
+    }
     drop(outsider);
     drop(store);
     assert!(ChannelStore::open(&path, &key).is_err());
