@@ -66,6 +66,117 @@ fn recovery_activation_refuses_non_quarantined_and_empty_files() {
 }
 
 #[test]
+fn wrong_key_activation_preserves_quarantine_records_and_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let source = dir.path().join("source.db");
+    let copy = dir.path().join("quarantine.db");
+    let key = [157_u8; 32];
+    let resource = "https://example.invalid/mcp";
+    let original = ChannelStore::open(&source, &key).unwrap();
+    original
+        .put_bot("alerts", "123", "synthetic-token")
+        .unwrap();
+    original
+        .set_permissions("101", "alerts", true, true)
+        .unwrap();
+    let token = original
+        .issue_access_token("101", resource, 1000, 60)
+        .unwrap();
+    drop(original);
+    let source_baseline = std::fs::read(&source).unwrap();
+    prepare_restored_copy(&source, &copy, &key, 90).unwrap();
+    let snapshot = || {
+        let db = rusqlite::Connection::open(&copy).unwrap();
+        let quarantine: i64 = db
+            .query_row(
+                "SELECT quarantined FROM recovery_control WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record: (String, Vec<u8>, Vec<u8>) = db
+            .query_row(
+                "SELECT name,nonce,ciphertext FROM channels WHERE name='alerts'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let marker: (Vec<u8>, Vec<u8>) = db
+            .query_row(
+                "SELECT nonce,ciphertext FROM key_check WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let revision: i64 = db
+            .query_row(
+                "SELECT revision FROM channel_permission_revisions WHERE channel_name='alerts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let counts: (i64, i64, i64, i64) = db.query_row("SELECT (SELECT COUNT(*) FROM channel_permissions), (SELECT COUNT(*) FROM mcp_access_tokens), (SELECT COUNT(*) FROM mcp_authorization_codes), (SELECT COUNT(*) FROM audit_events)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        let mut statement = db.prepare("SELECT id,occurred_at,event_type,outcome,actor_kind,actor_id,channel_name,subject_user_id,can_read,can_send FROM audit_events ORDER BY id").unwrap();
+        let rows: Vec<Vec<rusqlite::types::Value>> = statement
+            .query_map([], |row| (0..10).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (quarantine, record, counts, rows, marker, revision)
+    };
+    let before = snapshot();
+    assert_eq!(before.0, 1);
+    assert_eq!((before.2.0, before.2.1, before.2.2), (0, 0, 0));
+    let run = |candidate: [u8; 32]| {
+        Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_DB", &copy)
+            .env("DISCORD_MCP_KEY", hex::encode(candidate))
+            .args(["recovery-activate", "--confirm"])
+            .output()
+            .unwrap()
+    };
+    let failed = run([158; 32]);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("Decryption"));
+    assert_eq!(snapshot(), before);
+    assert_eq!(std::fs::read(&source).unwrap(), source_baseline);
+    let activated = run(key);
+    assert!(
+        activated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&activated.stderr)
+    );
+    let recovered = ChannelStore::open(&copy, &key).unwrap();
+    assert!(!recovered.recovery_quarantined().unwrap());
+    assert!(recovered.get_channel("alerts").is_ok());
+    assert!(
+        !recovered
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    assert_eq!(
+        recovered
+            .verify_access_token(&token, resource, 1001)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        recovered
+            .audit_events(None, Some("recovery_activated"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), source_baseline);
+}
+
+#[test]
 fn token_validation_checks_quarantine_with_token_in_same_snapshot() {
     use sha2::{Digest, Sha256};
 

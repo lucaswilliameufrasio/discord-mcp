@@ -122,6 +122,14 @@ da CLI verificam recusa de caminho ausente, arquivo vazio e banco ativo, além
 da ativação de cópia sintética preparada. Isso não substitui a revisão da cópia
 nem impede processos não cooperativos de modificarem o arquivo.
 
+`wrong_key_activation_preserves_quarantine_records_and_audit` exercita a CLI
+com uma chave sintética incorreta após preparar uma cópia. Compara estado de
+quarentena, canal cifrado, marcador de chave, revisão, contagens de autoridades
+e linhas de auditoria antes e depois da falha, além dos bytes da fonte offline.
+Uma tentativa subsequente com a chave correta ativa a cópia sem reinstalar a
+permissão ou token anteriores. A comparação da cópia é lógica, não uma garantia
+de preservação byte a byte de arquivos SQLite ou sidecars.
+
 O teste `activation_cli_rejects_reintroduced_authority_and_preserves_source`
 prepara três cópias sintéticas em quarentena e simula, separadamente, um escritor
 externo reintroduzindo uma permissão, um token ou um código. Em cada caso,
