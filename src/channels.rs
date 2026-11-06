@@ -227,6 +227,7 @@ impl ChannelStore {
         );",
             )
             .map_err(|_| StoreError::Storage)?;
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS channel_permission_revisions (channel_name TEXT PRIMARY KEY NOT NULL REFERENCES channels(name) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision >= 0));").map_err(|_| StoreError::Storage)?;
         store
             .db
             .execute_batch(
@@ -785,7 +786,7 @@ impl ChannelStore {
         can_read: bool,
         can_send: bool,
         context: AuditContext<'_>,
-        version: [u8; 32],
+        version: ([u8; 32], i64),
     ) -> Result<(), StoreError> {
         self.set_permissions_checked(user_id, channel, can_read, can_send, context, Some(version))
     }
@@ -797,7 +798,7 @@ impl ChannelStore {
         can_read: bool,
         can_send: bool,
         context: AuditContext<'_>,
-        version: Option<[u8; 32]>,
+        version: Option<([u8; 32], i64)>,
     ) -> Result<(), StoreError> {
         if !valid_user_id(user_id) {
             return Err(StoreError::InvalidInput);
@@ -814,8 +815,9 @@ impl ChannelStore {
         )
         .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
-        if let Some(expected) = version
-            && self.channel_version_in_snapshot(channel)? != Some(expected)
+        if let Some((expected, revision)) = version
+            && (self.channel_version_in_snapshot(channel)? != Some(expected)
+                || self.permission_revision_in_snapshot(channel)? != revision)
         {
             return Err(StoreError::AuthorizationDenied);
         }
@@ -832,6 +834,10 @@ impl ChannelStore {
             .map_err(|_| StoreError::Storage)?;
         if !exists {
             return Err(StoreError::NotFound);
+        }
+        let bumped = transaction.execute("INSERT INTO channel_permission_revisions(channel_name,revision) VALUES (?1,1) ON CONFLICT(channel_name) DO UPDATE SET revision=revision+1 WHERE revision<9223372036854775807", [channel]).map_err(|_| StoreError::Storage)?;
+        if bumped != 1 {
+            return Err(StoreError::Storage);
         }
         if !can_read && !can_send {
             transaction
@@ -1052,11 +1058,28 @@ impl ChannelStore {
         Ok(permissions)
     }
 
+    fn permission_revision_in_snapshot(&self, channel: &str) -> Result<i64, StoreError> {
+        self.db.query_row("SELECT COALESCE((SELECT revision FROM channel_permission_revisions WHERE channel_name=?1), 0)", [channel], |row| row.get(0)).map_err(|_| StoreError::Storage)
+    }
+
+    /// Channel identity and permission revision for a pending CLI action.
+    pub fn permission_context(&self, channel: &str) -> Result<(Option<[u8; 32]>, i64), StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let version = self.channel_version_in_snapshot(channel)?;
+        let revision = self.permission_revision_in_snapshot(channel)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok((version, revision))
+    }
+
     /// Permissions and channel version for an administrative form, from one snapshot.
     pub fn permission_view(
         &self,
         channel: &str,
-    ) -> Result<(Vec<ChannelPermission>, [u8; 32]), StoreError> {
+    ) -> Result<(Vec<ChannelPermission>, [u8; 32], i64), StoreError> {
         let transaction = self
             .db
             .unchecked_transaction()
@@ -1066,8 +1089,9 @@ impl ChannelStore {
             .channel_version_in_snapshot(channel)?
             .ok_or(StoreError::NotFound)?;
         let permissions = self.list_permissions(channel)?;
+        let revision = self.permission_revision_in_snapshot(channel)?;
         transaction.commit().map_err(|_| StoreError::Storage)?;
-        Ok((permissions, version))
+        Ok((permissions, version, revision))
     }
 
     /// One SQLite statement provides a consistent point-in-time view.

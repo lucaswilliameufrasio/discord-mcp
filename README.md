@@ -117,6 +117,14 @@ for substituído antes do envio, a alteração é recusada; volte à lista e con
 o canal novamente. A tabela de permissões e a versão exibidas são lidas do
 mesmo snapshot do SQLite.
 
+Alterações de permissão pela interface administrativa ou pela CLI remota também
+verificam uma revisão por canal. Se outra alteração de permissões ocorrer desde
+a abertura da página ou criação da solicitação, a edição é recusada e deve ser
+refeita após revisão. Essa proteção é conservadora: alterações de usuários
+diferentes no mesmo canal também podem conflitar; canais distintos têm revisões
+independentes. Escritores externos e versões antigas da aplicação que não
+atualizem a revisão não são cobertos; não os use no mesmo banco.
+
 Para alterar uma permissão remotamente, use
 `discord-mcp remote-set-permission ORIGEM ID_DISCORD CANAL read|send|both|none`.
 A origem deve ser HTTPS (HTTP somente em loopback). Abra o link exibido, entre

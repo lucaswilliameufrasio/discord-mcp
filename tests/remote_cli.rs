@@ -1315,6 +1315,57 @@ async fn cli_real_router_discord_login_and_consent() {
     );
     assert!(store.list().unwrap().contains(&"alerts".to_owned()));
     assert!(!forbidden_db.exists());
+    let mut simultaneous = Vec::new();
+    for (read, send) in [(true, false), (false, true)] {
+        let request: Value = browser.post(format!("{origin}/v1/cli/requests"))
+            .json(&json!({"user_id":"108","channel":"alerts","read":read,"send":send,"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+        let id = request["request_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            browser
+                .post(format!("{origin}/admin/cli"))
+                .header(header::COOKIE, &session)
+                .header(header::ORIGIN, &origin)
+                .form(&[("request_id", &id)])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        simultaneous.push(id);
+    }
+    let first = json!({"request_id":simultaneous[0],"verifier":hex::encode(verifier)});
+    let second = json!({"request_id":simultaneous[1],"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&first)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&second)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(
+        store
+            .is_permitted("108", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_permitted("108", "alerts", ChannelAction::Send)
+            .unwrap()
+    );
     for (kind, existed) in [
         ("bot", false),
         ("webhook", false),

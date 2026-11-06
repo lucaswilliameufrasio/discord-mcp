@@ -24,6 +24,7 @@ pub struct PermissionChange {
     pub read: bool,
     pub send: bool,
     pub version: Option<[u8; 32]>,
+    pub permission_revision: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +268,7 @@ mod tests {
             read: true,
             send: false,
             version: Some([3; 32]),
+            permission_revision: 0,
         }
     }
 
