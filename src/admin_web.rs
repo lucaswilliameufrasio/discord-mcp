@@ -94,13 +94,51 @@ pub(crate) fn router_with_cli(
 }
 
 #[cfg(feature = "encrypted-s3-backup")]
-async fn backup_audit(State(app): State<Shared>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct BackupAuditQuery {
+    days: Option<String>,
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn backup_audit(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<BackupAuditQuery>,
+) -> Response {
     if !authorized(&app, &headers) {
         return error(StatusCode::FORBIDDEN);
     }
     let entries = match store(&app).and_then(|store| store.recent_backup_audit()) {
         Ok(entries) => entries,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let preview = if let Some(days) = query.days {
+        let Ok(days) = days.parse::<i64>() else {
+            return error(StatusCode::BAD_REQUEST);
+        };
+        if !(1..=36500).contains(&days) {
+            return error(StatusCode::BAD_REQUEST);
+        }
+        let Ok(now) = current_timestamp() else {
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let Some(cutoff) = now.checked_sub(days * 86400).filter(|value| *value >= 0) else {
+            return error(StatusCode::BAD_REQUEST);
+        };
+        let summary = match store(&app).and_then(|store| store.preview_backup_audit(cutoff)) {
+            Ok(summary) => summary,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+        format!(
+            "<h2>Pré-visualização somente leitura</h2><p>Corte exclusivo UTC (epoch): {cutoff}. Confirmações anteriores ao corte: {}. Started preservados: {}. Unknown preservados: {}. Outros registros preservados: {}. Total: {}.</p><p>Nenhum registro ou objeto foi excluído. A contagem pode mudar; não aprova nem habilita limpeza.</p>",
+            summary.confirmed_before_cutoff,
+            summary.started,
+            summary.unknown,
+            summary.other_records,
+            summary.total
+        )
+    } else {
+        String::new()
     };
     let mut rows = String::new();
     for entry in entries {
@@ -122,7 +160,7 @@ async fn backup_audit(State(app): State<Shared>, headers: HeaderMap) -> Response
         ));
     }
     page(format!(
-        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><table><thead><tr><th>ID</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><form method=\"get\" action=\"/admin/backup-audit\"><label for=\"days\">Pré-visualizar confirmações com mais de quantos dias?</label><input id=\"days\" name=\"days\" type=\"number\" min=\"1\" max=\"36500\" required><button>Pré-visualizar</button></form>{preview}<table><thead><tr><th>ID</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
     ))
 }
 

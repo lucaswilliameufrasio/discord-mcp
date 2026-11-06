@@ -36,3 +36,63 @@ fn legacy_attempt_remains_unbound_and_binding_failure_rolls_back_intent() {
         Some(("legacy".to_owned(), None))
     );
 }
+
+#[test]
+fn audit_preview_preserves_all_rows_and_excludes_inconclusive_and_invalid_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("preview.db");
+    let store = ChannelStore::open(&database, &[8; 32]).unwrap();
+    let sql = rusqlite::Connection::open(&database).unwrap();
+    for (n, state, finished) in [
+        (0, "confirmed", Some(99)),
+        (1, "confirmed", Some(100)),
+        (2, "confirmed", None),
+        (3, "confirmed", Some(5)),
+        (4, "started", None),
+        (5, "unknown", Some(40)),
+    ] {
+        let request = format!("{n:064x}");
+        store
+            .begin_backup_audit(&request, "fixture", "123", 10, &[n as u8; 32])
+            .unwrap();
+        sql.execute(
+            "UPDATE backup_audit SET state=?2,finished_at=?3 WHERE request_id=?1",
+            rusqlite::params![request, state, finished],
+        )
+        .unwrap();
+    }
+    let before: Vec<(String, String, Option<i64>, Vec<u8>)> = {
+        let mut statement = sql.prepare("SELECT a.request_id,a.state,a.finished_at,b.fingerprint FROM backup_audit a JOIN backup_target_binding b ON a.request_id=b.request_id ORDER BY a.request_id").unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let preview = store.preview_backup_audit(100).unwrap();
+    assert_eq!(
+        (
+            preview.total,
+            preview.confirmed_before_cutoff,
+            preview.started,
+            preview.unknown,
+            preview.other_records
+        ),
+        (6, 1, 1, 1, 3)
+    );
+    assert!(store.preview_backup_audit(-1).is_err());
+    assert_eq!(store.preview_backup_audit(100).unwrap(), preview);
+    let after: Vec<(String, String, Option<i64>, Vec<u8>)> = {
+        let mut statement = sql.prepare("SELECT a.request_id,a.state,a.finished_at,b.fingerprint FROM backup_audit a JOIN backup_target_binding b ON a.request_id=b.request_id ORDER BY a.request_id").unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(before, after);
+}

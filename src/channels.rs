@@ -135,6 +135,17 @@ pub struct BackupAuditRow {
     pub state: String,
 }
 
+/// Read-only point-in-time counts, not permission or a plan to delete records.
+#[cfg(feature = "encrypted-s3-backup")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct BackupAuditPreview {
+    pub total: i64,
+    pub confirmed_before_cutoff: i64,
+    pub started: i64,
+    pub unknown: i64,
+    pub other_records: i64,
+}
+
 #[cfg(feature = "encrypted-s3-backup")]
 pub type InconclusiveBackupTarget = (String, Option<Vec<u8>>);
 
@@ -478,6 +489,26 @@ impl ChannelStore {
             .map_err(|_| StoreError::Storage)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| StoreError::Storage)
+    }
+
+    /// One SQLite statement gives a consistent count snapshot. A confirmed
+    /// row without a valid completion time is never classified as a candidate.
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn preview_backup_audit(&self, cutoff: i64) -> Result<BackupAuditPreview, StoreError> {
+        if cutoff < 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        self.db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='confirmed' AND typeof(started_at)='integer' AND typeof(finished_at)='integer' AND started_at>=0 AND finished_at>=started_at AND finished_at<?1 THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN state='started' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN state='unknown' THEN 1 ELSE 0 END),0) FROM backup_audit",
+            [cutoff],
+            |row| {
+                let total: i64 = row.get(0)?;
+                let confirmed_before_cutoff: i64 = row.get(1)?;
+                let started: i64 = row.get(2)?;
+                let unknown: i64 = row.get(3)?;
+                Ok(BackupAuditPreview { total, confirmed_before_cutoff, started, unknown, other_records: total - confirmed_before_cutoff - started - unknown })
+            },
+        ).map_err(|_| StoreError::Storage)
     }
 
     #[cfg(feature = "encrypted-s3-backup")]

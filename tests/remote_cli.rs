@@ -2218,6 +2218,53 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         .unwrap();
     assert!(audit_html.contains("backup-1") && audit_html.contains("unknown"));
     assert!(!audit_html.contains("synthetic-token"));
+    let before_preview = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    let preview = browser
+        .get(format!("{origin}/admin/backup-audit?days=1"))
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        preview.contains("Pré-visualização somente leitura")
+            && preview.contains("Unknown preservados: 1")
+            && preview.contains("Nenhum registro ou objeto foi excluído")
+    );
+    assert_eq!(
+        browser
+            .get(format!("{origin}/admin/backup-audit?days=0"))
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        browser
+            .get(format!("{origin}/admin/backup-audit?days=1"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let after_preview = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    assert_eq!(before_preview, after_preview);
+    println!("PASS audit preview: authorized, read-only and inconclusive attempts preserved");
     assert_eq!(
         browser
             .get(format!("{origin}/admin/backup-audit"))

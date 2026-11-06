@@ -194,6 +194,18 @@ job nem um protocolo de reconciliação; `started` e `unknown` exigem inspeção
 objeto e não autorizam reenvio cego. Uma falha ao registrar resultado é sinalizada
 no processo, mas interrupção abrupta pode impedir aviso adicional.
 
+A página autenticada `/admin/backup-audit` oferece pré-visualização somente
+leitura com um número de dias escolhido pelo operador (1 a 36.500, limite de
+validação, não uma política). Exibe o corte UTC exclusivo, total de registros,
+confirmações com `finished_at` válido e anterior ao corte, `started`, `unknown`
+e outros registros preservados. Horário ausente, inválido ou anterior ao início
+nunca é contado como confirmação anterior. Todas as contagens vêm de uma única
+consulta SQLite; podem mudar depois, portanto não constituem uma lista imutável
+nem autorização para limpeza. A operação não remove registros, vínculos ou
+objetos S3, e não oferece botão de exclusão. Uma política e implementação de
+limpeza ainda dependem de decisão explícita; preservar inconclusivos continua
+obrigatório.
+
 Na página `/admin/backup-audit`, o administrador autenticado pode solicitar
 uma investigação por POST para uma tentativa `started` ou `unknown`; o serviço
 verifica apenas a presença da chave no **bucket atualmente configurado** usando
