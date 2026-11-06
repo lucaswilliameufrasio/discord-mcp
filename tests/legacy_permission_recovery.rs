@@ -255,3 +255,69 @@ fn rejects_revision_schema_and_invalid_rows_on_open_and_restore() {
         assert!(ChannelStore::open(&source, &key).is_err(), "{sql}");
     }
 }
+
+#[test]
+fn revision_check_is_not_required_on_existing_tables_but_invalid_data_is_rejected_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = dir.path().join("no-check.db");
+    let restored = dir.path().join("restored.db");
+    let key = [144; 32];
+    create_legacy_fixture(&path, &key);
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE channel_permission_revisions (channel_name TEXT PRIMARY KEY NOT NULL REFERENCES channels(name) ON DELETE CASCADE, revision INTEGER NOT NULL); INSERT INTO channel_permission_revisions VALUES ('support', 2); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let baseline = std::fs::read(&path).unwrap();
+    prepare_restored_copy(&path, &restored, &key, 90).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), baseline);
+    assert!(
+        ChannelStore::open(&restored, &key)
+            .unwrap()
+            .recovery_quarantined()
+            .unwrap()
+    );
+    let store = ChannelStore::open(&path, &key).unwrap();
+    assert_eq!(store.permission_context("support").unwrap().1, 2);
+    store
+        .set_permissions("101", "support", true, false)
+        .unwrap();
+    assert_eq!(store.permission_context("support").unwrap().1, 3);
+    // A non-cooperating SQLite client can violate the invariant while this
+    // connection remains open; reopening checks the persisted rows again.
+    let outsider = rusqlite::Connection::open(&path).unwrap();
+    outsider
+        .execute(
+            "UPDATE channel_permission_revisions SET revision=-1 WHERE channel_name='support'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(store.permission_context("support").unwrap().1, -1);
+    drop(outsider);
+    drop(store);
+    assert!(ChannelStore::open(&path, &key).is_err());
+    let rejected = dir.path().join("rejected.db");
+    assert!(prepare_restored_copy(&path, &rejected, &key, 90).is_err());
+    assert!(!rejected.exists());
+}
+
+#[test]
+fn newly_created_revision_table_rejects_negative_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("current.db");
+    let store = ChannelStore::open(&path, &[145; 32]).unwrap();
+    store.put_bot("support", "123", "synthetic-token").unwrap();
+    let outsider = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        outsider
+            .execute(
+                "INSERT INTO channel_permission_revisions VALUES ('support', -1)",
+                []
+            )
+            .is_err()
+    );
+}

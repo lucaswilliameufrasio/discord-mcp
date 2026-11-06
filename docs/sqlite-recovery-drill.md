@@ -122,6 +122,19 @@ incompatíveis, revisões inválidas ou registros órfãos são recusadas antes 
 publicação. A validação confere os dados existentes na abertura; não transforma
 escritores externos ou versões antigas em participantes do controle de revisão.
 
+A criação da tabela pela aplicação inclui `CHECK(revision >= 0)`, mas a
+validação de uma tabela já existente **não exige nem verifica a presença desse
+CHECK**. Uma tabela sem ele é aceita se as colunas, a chave primária, a chave
+estrangeira e os dados existentes forem válidos; uma cópia assim também pode ser
+publicada em quarentena. Os testes demonstram que outro cliente SQLite pode
+inserir uma revisão negativa enquanto a conexão permanece aberta e que essa
+conexão pode lê-la. Uma nova abertura ou preparação de cópia recusa os dados
+inválidos, mas isso não detecta nem impede alterações indevidas durante a vida
+de uma conexão já aberta, inclusive valores válidos que burlem a revisão.
+O lock consultivo não protege contra esse cliente; o controle concorrente
+depende de todos os escritores usarem a aplicação atual e de um limite de
+acesso apropriado no sistema operacional.
+
 O exercício filesystem opt-in passou usando o binário já existente em
 `target/replication-drill/debug/examples/snapshot-restore`. Sua proveniência
 não está fixada: o resultado não comprova build reproduzível da biblioteca,
