@@ -986,6 +986,24 @@ impl ChannelStore {
         Ok(permissions)
     }
 
+    /// Permissions and channel version for an administrative form, from one snapshot.
+    pub fn permission_view(
+        &self,
+        channel: &str,
+    ) -> Result<(Vec<ChannelPermission>, [u8; 32]), StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let version = self
+            .channel_version_in_snapshot(channel)?
+            .ok_or(StoreError::NotFound)?;
+        let permissions = self.list_permissions(channel)?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok((permissions, version))
+    }
+
     /// One SQLite statement provides a consistent point-in-time view.
     pub fn overview(&self, now: i64) -> Result<Overview, StoreError> {
         if now < 0 {

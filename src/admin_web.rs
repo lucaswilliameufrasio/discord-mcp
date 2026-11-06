@@ -988,12 +988,17 @@ async fn channel(
     if !authorized(&app, &headers) {
         return error(StatusCode::FORBIDDEN);
     }
-    let permissions = match store(&app).and_then(|store| store.list_permissions(&query.name)) {
-        Ok(value) => value,
-        Err(crate::channels::StoreError::NotFound) => return error(StatusCode::NOT_FOUND),
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
-    };
+    let (permissions, version) =
+        match store(&app).and_then(|store| store.permission_view(&query.name)) {
+            Ok(value) => value,
+            Err(crate::channels::StoreError::NotFound) => return error(StatusCode::NOT_FOUND),
+            Err(crate::channels::StoreError::RecoveryPending) => {
+                return error(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+        };
     let name = escape(&query.name);
+    let version = hex::encode(version);
     let mut rows = String::new();
     for permission in permissions {
         rows.push_str(&format!(
@@ -1007,7 +1012,7 @@ async fn channel(
         rows.push_str("<tr><td colspan=\"3\">Nenhuma permissão concedida.</td></tr>");
     }
     page(format!(
-        "<p><a href=\"/admin/channels\">Voltar aos canais</a></p><h1>Canal: {name}</h1><table><thead><tr><th>Usuário Discord</th><th>Leitura</th><th>Envio</th></tr></thead><tbody>{rows}</tbody></table><h2>Alterar permissão</h2><p>Use o ID numérico do usuário Discord. A nova escolha substitui as permissões anteriores.</p><form method=\"post\" action=\"/admin/permissions\"><input type=\"hidden\" name=\"channel\" value=\"{name}\"><label for=\"user_id\">ID do usuário Discord</label><input id=\"user_id\" name=\"user_id\" inputmode=\"numeric\" pattern=\"[0-9]+\" maxlength=\"20\" required><label for=\"permission\">Permissão</label><select id=\"permission\" name=\"permission\"><option value=\"none\">Nenhuma</option><option value=\"read\">Leitura</option><option value=\"send\">Envio</option><option value=\"both\">Leitura e envio</option></select><button>Salvar permissão</button></form>"
+        "<p><a href=\"/admin/channels\">Voltar aos canais</a></p><h1>Canal: {name}</h1><table><thead><tr><th>Usuário Discord</th><th>Leitura</th><th>Envio</th></tr></thead><tbody>{rows}</tbody></table><h2>Alterar permissão</h2><p>Use o ID numérico do usuário Discord. A nova escolha substitui as permissões anteriores.</p><form method=\"post\" action=\"/admin/permissions\"><input type=\"hidden\" name=\"channel\" value=\"{name}\"><input type=\"hidden\" name=\"version\" value=\"{version}\"><label for=\"user_id\">ID do usuário Discord</label><input id=\"user_id\" name=\"user_id\" inputmode=\"numeric\" pattern=\"[0-9]+\" maxlength=\"20\" required><label for=\"permission\">Permissão</label><select id=\"permission\" name=\"permission\"><option value=\"none\">Nenhuma</option><option value=\"read\">Leitura</option><option value=\"send\">Envio</option><option value=\"both\">Leitura e envio</option></select><button>Salvar permissão</button></form>"
     ))
 }
 
@@ -1016,6 +1021,8 @@ struct PermissionForm {
     user_id: String,
     channel: String,
     permission: String,
+    #[serde(default)]
+    version: String,
 }
 
 async fn set_permission(
@@ -1026,6 +1033,11 @@ async fn set_permission(
     if !allowed_post(&app, &headers) {
         return error(StatusCode::FORBIDDEN);
     }
+    let Ok(version) = hex::decode(&form.version).and_then(|value| {
+        <[u8; 32]>::try_from(value).map_err(|_| hex::FromHexError::InvalidStringLength)
+    }) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
     let (read, send) = match form.permission.as_str() {
         "none" => (false, false),
         "read" => (true, false),
@@ -1038,7 +1050,7 @@ async fn set_permission(
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
     };
     let result = store(&app).and_then(|store| {
-        store.set_permissions_audited(
+        store.set_permissions_audited_if_version(
             &form.user_id,
             &form.channel,
             read,
@@ -1048,10 +1060,19 @@ async fn set_permission(
                 now,
                 retention_days: app.config.auth.audit.retention_days(),
             },
+            version,
         )
     });
     match result {
         Ok(()) => {}
+        Err(crate::channels::StoreError::AuthorizationDenied) => {
+            let mut response = page("<p>O canal foi alterado. Volte à lista de canais e confira novamente antes de alterar permissões.</p><p><a href=\"/admin/channels\">Voltar aos canais</a></p>".into());
+            *response.status_mut() = StatusCode::CONFLICT;
+            return response;
+        }
+        Err(crate::channels::StoreError::RecoveryPending) => {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
         Err(crate::channels::StoreError::Storage | crate::channels::StoreError::Decryption) => {
             app.config.auth.audit.mark_failure();
             return error(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1318,6 +1339,57 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
+        store.put_bot("race", "123", "synthetic-token").unwrap();
+        let html = client
+            .get(format!("{origin}/admin/channel?name=race"))
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let old_version = html
+            .split("name=\"version\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+        store
+            .put_bot("race", "456", "replacement-synthetic")
+            .unwrap();
+        let stale = client
+            .post(format!("{origin}/admin/permissions"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[
+                ("channel", "race"),
+                ("user_id", "111"),
+                ("permission", "read"),
+                ("version", old_version.as_str()),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(stale.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(stale.text().await.unwrap().contains("canal foi alterado"));
+        assert!(
+            !store
+                .audit_events(None, Some("permission_change"), 100)
+                .unwrap()
+                .iter()
+                .any(|row| row.channel.as_deref() == Some("race")
+                    && row.subject_user_id.as_deref() == Some("111"))
+        );
+        assert!(
+            !store
+                .is_permitted("111", "race", ChannelAction::Read)
+                .unwrap()
+        );
+        store.delete("race").unwrap();
         // The browser session is never supplied to the CLI endpoints.
         use sha2::{Digest, Sha256};
         let verifier = [42_u8; 32];
@@ -1465,12 +1537,64 @@ mod tests {
         assert!(metrics.contains("<dt>Falhas de envio</dt><dd>1</dd>"));
         assert!(!metrics.contains("synthetic-bot-token"));
         let endpoint = format!("{origin}/admin/permissions");
+        let html = client
+            .get(&channel)
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let version = html
+            .split("name=\"version\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
         let post = || {
             client
                 .post(&endpoint)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body("channel=alerts&user_id=456&permission=read")
+                .body(format!(
+                    "channel=alerts&user_id=456&permission=read&version={version}"
+                ))
         };
+        assert_eq!(
+            client
+                .post(&endpoint)
+                .header(header::COOKIE, &session)
+                .header(header::ORIGIN, &origin)
+                .form(&[
+                    ("channel", "alerts"),
+                    ("user_id", "456"),
+                    ("permission", "read")
+                ])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            client
+                .post(&endpoint)
+                .header(header::COOKIE, &session)
+                .header(header::ORIGIN, &origin)
+                .form(&[
+                    ("channel", "alerts"),
+                    ("user_id", "456"),
+                    ("permission", "read"),
+                    ("version", "invalid")
+                ])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             post()
                 .header(header::ORIGIN, &origin)
@@ -1559,7 +1683,9 @@ mod tests {
             .header(header::COOKIE, &session)
             .header(header::ORIGIN, &origin)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body("channel=alerts&user_id=456&permission=none")
+            .body(format!(
+                "channel=alerts&user_id=456&permission=none&version={version}"
+            ))
             .send()
             .await
             .unwrap();
@@ -1609,6 +1735,33 @@ mod tests {
         assert_eq!(logins[0].outcome, "denied");
         assert_eq!(logins[1].actor_id.as_deref(), Some("123"));
         assert_eq!(logins[1].outcome, "success");
+        rusqlite::Connection::open(dir.path().join("admin.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            post()
+                .header(header::COOKIE, &session)
+                .header(header::ORIGIN, &origin)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            client
+                .get(&channel)
+                .header(header::COOKIE, &session)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         fake.join().unwrap();
         let logout = client
             .post(format!("{origin}/admin/logout"))

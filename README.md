@@ -102,6 +102,11 @@ momento da consulta: canais, usuários com concessões, permissões de leitura e
 envio e tokens MCP não expirados. Tokens não expirados não são conexões ativas.
 A criação de canais ainda é feita na interface local.
 
+O formulário de permissões fica vinculado à versão do canal exibido. Se o canal
+for substituído antes do envio, a alteração é recusada; volte à lista e confira
+o canal novamente. A tabela de permissões e a versão exibidas são lidas do
+mesmo snapshot do SQLite.
+
 Para alterar uma permissão remotamente, use
 `discord-mcp remote-set-permission ORIGEM ID_DISCORD CANAL read|send|both|none`.
 A origem deve ser HTTPS (HTTP somente em loopback). Abra o link exibido, entre
