@@ -44,6 +44,8 @@ SameSite estrito e não exibe webhooks já cadastrados. É uma interface local,
 não um servidor acessível remotamente. Ela roda em processo separado do MCP
 stdio e utiliza o mesmo banco. Não protege contra outro processo com os mesmos
 privilégios do usuário que consiga ler a chave ou controlar o navegador.
+Na remoção, a confirmação é vinculada à versão do canal exibida; se o canal
+for substituído antes da confirmação, a interface recusa e pede nova revisão.
 
 ### Servidor HTTP experimental
 

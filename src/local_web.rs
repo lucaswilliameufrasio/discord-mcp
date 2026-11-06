@@ -276,6 +276,13 @@ struct NameForm {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct DeleteForm {
+    name: String,
+    #[serde(default)]
+    version: String,
+}
+
 async fn delete_confirm(
     State(app): State<Shared>,
     headers: HeaderMap,
@@ -284,20 +291,27 @@ async fn delete_confirm(
     if !allowed_post(&app, &headers) || !authenticated(&app, &headers) {
         return denied();
     }
-    // Only names present in the store (and validated on insertion) are rendered.
-    let names = match app.storage.open().and_then(|store| store.list()) {
-        Ok(names) => names,
+    let version = match app
+        .storage
+        .open()
+        .and_then(|store| store.channel_version(&form.name))
+    {
+        Ok(Some(version)) => hex::encode(version),
+        Ok(None) => return page(StatusCode::NOT_FOUND, "<p>Canal não encontrado.</p>".into()),
+        Err(discord_mcp::channels::StoreError::RecoveryPending) => {
+            return page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "<p>Banco em quarentena.</p>".into(),
+            );
+        }
         Err(_) => return denied(),
     };
-    if !names.contains(&form.name) {
-        return page(StatusCode::NOT_FOUND, "<p>Canal não encontrado.</p>".into());
-    }
     let safe_name = escape_html(&form.name);
     page(
         StatusCode::OK,
         format!(
-            r#"<p>Remover o canal <strong>{}</strong>? Essa ação remove o cadastro local, mas não revoga o webhook no Discord.</p><form method="post" action="/delete/confirm"><input type="hidden" name="name" value="{}"><button class="danger">Confirmar remoção</button></form><p><a href="/">Cancelar</a></p>"#,
-            safe_name, safe_name
+            r#"<p>Remover o canal <strong>{}</strong>? Essa ação remove o cadastro e as permissões locais, mas não revoga o webhook no Discord.</p><form method="post" action="/delete/confirm"><input type="hidden" name="name" value="{}"><input type="hidden" name="version" value="{}"><button class="danger">Confirmar remoção</button></form><p><a href="/">Cancelar</a></p>"#,
+            safe_name, safe_name, version
         ),
     )
 }
@@ -305,21 +319,24 @@ async fn delete_confirm(
 async fn delete(
     State(app): State<Shared>,
     headers: HeaderMap,
-    Form(form): Form<NameForm>,
+    Form(form): Form<DeleteForm>,
 ) -> Response {
     if !allowed_post(&app, &headers) || !authenticated(&app, &headers) {
         return denied();
     }
-    if app
-        .storage
-        .open()
-        .and_then(|store| store.delete(&form.name))
-        .is_err()
-    {
+    let Ok(version) = hex::decode(&form.version).and_then(|value| {
+        <[u8; 32]>::try_from(value).map_err(|_| hex::FromHexError::InvalidStringLength)
+    }) else {
         return page(
-            StatusCode::NOT_FOUND,
-            "<p>Não foi possível remover o canal.</p>".into(),
+            StatusCode::BAD_REQUEST,
+            "<p>Confirmação inválida. Volte à lista de canais.</p>".into(),
         );
+    };
+    match app.storage.open().and_then(|store| store.delete_if_version(&form.name, version)) {
+        Ok(()) => {}
+        Err(discord_mcp::channels::StoreError::AuthorizationDenied) => return page(StatusCode::CONFLICT, "<p>O canal foi alterado. Volte à lista e confirme novamente.</p><p><a href=\"/\">Voltar aos canais</a></p>".into()),
+        Err(discord_mcp::channels::StoreError::RecoveryPending) => return page(StatusCode::SERVICE_UNAVAILABLE, "<p>Banco em quarentena.</p>".into()),
+        Err(_) => return page(StatusCode::INTERNAL_SERVER_ERROR, "<p>Não foi possível remover o canal.</p>".into()),
     }
     (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response()
 }
@@ -412,6 +429,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        let store = storage.open().unwrap();
+        store.put_bot("race", "123", "synthetic-token").unwrap();
+        let html = post("/delete", "name=race".into())
+            .header(header::ORIGIN, &origin)
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let version = html
+            .split("name=\"version\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+        store
+            .put_bot("race", "456", "replacement-synthetic")
+            .unwrap();
+        let stale = post("/delete/confirm", format!("name=race&version={version}"))
+            .header(header::ORIGIN, &origin)
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert!(store.list().unwrap().contains(&"race".to_owned()));
+        assert!(
+            !store
+                .audit_events(None, Some("channel_deleted"), 100)
+                .unwrap()
+                .iter()
+                .any(|row| row.channel.as_deref() == Some("race"))
+        );
+        store.delete("race").unwrap();
         let bot_saved = post(
             "/channels/bot",
             "name=robot&channel_id=123&token=synthetic-bot-token".into(),
@@ -445,11 +500,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(confirmation.status(), StatusCode::OK);
+        let html = confirmation.text().await.unwrap();
+        let version = html
+            .split("name=\"version\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
         assert_eq!(
             storage.open().unwrap().list().unwrap(),
             vec!["alerts", "robot"]
         );
-        let removed = post("/delete/confirm", "name=alerts".into())
+        assert_eq!(
+            post("/delete/confirm", "name=alerts".into())
+                .header(header::ORIGIN, &origin)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let removed = post("/delete/confirm", format!("name=alerts&version={version}"))
             .header(header::ORIGIN, &origin)
             .header(header::COOKIE, &cookie)
             .send()
@@ -457,6 +531,38 @@ mod tests {
             .unwrap();
         assert_eq!(removed.status(), StatusCode::SEE_OTHER);
         assert_eq!(storage.open().unwrap().list().unwrap(), vec!["robot"]);
+        let robot_version = hex::encode(store.channel_version("robot").unwrap().unwrap());
+        rusqlite::Connection::open(&storage.path)
+            .unwrap()
+            .execute(
+                "INSERT INTO recovery_control(id,quarantined) VALUES(1,1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            post("/delete", "name=robot".into())
+                .header(header::ORIGIN, &origin)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            post(
+                "/delete/confirm",
+                format!("name=robot&version={robot_version}")
+            )
+            .header(header::ORIGIN, &origin)
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(store.list().unwrap().contains(&"robot".to_owned()));
         server.abort();
     }
 }

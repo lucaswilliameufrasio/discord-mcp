@@ -578,6 +578,10 @@ impl ChannelStore {
         self.delete_checked(name, None, AuditActor::LocalOperator)
     }
 
+    pub fn delete_if_version(&self, name: &str, version: [u8; 32]) -> Result<(), StoreError> {
+        self.delete_checked(name, Some(version), AuditActor::LocalOperator)
+    }
+
     /// Identify the exact encrypted record, without returning its credential.
     pub fn channel_version(&self, name: &str) -> Result<Option<[u8; 32]>, StoreError> {
         let transaction = self
