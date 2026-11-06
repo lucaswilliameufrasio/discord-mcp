@@ -146,6 +146,15 @@ seu próprio banco e as concessões e auditorias de sucesso permanecem iguais.
 Os handlers abrem novas conexões, logo esse teste inclui a validação de abertura;
 o teste de armazenamento com conexão mantida aberta cobre o caso ativo separado.
 
+O teste sintético `permission_transaction_serializes_competing_revision_writer`
+pausa a operação real por trace SQLite, após `BEGIN IMMEDIATE` e a checagem da
+revisão, imediatamente antes de incrementá-la. Uma segunda conexão, sem espera,
+recebe `SQLITE_BUSY` ao tentar alterar a revisão. Após liberar a operação, o teste
+confirma o incremento, a permissão e uma única auditoria de sucesso. A segunda
+conexão consegue escrever depois do commit: essa evidência comprova serialização
+da transação testada, não exclusividade nem proteção contra alterações externas
+posteriores. A pausa e o trace existem apenas no teste e não no runtime.
+
 O exercício filesystem opt-in passou usando o binário já existente em
 `target/replication-drill/debug/examples/snapshot-restore`. Sua proveniência
 não está fixada: o resultado não comprova build reproduzível da biblioteca,

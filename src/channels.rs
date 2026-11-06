@@ -1553,6 +1553,106 @@ mod token_snapshot_tests {
     }
 
     #[test]
+    fn permission_transaction_serializes_competing_revision_writer() {
+        use super::{AuditActor, AuditContext, ChannelAction, current_timestamp};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic-permission.db");
+        let key = [146; 32];
+        let store = ChannelStore::open(&path, &key).unwrap();
+        store.put_bot("alerts", "123", "synthetic-token").unwrap();
+        store.set_permissions("101", "alerts", true, false).unwrap();
+        let (version, revision) = store.permission_context("alerts").unwrap();
+        let prior_audit = store
+            .audit_events(None, Some("permission_change"), 100)
+            .unwrap()
+            .len();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut barrier = Box::new(TraceBarrier {
+                entered: entered_tx,
+                resume: resume_rx,
+                prefix: b"INSERT INTO channel_permission_revisions",
+            });
+            // SAFETY: this thread owns the connection and callback context;
+            // tracing is removed before the context is dropped.
+            let handle = unsafe { store.db.handle() };
+            let registered = unsafe {
+                ffi::sqlite3_trace_v2(
+                    handle,
+                    ffi::SQLITE_TRACE_STMT,
+                    Some(pause_token_statement),
+                    (&mut *barrier as *mut TraceBarrier).cast(),
+                )
+            };
+            assert_eq!(registered, ffi::SQLITE_OK);
+            let result = store.set_permissions_audited_if_version(
+                "101",
+                "alerts",
+                false,
+                true,
+                AuditContext {
+                    actor: AuditActor::Discord("123"),
+                    now: current_timestamp().unwrap(),
+                    retention_days: 90,
+                },
+                (version.unwrap(), revision),
+            );
+            let removed = unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+            assert_eq!(removed, ffi::SQLITE_OK);
+            result
+        });
+        // The paused statement follows BEGIN IMMEDIATE and the revision check,
+        // but precedes both the revision increment and permission write.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let error = writer
+            .execute(
+                "UPDATE channel_permission_revisions SET revision=99 WHERE channel_name='alerts'",
+                [],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let visible: i64 = writer
+            .query_row(
+                "SELECT revision FROM channel_permission_revisions WHERE channel_name='alerts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible, revision);
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        let check = ChannelStore::open(&path, &key).unwrap();
+        assert_eq!(check.permission_context("alerts").unwrap().1, revision + 1);
+        assert!(
+            !check
+                .is_permitted("101", "alerts", ChannelAction::Read)
+                .unwrap()
+        );
+        assert!(
+            check
+                .is_permitted("101", "alerts", ChannelAction::Send)
+                .unwrap()
+        );
+        let audit = check
+            .audit_events(None, Some("permission_change"), 100)
+            .unwrap();
+        assert_eq!(audit.len(), prior_audit + 1);
+        assert_eq!(audit[0].outcome, "success");
+        assert_eq!(audit[0].actor_id.as_deref(), Some("123"));
+        assert_eq!(audit[0].can_read, Some(false));
+        assert_eq!(audit[0].can_send, Some(true));
+        // Once committed, SQLite permits the non-cooperating writer to act.
+        assert_eq!(writer.execute("UPDATE channel_permission_revisions SET revision=99 WHERE channel_name='alerts'", []).unwrap(), 1);
+        assert_eq!(check.permission_context("alerts").unwrap().1, 99);
+    }
+
+    #[test]
     fn quarantine_committed_before_token_statement_is_observed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic.db");
