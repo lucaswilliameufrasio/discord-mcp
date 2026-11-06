@@ -57,6 +57,10 @@ o formulário se houver mais de 10.000 canais.
 
 ### Servidor HTTP experimental
 
+Modelos alternativos para Linux com systemd ou Docker e seus limites estão em
+[`docs/remote-runtime-options.md`](docs/remote-runtime-options.md). Eles não
+instalam serviços, não configuram backups e não são prontos para produção.
+
 O comando `discord-mcp serve` inicia OAuth e MCP HTTP usando o mesmo banco de
 canais. O processo só aceita escutar em endereço de loopback; não o exponha
 diretamente em uma interface pública. O servidor ainda não foi validado com o

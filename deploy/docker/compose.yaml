@@ -1,0 +1,53 @@
+services:
+  discord-mcp:
+    image: ${DISCORD_MCP_IMAGE:?Set a reviewed image reference}
+    user: ${DISCORD_MCP_CONTAINER_UID:?Set a non-root container UID}:${DISCORD_MCP_CONTAINER_GID:?Set a non-root container GID}
+    ports:
+      - 127.0.0.1:${DISCORD_MCP_HOST_PORT:?Set an available host loopback port}:8080
+    env_file:
+      - ${DISCORD_MCP_SERVICE_ENV:?Set an external private service environment file}
+    environment:
+      DISCORD_MCP_DB: /var/lib/discord-mcp/channels.db
+      DISCORD_MCP_LISTEN: 127.0.0.1:8000
+    volumes:
+      - type: bind
+        source: ${DISCORD_MCP_DATA_DIR:?Set an existing private data directory}
+        target: /var/lib/discord-mcp
+        bind:
+          create_host_path: false
+    command: ["serve"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 25s
+    restart: unless-stopped
+  loopback-relay:
+    image: ${DISCORD_MCP_RELAY_IMAGE:?Set a reviewed Caddy image reference}
+    network_mode: service:discord-mcp
+    depends_on:
+      - discord-mcp
+    user: ${DISCORD_MCP_CONTAINER_UID:?Set a non-root container UID}:${DISCORD_MCP_CONTAINER_GID:?Set a non-root container GID}
+    command: ["run", "--config", "/etc/caddy/relay.Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      XDG_CONFIG_HOME: /tmp/caddy-config
+      XDG_DATA_HOME: /tmp/caddy-data
+    volumes:
+      - type: bind
+        source: ./relay.Caddyfile
+        target: /etc/caddy/relay.Caddyfile
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    stop_grace_period: 10s
+    restart: unless-stopped
