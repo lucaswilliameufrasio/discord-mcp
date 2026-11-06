@@ -1553,6 +1553,108 @@ mod token_snapshot_tests {
     }
 
     #[test]
+    fn recovery_activation_serializes_authority_reintroduction() {
+        use super::{ChannelAction, StoreError};
+        for before_reservation in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("synthetic-recovery.db");
+            let store = ChannelStore::open(&path, &[152; 32]).unwrap();
+            store.put_bot("alerts", "123", "synthetic-token").unwrap();
+            store.set_permissions("101", "alerts", true, false).unwrap();
+            store.quarantine_recovered_copy().unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut barrier = Box::new(TraceBarrier {
+                    entered: entered_tx,
+                    resume: resume_rx,
+                    prefix: if before_reservation {
+                        b"BEGIN IMMEDIATE"
+                    } else {
+                        b"UPDATE recovery_control SET quarantined=0"
+                    },
+                });
+                // SAFETY: the worker owns the connection and trace context;
+                // tracing is unregistered before the context is dropped.
+                let handle = unsafe { store.db.handle() };
+                let registered = unsafe {
+                    ffi::sqlite3_trace_v2(
+                        handle,
+                        ffi::SQLITE_TRACE_STMT,
+                        Some(pause_token_statement),
+                        (&mut *barrier as *mut TraceBarrier).cast(),
+                    )
+                };
+                assert_eq!(registered, ffi::SQLITE_OK);
+                let result = store.activate_recovered_copy();
+                let removed =
+                    unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+                assert_eq!(removed, ffi::SQLITE_OK);
+                (store, result)
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.busy_timeout(Duration::ZERO).unwrap();
+            let insert = "INSERT INTO channel_permissions VALUES ('101','alerts',1,0)";
+            if before_reservation {
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                writer.execute(insert, []).unwrap();
+                writer.execute_batch("COMMIT").unwrap();
+                let visible: i64 = writer
+                    .query_row("SELECT count(*) FROM channel_permissions", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(visible, 1);
+            } else {
+                let error = writer.execute(insert, []).unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+            }
+            resume_tx.send(()).unwrap();
+            let (store, result) = worker.join().unwrap();
+            let audit = store
+                .audit_events(None, Some("recovery_activated"), 10)
+                .unwrap();
+            if before_reservation {
+                assert!(matches!(result, Err(StoreError::InvalidInput)));
+                assert!(store.recovery_quarantined().unwrap());
+                assert!(matches!(
+                    store.is_permitted("101", "alerts", ChannelAction::Read),
+                    Err(StoreError::RecoveryPending)
+                ));
+                assert!(audit.is_empty());
+                let count: i64 = writer
+                    .query_row("SELECT count(*) FROM channel_permissions", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 1);
+            } else {
+                assert!(result.is_ok());
+                assert!(!store.recovery_quarantined().unwrap());
+                assert!(
+                    !store
+                        .is_permitted("101", "alerts", ChannelAction::Read)
+                        .unwrap()
+                );
+                assert_eq!(audit.len(), 1);
+                assert_eq!(audit[0].outcome, "success");
+                assert_eq!(audit[0].actor_kind, "local_operator");
+                // A non-cooperating writer can still add authority after commit.
+                assert_eq!(writer.execute(insert, []).unwrap(), 1);
+                assert!(
+                    store
+                        .is_permitted("101", "alerts", ChannelAction::Read)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn invalid_revision_committed_before_write_reservation_is_rejected() {
         use super::{AuditActor, AuditContext, ChannelAction, StoreError, current_timestamp};
         let dir = tempfile::tempdir().unwrap();

@@ -115,6 +115,15 @@ preservados e não há auditoria de ativação bem-sucedida; a fonte offline é
 comparada byte a byte. Esse teste não autoriza corrigir dados reais manualmente
 nem comprova isolamento contra o escritor que introduziu os registros.
 
+O teste `recovery_activation_serializes_authority_reintroduction` usa duas
+conexões SQLite e uma pausa de trace restrita ao teste para verificar as duas
+ordens de concorrência. Uma permissão confirmada antes de `BEGIN IMMEDIATE`
+impede a ativação, mantendo quarentena e ausência de auditoria de ativação;
+após a reserva e a checagem de autoridade, a inserção concorrente recebe
+`SQLITE_BUSY`, e a ativação confirma estado e uma auditoria de sucesso. Uma
+inserção externa depois do commit consegue conceder acesso: serialização não é
+isolamento de processos nem impede autoridade indevida posteriormente.
+
 Duas execuções adicionais incluíram prefixos exclusivos com o manifesto presente
 mas LTX ausente, e com o mesmo manifesto mais LTX truncado. Cada restore retornou
 erro e não publicou banco nem sidecars no destino. Em outro cenário, um endpoint
