@@ -115,6 +115,14 @@ preservados e não há auditoria de ativação bem-sucedida; a fonte offline é
 comparada byte a byte. Esse teste não autoriza corrigir dados reais manualmente
 nem comprova isolamento contra o escritor que introduziu os registros.
 
+`activation_audit_failure_rolls_back_quarantine_transition` injeta, apenas
+após preparar uma cópia sintética, um trigger que falha na inserção da auditoria
+de ativação. A CLI retorna erro e a transação reverte a saída da quarentena;
+nenhuma ativação bem-sucedida aparece, as autoridades continuam invalidadas e
+a fonte offline permanece igual byte a byte. O trigger é um mecanismo de teste,
+não parte da solução: a preparação rejeita fontes contendo triggers. A injeção
+não simula falta de espaço, pane do host ou interrupção no commit.
+
 O teste `recovery_activation_serializes_authority_reintroduction` usa duas
 conexões SQLite e uma pausa de trace restrita ao teste para verificar as duas
 ordens de concorrência. Uma permissão confirmada antes de `BEGIN IMMEDIATE`

@@ -459,6 +459,97 @@ fn activation_cli_rejects_reintroduced_authority_and_preserves_source() {
 }
 
 #[test]
+fn activation_audit_failure_rolls_back_quarantine_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let source = dir.path().join("source.db");
+    let destination = dir.path().join("quarantine.db");
+    let key = [153_u8; 32];
+    let source_store = ChannelStore::open(&source, &key).unwrap();
+    source_store
+        .put_bot("alerts", "123", "synthetic-token")
+        .unwrap();
+    source_store
+        .set_permissions("101", "alerts", true, false)
+        .unwrap();
+    drop(source_store);
+    let source_baseline = std::fs::read(&source).unwrap();
+    prepare_restored_copy(&source, &destination, &key, 90).unwrap();
+    {
+        let db = rusqlite::Connection::open(&destination).unwrap();
+        // Fault injection only after preparation: restored sources with triggers
+        // are rejected, and this trigger exists solely in the synthetic copy.
+        db.execute_batch("CREATE TRIGGER fail_activation_audit AFTER INSERT ON audit_events WHEN NEW.event_type='recovery_activated' BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END;").unwrap();
+    }
+    let before = ChannelStore::open(&destination, &key).unwrap();
+    let quarantine_audits = before
+        .audit_events(None, Some("recovery_quarantined"), 10)
+        .unwrap()
+        .len();
+    assert_eq!(quarantine_audits, 1);
+    assert!(before.recovery_quarantined().unwrap());
+    drop(before);
+    let result = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &destination)
+        .env("DISCORD_MCP_KEY", hex::encode(key))
+        .args(["recovery-activate", "--confirm"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Storage"));
+    let after = ChannelStore::open(&destination, &key).unwrap();
+    assert!(after.recovery_quarantined().unwrap());
+    assert!(matches!(
+        after.get_channel("alerts"),
+        Err(StoreError::RecoveryPending)
+    ));
+    assert!(matches!(
+        after.set_permissions("101", "alerts", true, false),
+        Err(StoreError::RecoveryPending)
+    ));
+    assert!(
+        after
+            .audit_events(None, Some("recovery_activated"), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        after
+            .audit_events(None, Some("recovery_quarantined"), 10)
+            .unwrap()
+            .len(),
+        quarantine_audits
+    );
+    drop(after);
+    let db = rusqlite::Connection::open(&destination).unwrap();
+    for table in [
+        "channel_permissions",
+        "mcp_access_tokens",
+        "mcp_authorization_codes",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    drop(db);
+    assert_eq!(std::fs::read(&source).unwrap(), source_baseline);
+    let original = ChannelStore::open(&source, &key).unwrap();
+    assert!(
+        original
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+}
+
+#[test]
 fn refuses_missing_key_marker_triggers_and_source_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]
