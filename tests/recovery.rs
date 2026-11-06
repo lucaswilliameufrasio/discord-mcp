@@ -283,6 +283,85 @@ fn corrupt_channel_ciphertext_rejects_staged_restore_without_touching_source() {
 }
 
 #[test]
+fn recovery_prepare_cli_wrong_key_cleans_staging_and_allows_safe_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let source = dir.path().join("source.db");
+    let destination = dir.path().join("prepared.db");
+    let key = [149_u8; 32];
+    let source_store = ChannelStore::open(&source, &key).unwrap();
+    source_store
+        .put_bot("alerts", "123", "synthetic-token")
+        .unwrap();
+    source_store
+        .set_permissions("101", "alerts", true, false)
+        .unwrap();
+    drop(source_store);
+    let baseline = std::fs::read(&source).unwrap();
+    let run = |key: [u8; 32]| {
+        Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .args([
+                std::ffi::OsStr::new("recovery-prepare"),
+                source.as_os_str(),
+                destination.as_os_str(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let failure = run([150; 32]);
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("InvalidKeyOrData"));
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), baseline);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!dir.path().join(format!("prepared.db{suffix}")).exists());
+    }
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".discord-mcp-recovery-")
+    }));
+    let success = run(key);
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&success.stdout)
+            .contains("Quarantined copy prepared; invalidated permissions=1")
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), baseline);
+    let prepared = ChannelStore::open(&destination, &key).unwrap();
+    assert!(prepared.recovery_quarantined().unwrap());
+    assert!(matches!(
+        prepared.get_channel("alerts"),
+        Err(StoreError::RecoveryPending)
+    ));
+    drop(prepared);
+    let destination_baseline = std::fs::read(&destination).unwrap();
+    let repeat = run(key);
+    assert!(!repeat.status.success());
+    assert!(String::from_utf8_lossy(&repeat.stderr).contains("DestinationExists"));
+    assert_eq!(std::fs::read(&destination).unwrap(), destination_baseline);
+    assert_eq!(std::fs::read(&source).unwrap(), baseline);
+    let original = ChannelStore::open(&source, &key).unwrap();
+    assert!(
+        original
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+}
+
+#[test]
 fn refuses_missing_key_marker_triggers_and_source_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]

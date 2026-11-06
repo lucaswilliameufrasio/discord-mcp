@@ -99,6 +99,14 @@ preserva byte a byte a fonte; o outro canal e sua permissão seguem acessíveis.
 Esse teste não exercita queda brusca, fonte ativa, perda de chave ou recuperação
 de infraestrutura e não demonstra disponibilidade de backups reais.
 
+O teste `recovery_prepare_cli_wrong_key_cleans_staging_and_allows_safe_retry`
+executa a CLI real sobre uma imagem sintética offline, sem serviços externos.
+Uma chave incorreta retorna erro, preserva a fonte byte a byte e não deixa
+destino, sidecars ou diretório de staging. Uma nova execução com a chave correta
+publica uma cópia em quarentena e invalida a concessão; uma terceira execução
+recusa sobrescrever essa cópia e preserva seus bytes. O teste não cobre crash,
+custódia de chave, recuperação de backup real ou ativação em produção.
+
 Duas execuções adicionais incluíram prefixos exclusivos com o manifesto presente
 mas LTX ausente, e com o mesmo manifesto mais LTX truncado. Cada restore retornou
 erro e não publicou banco nem sidecars no destino. Em outro cenário, um endpoint
