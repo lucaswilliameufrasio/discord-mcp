@@ -99,6 +99,10 @@ fn preparation_quarantines_and_invalidates_restored_authority_before_activation(
     let recovered = ChannelStore::open(&output, &key).unwrap();
     assert!(recovered.recovery_quarantined().unwrap());
     assert!(matches!(
+        recovered.list_active(),
+        Err(StoreError::RecoveryPending)
+    ));
+    assert!(matches!(
         recovered.get_channel("alerts"),
         Err(StoreError::RecoveryPending)
     ));

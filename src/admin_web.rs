@@ -17,7 +17,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     channels::{AuditActor, AuditContext, ChannelStore, LoginKind, current_timestamp},
-    cli_authorization::{CliAuthorizations, PermissionChange},
+    cli_authorization::{CliAuthorizations, CliOperation, PermissionChange},
     discord_login::{DiscordLoginClient, PendingDiscordLogin},
     http_auth::AuthState,
 };
@@ -77,10 +77,32 @@ pub(crate) fn router_with_cli(
         .route("/admin/permissions", post(set_permission))
         .route("/admin/logout", post(logout))
         .route("/v1/cli/requests", post(cli_begin))
+        .route("/v1/cli/list-requests", post(cli_begin_list))
         .route("/v1/cli/execute", post(cli_execute))
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[derive(Deserialize)]
+struct CliBeginList {
+    challenge: String,
+}
+
+async fn cli_begin_list(State(app): State<Shared>, Json(req): Json<CliBeginList>) -> Response {
+    let Ok(bytes) = hex::decode(req.challenge) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let Ok(challenge) = <[u8; 32]>::try_from(bytes) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let id = match app.cli.begin_list(challenge, Instant::now()) {
+        Ok(id) => id,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id": id})).into_response();
+    headers(&mut response);
+    response
 }
 
 #[derive(Deserialize)]
@@ -131,12 +153,18 @@ async fn cli_consent(
     let Some(operation) = app.cli.pending(&req.request_id, Instant::now()) else {
         return error(StatusCode::NOT_FOUND);
     };
+    let description = match operation {
+        CliOperation::PermissionChange(operation) => format!(
+            "Alterar permissão<br>Usuário: {}<br>Canal: {}<br>Leitura: {}<br>Envio: {}",
+            escape(&operation.user_id),
+            escape(&operation.channel),
+            operation.read,
+            operation.send
+        ),
+        CliOperation::ListChannels => "Consultar nomes dos canais cadastrados".to_owned(),
+    };
     page(format!(
-        "<h1>Autorizar solicitação da CLI</h1><p>Usuário: {}<br>Canal: {}<br>Leitura: {}<br>Envio: {}</p><form method=\"post\" action=\"/admin/cli\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Autorizar esta alteração</button></form>",
-        escape(&operation.user_id),
-        escape(&operation.channel),
-        operation.read,
-        operation.send,
+        "<h1>Autorizar solicitação da CLI</h1><p>{description}</p><form method=\"post\" action=\"/admin/cli\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Autorizar esta operação</button></form>",
         escape(&req.request_id)
     ))
 }
@@ -167,6 +195,26 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
     };
     let Some(operation) = app.cli.consume(&req.request_id, &verifier, Instant::now()) else {
         return error(StatusCode::FORBIDDEN);
+    };
+    let operation = match operation {
+        CliOperation::PermissionChange(operation) => operation,
+        CliOperation::ListChannels => {
+            return match store(&app).and_then(|store| store.list_active()) {
+                Ok(names) => {
+                    let mut response =
+                        Json(rmcp::serde_json::json!({"channels": names})).into_response();
+                    headers(&mut response);
+                    response
+                }
+                Err(crate::channels::StoreError::RecoveryPending) => {
+                    error(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                Err(_) => {
+                    app.config.auth.audit.mark_failure();
+                    error(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            };
+        }
     };
     let Ok(now) = current_timestamp() else {
         return error(StatusCode::INTERNAL_SERVER_ERROR);

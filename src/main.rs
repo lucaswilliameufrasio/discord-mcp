@@ -173,7 +173,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let [command, origin, user, channel, permission] = args.as_slice()
         && command == "remote-set-permission"
     {
-        remote_set_permission(origin, user, channel, permission).await?;
+        remote_operation(origin, Some((user, channel, permission))).await?;
+        return Ok(());
+    }
+    if let [command, origin] = args.as_slice()
+        && command == "remote-list-channels"
+    {
+        remote_operation(origin, None).await?;
         return Ok(());
     }
     if let [command, source, destination] = args.as_slice()
@@ -222,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
@@ -319,11 +325,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn remote_set_permission(
+async fn remote_operation(
     origin: &str,
-    user: &str,
-    channel: &str,
-    permission: &str,
+    permission_change: Option<(&str, &str, &str)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use sha2::{Digest, Sha256};
     use std::time::Duration;
@@ -344,13 +348,6 @@ async fn remote_set_permission(
     {
         return Err("remote origin must be HTTPS or loopback HTTP, without a path".into());
     }
-    let (read, send) = match permission {
-        "none" => (false, false),
-        "read" => (true, false),
-        "send" => (false, true),
-        "both" => (true, true),
-        _ => return Err("permission must be none, read, send or both".into()),
-    };
     let mut verifier = [0u8; 32];
     getrandom::fill(&mut verifier)?;
     let challenge = hex::encode(Sha256::digest(verifier));
@@ -358,7 +355,30 @@ async fn remote_set_permission(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()?;
-    let response = client.post(url.join("/v1/cli/requests")?).json(&rmcp::serde_json::json!({"user_id":user,"channel":channel,"read":read,"send":send,"challenge":challenge})).send().await?.error_for_status()?;
+    let (endpoint, body) = if let Some((user, channel, permission)) = permission_change {
+        let (read, send) = match permission {
+            "none" => (false, false),
+            "read" => (true, false),
+            "send" => (false, true),
+            "both" => (true, true),
+            _ => return Err("permission must be none, read, send or both".into()),
+        };
+        (
+            "/v1/cli/requests",
+            rmcp::serde_json::json!({"user_id":user,"channel":channel,"read":read,"send":send,"challenge":challenge}),
+        )
+    } else {
+        (
+            "/v1/cli/list-requests",
+            rmcp::serde_json::json!({"challenge":challenge}),
+        )
+    };
+    let response = client
+        .post(url.join(endpoint)?)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
     let body: rmcp::serde_json::Value = response.json().await?;
     let id = body
         .get("request_id")
@@ -368,7 +388,7 @@ async fn remote_set_permission(
     let mut consent = url.join("/admin/cli")?;
     consent.query_pairs_mut().append_pair("request_id", id);
     eprintln!(
-        "Abra no navegador, entre com Discord e autorize a alteração: {consent}\nDepois pressione Enter nesta CLI."
+        "Abra no navegador, entre com Discord e autorize a operação: {consent}\nDepois pressione Enter nesta CLI."
     );
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
@@ -377,9 +397,23 @@ async fn remote_set_permission(
         .json(&rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)}))
         .send()
         .await?;
-    if response.status() != reqwest::StatusCode::NO_CONTENT {
-        return Err("authorization denied, expired, consumed or operation failed".into());
+    if permission_change.is_some() {
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err("authorization denied, expired, consumed or operation failed".into());
+        }
+        eprintln!("Channel permissions updated by remote service.");
+    } else {
+        if response.status() != reqwest::StatusCode::OK {
+            return Err("authorization denied, expired, consumed or operation failed".into());
+        }
+        #[derive(serde::Deserialize)]
+        struct Channels {
+            channels: Vec<String>,
+        }
+        let result: Channels = response.json().await?;
+        for channel in result.channels {
+            println!("{channel}");
+        }
     }
-    eprintln!("Channel permissions updated by remote service.");
     Ok(())
 }

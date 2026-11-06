@@ -317,6 +317,138 @@ async fn cli_real_router_discord_login_and_consent() {
             .unwrap()
     );
     assert!(!forbidden_db.exists());
+    let mut list_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &forbidden_db)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-list-channels", &origin])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut list_stderr = BufReader::new(list_cli.stderr.take().unwrap());
+    let mut list_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        list_stderr.read_line(&mut list_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let list_url = reqwest::Url::parse(list_line.split_whitespace().last().unwrap()).unwrap();
+    let list_id = list_url
+        .query_pairs()
+        .find(|(k, _)| k == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let list_page = browser
+        .get(list_url)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list_page.contains("Consultar nomes dos canais cadastrados"));
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &list_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    list_cli
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .await
+        .unwrap();
+    let list_result = timeout(Duration::from_secs(10), list_cli.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(list_result.status.success());
+    assert_eq!(String::from_utf8(list_result.stdout).unwrap(), "alerts\n");
+    let verifier = [73_u8; 32];
+    let request: Value = browser
+        .post(format!("{origin}/v1/cli/list-requests"))
+        .json(&json!({"challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request_id = request["request_id"].as_str().unwrap();
+    let execute = |proof: String| {
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&json!({"request_id":request_id,"verifier":proof}))
+    };
+    assert_eq!(
+        execute(hex::encode(verifier))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", request_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        execute(hex::encode([74_u8; 32]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let list_response = execute(hex::encode(verifier)).send().await.unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    assert_eq!(list_response.headers()[header::CACHE_CONTROL], "no-store");
+    let names: Value = list_response.json().await.unwrap();
+    assert_eq!(names["channels"], json!(["alerts"]));
+    assert_eq!(
+        execute(hex::encode(verifier))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &list_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(!forbidden_db.exists());
     service.abort();
     provider_task.abort();
 }

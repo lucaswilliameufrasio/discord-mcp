@@ -516,6 +516,18 @@ impl ChannelStore {
             .map_err(|_| StoreError::Storage)
     }
 
+    /// Read channel names and recovery state from one SQLite snapshot.
+    pub fn list_active(&self) -> Result<Vec<String>, StoreError> {
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let names = self.list()?;
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(names)
+    }
+
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.db,

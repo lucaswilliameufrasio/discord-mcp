@@ -25,9 +25,15 @@ pub struct PermissionChange {
     pub send: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CliOperation {
+    PermissionChange(PermissionChange),
+    ListChannels,
+}
+
 struct Entry {
     challenge: [u8; 32],
-    operation: PermissionChange,
+    operation: CliOperation,
     expires: Instant,
     approved: bool,
 }
@@ -63,6 +69,19 @@ impl CliAuthorizations {
         {
             return Err("invalid operation");
         }
+        self.begin_operation(CliOperation::PermissionChange(operation), challenge, now)
+    }
+
+    pub fn begin_list(&self, challenge: [u8; 32], now: Instant) -> Result<String, &'static str> {
+        self.begin_operation(CliOperation::ListChannels, challenge, now)
+    }
+
+    fn begin_operation(
+        &self,
+        operation: CliOperation,
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
         let mut entries = self.entries.lock().map_err(|_| "unavailable")?;
         entries.retain(|_, entry| entry.expires > now);
         if entries.len() >= MAX_PENDING {
@@ -88,7 +107,7 @@ impl CliAuthorizations {
     }
 
     /// Return the precise pending operation to show on the consent screen.
-    pub fn pending(&self, id: &str, now: Instant) -> Option<PermissionChange> {
+    pub fn pending(&self, id: &str, now: Instant) -> Option<CliOperation> {
         let entries = self.entries.lock().ok()?;
         let entry = entries.get(id)?;
         if entry.expires <= now || entry.approved {
@@ -113,7 +132,7 @@ impl CliAuthorizations {
     }
 
     /// Atomically consume an approved request; failures never return an operation.
-    pub fn consume(&self, id: &str, verifier: &[u8], now: Instant) -> Option<PermissionChange> {
+    pub fn consume(&self, id: &str, verifier: &[u8], now: Instant) -> Option<CliOperation> {
         if verifier.len() != 32 {
             return None;
         }
@@ -151,13 +170,19 @@ mod tests {
         let verifier = [7; 32];
         let challenge = Sha256::digest(verifier).into();
         let id = registry.begin(operation(), challenge, now).unwrap();
-        assert_eq!(registry.pending(&id, now), Some(operation()));
+        assert_eq!(
+            registry.pending(&id, now),
+            Some(CliOperation::PermissionChange(operation()))
+        );
         assert!(registry.consume(&id, &verifier, now).is_none());
         assert!(registry.approve(&id, now));
         assert_eq!(registry.pending(&id, now), None);
         assert!(!registry.approve(&id, now));
         assert!(registry.consume(&id, &[8; 32], now).is_none());
-        assert_eq!(registry.consume(&id, &verifier, now), Some(operation()));
+        assert_eq!(
+            registry.consume(&id, &verifier, now),
+            Some(CliOperation::PermissionChange(operation()))
+        );
         assert!(registry.consume(&id, &verifier, now).is_none());
         let expired = registry.begin(operation(), challenge, now).unwrap();
         assert!(!registry.approve(&expired, now + LIFETIME));

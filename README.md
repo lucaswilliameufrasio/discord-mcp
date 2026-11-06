@@ -114,6 +114,12 @@ falhar após o consumo, confira o estado e a auditoria antes de iniciar outra
 solicitação. Tokens MCP não concedem autorização administrativa. O cookie da
 sessão web não é transferido para a CLI.
 
+Para consultar somente os nomes dos canais, use
+`discord-mcp remote-list-channels ORIGEM` e confirme a consulta no navegador.
+Essa é uma autorização distinta, também de uso único: ela não concede
+permissão para alterar canais nem retorna tokens, webhooks ou credenciais. A
+consulta é recusada se o banco estiver em quarentena.
+
 Em `/admin/observability`, a conta administradora pode consultar as últimas 24
 horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
 envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,
