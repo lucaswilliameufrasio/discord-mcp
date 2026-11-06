@@ -6,6 +6,66 @@ use discord_mcp::{
 };
 
 #[test]
+fn recovery_activation_does_not_create_a_missing_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.db");
+    for args in [
+        &["recovery-activate"][..],
+        &["recovery-activate", "--confirm"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_DB", &missing)
+            .env("DISCORD_MCP_KEY", hex::encode([155_u8; 32]))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!missing.exists());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!dir.path().join(format!("missing.db{suffix}")).exists());
+        }
+    }
+}
+
+#[test]
+fn recovery_activation_refuses_non_quarantined_and_empty_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("active.db");
+    let empty = dir.path().join("empty.db");
+    let key = [156_u8; 32];
+    let store = ChannelStore::open(&source, &key).unwrap();
+    store.put_bot("alerts", "123", "synthetic-token").unwrap();
+    store.set_permissions("101", "alerts", true, false).unwrap();
+    drop(store);
+    std::fs::write(&empty, []).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let baseline = std::fs::read(&source).unwrap();
+    for path in [&source, &empty] {
+        let result = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+            .env_clear()
+            .env("DISCORD_MCP_DB", path)
+            .env("DISCORD_MCP_KEY", hex::encode(key))
+            .args(["recovery-activate", "--confirm"])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+    }
+    assert_eq!(std::fs::read(&source).unwrap(), baseline);
+    assert!(std::fs::read(&empty).unwrap().is_empty());
+    let store = ChannelStore::open(&source, &key).unwrap();
+    assert!(
+        store
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+}
+
+#[test]
 fn token_validation_checks_quarantine_with_token_in_same_snapshot() {
     use sha2::{Digest, Sha256};
 

@@ -215,8 +215,17 @@ pub struct ChannelStore {
 impl ChannelStore {
     /// The key is supplied independently of the database and must be backed up separately.
     pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self, StoreError> {
+        Self::open_inner(path, key, true)
+    }
+
+    /// Open an existing quarantined recovery copy without creating a database.
+    pub fn open_recovery_copy(path: &Path, key: &[u8; 32]) -> Result<Self, StoreError> {
+        Self::open_inner(path, key, false)
+    }
+
+    fn open_inner(path: &Path, key: &[u8; 32], create: bool) -> Result<Self, StoreError> {
         #[cfg(unix)]
-        {
+        if create {
             use std::os::unix::fs::OpenOptionsExt;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true).mode(0o600);
@@ -234,9 +243,31 @@ impl ChannelStore {
                 return Err(StoreError::Storage);
             }
         }
-        let db = Connection::open(path).map_err(|_| StoreError::Storage)?;
+        let flags = if create {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        };
+        let db = Connection::open_with_flags(path, flags).map_err(|_| StoreError::Storage)?;
         db.busy_timeout(Duration::from_secs(5))
             .map_err(|_| StoreError::Storage)?;
+        if !create {
+            let quarantine: i64 = db
+                .query_row(
+                    "SELECT quarantined FROM recovery_control WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| StoreError::Storage)?;
+            let marker: i64 = db
+                .query_row("SELECT count(*) FROM key_check WHERE id=1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| StoreError::Storage)?;
+            if quarantine != 1 || marker != 1 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
         db.pragma_update(None, "foreign_keys", "ON")
             .map_err(|_| StoreError::Storage)?;
         db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channels (name TEXT PRIMARY KEY NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL); CREATE TABLE IF NOT EXISTS key_check (id INTEGER PRIMARY KEY CHECK(id=1), nonce BLOB NOT NULL, ciphertext BLOB NOT NULL);")

@@ -116,6 +116,12 @@ publica uma cópia em quarentena e invalida a concessão; uma terceira execuçã
 recusa sobrescrever essa cópia e preserva seus bytes. O teste não cobre crash,
 custódia de chave, recuperação de backup real ou ativação em produção.
 
+`recovery-activate` abre somente um arquivo existente com marcador de chave e
+estado de quarentena; não cria um banco vazio para um caminho ausente. Os testes
+da CLI verificam recusa de caminho ausente, arquivo vazio e banco ativo, além
+da ativação de cópia sintética preparada. Isso não substitui a revisão da cópia
+nem impede processos não cooperativos de modificarem o arquivo.
+
 O teste `activation_cli_rejects_reintroduced_authority_and_preserves_source`
 prepara três cópias sintéticas em quarentena e simula, separadamente, um escritor
 externo reintroduzindo uma permissão, um token ou um código. Em cada caso,

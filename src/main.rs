@@ -253,6 +253,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let storage = StorageConfig::from_environment()?;
+    let recovery_activation =
+        matches!(args.first(), Some(command) if command == "recovery-activate");
     // The lock is cooperative: it separates this program's remote and local
     // processes, but does not confine other programs or protect replication.
     #[cfg(target_os = "linux")]
@@ -262,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(process_guard::acquire(
             &config.path,
             args.as_slice() == ["serve"],
-            true,
+            !recovery_activation,
         )?)
     } else {
         None
@@ -287,7 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.as_slice() == ["serve"] {
             return server::run(storage).await;
         }
-        let db = storage.open()?;
+        let db = if recovery_activation {
+            ChannelStore::open_recovery_copy(&storage.path, &storage.key)?
+                .with_audit_retention(storage.audit_retention_days)?
+        } else {
+            storage.open()?
+        };
         if db.recovery_quarantined()? && args.as_slice() != ["recovery-activate", "--confirm"] {
             return Err(
                 "database is quarantined; review and explicitly activate recovery first".into(),
