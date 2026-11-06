@@ -168,6 +168,12 @@ impl ServerHandler for DiscordMcp {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [command, origin, user, channel, permission] = args.as_slice()
+        && command == "remote-set-permission"
+    {
+        remote_set_permission(origin, user, channel, permission).await?;
+        return Ok(());
+    }
     if let [command, source, destination] = args.as_slice()
         && command == "recovery-prepare"
     {
@@ -198,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
@@ -292,5 +298,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .serve(rmcp::transport::stdio())
     .await?;
     server.waiting().await?;
+    Ok(())
+}
+
+async fn remote_set_permission(
+    origin: &str,
+    user: &str,
+    channel: &str,
+    permission: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+
+    let url = reqwest::Url::parse(origin)?;
+    let local = url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+        );
+    if !(url.scheme() == "https" || local)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("remote origin must be HTTPS or loopback HTTP, without a path".into());
+    }
+    let (read, send) = match permission {
+        "none" => (false, false),
+        "read" => (true, false),
+        "send" => (false, true),
+        "both" => (true, true),
+        _ => return Err("permission must be none, read, send or both".into()),
+    };
+    let mut verifier = [0u8; 32];
+    getrandom::fill(&mut verifier)?;
+    let challenge = hex::encode(Sha256::digest(verifier));
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let response = client.post(url.join("/v1/cli/requests")?).json(&rmcp::serde_json::json!({"user_id":user,"channel":channel,"read":read,"send":send,"challenge":challenge})).send().await?.error_for_status()?;
+    let body: rmcp::serde_json::Value = response.json().await?;
+    let id = body
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("invalid server response")?;
+    let mut consent = url.join("/admin/cli")?;
+    consent.query_pairs_mut().append_pair("request_id", id);
+    eprintln!(
+        "Abra no navegador, entre com Discord e autorize a alteração: {consent}\nDepois pressione Enter nesta CLI."
+    );
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let response = client
+        .post(url.join("/v1/cli/execute")?)
+        .json(&rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)}))
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err("authorization denied, expired, consumed or operation failed".into());
+    }
+    eprintln!("Channel permissions updated by remote service.");
     Ok(())
 }

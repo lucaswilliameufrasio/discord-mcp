@@ -92,6 +92,18 @@ momento da consulta: canais, usuários com concessões, permissões de leitura e
 envio e tokens MCP não expirados. Tokens não expirados não são conexões ativas.
 A criação de canais ainda é feita na interface local.
 
+Para alterar uma permissão remotamente, use
+`discord-mcp remote-set-permission ORIGEM ID_DISCORD CANAL read|send|both|none`.
+A origem deve ser HTTPS (HTTP somente em loopback). Abra o link exibido, entre
+com a conta administradora pelo Discord, reabra o link após o login, confira a
+operação e confirme; então pressione Enter na CLI. A CLI não precisa do banco
+nem da chave. A solicitação fica em memória por até cinco minutos, é vinculada
+à prova mantida pela CLI e pode ser consumida uma única vez. Reiniciar o
+servidor invalida solicitações pendentes. Se a resposta se perder ou a operação
+falhar após o consumo, confira o estado e a auditoria antes de iniciar outra
+solicitação. Tokens MCP não concedem autorização administrativa. O cookie da
+sessão web não é transferido para a CLI.
+
 Em `/admin/observability`, a conta administradora pode consultar as últimas 24
 horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
 envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,

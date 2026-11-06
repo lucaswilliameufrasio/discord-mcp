@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::{
-    Form, Router,
+    Form, Json, Router,
     extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -17,6 +17,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     channels::{AuditActor, AuditContext, ChannelStore, LoginKind, current_timestamp},
+    cli_authorization::{CliAuthorizations, PermissionChange},
     discord_login::{DiscordLoginClient, PendingDiscordLogin},
     http_auth::AuthState,
 };
@@ -39,6 +40,7 @@ struct Inner {
     config: AdminConfig,
     attempts: Mutex<HashMap<String, Attempt>>,
     sessions: Mutex<HashMap<String, Instant>>,
+    cli: CliAuthorizations,
 }
 type Shared = Arc<Inner>;
 
@@ -55,6 +57,7 @@ pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
         config,
         attempts: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        cli: CliAuthorizations::default(),
     });
     Ok(Router::new()
         .route("/admin", get(home))
@@ -66,8 +69,121 @@ pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
         .route("/admin/channel", get(channel))
         .route("/admin/permissions", post(set_permission))
         .route("/admin/logout", post(logout))
+        .route("/v1/cli/requests", post(cli_begin))
+        .route("/v1/cli/execute", post(cli_execute))
+        .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[derive(Deserialize)]
+struct CliBegin {
+    user_id: String,
+    channel: String,
+    read: bool,
+    send: bool,
+    challenge: String,
+}
+
+async fn cli_begin(State(app): State<Shared>, Json(req): Json<CliBegin>) -> Response {
+    let Ok(bytes) = hex::decode(&req.challenge) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let Ok(challenge) = <[u8; 32]>::try_from(bytes) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let operation = PermissionChange {
+        user_id: req.user_id,
+        channel: req.channel,
+        read: req.read,
+        send: req.send,
+    };
+    let id = match app.cli.begin(operation, challenge, Instant::now()) {
+        Ok(id) => id,
+        Err("invalid operation") => return error(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id": id})).into_response();
+    headers(&mut response);
+    response
+}
+
+#[derive(Deserialize)]
+struct CliRequestId {
+    request_id: String,
+}
+
+async fn cli_consent(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(req): Query<CliRequestId>,
+) -> Response {
+    if !authorized(&app, &headers) {
+        return page("<p>Entre como administrador em <a href=\"/admin/login\">Login Discord</a> e reabra o link da CLI.</p>".into());
+    }
+    let Some(operation) = app.cli.pending(&req.request_id, Instant::now()) else {
+        return error(StatusCode::NOT_FOUND);
+    };
+    page(format!(
+        "<h1>Autorizar solicitação da CLI</h1><p>Usuário: {}<br>Canal: {}<br>Leitura: {}<br>Envio: {}</p><form method=\"post\" action=\"/admin/cli\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Autorizar esta alteração</button></form>",
+        escape(&operation.user_id),
+        escape(&operation.channel),
+        operation.read,
+        operation.send,
+        escape(&req.request_id)
+    ))
+}
+
+async fn cli_approve(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Form(req): Form<CliRequestId>,
+) -> Response {
+    if !allowed_post(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    if !app.cli.approve(&req.request_id, Instant::now()) {
+        return error(StatusCode::NOT_FOUND);
+    }
+    page("<p>Autorização concedida. Volte para a CLI.</p>".into())
+}
+
+#[derive(Deserialize)]
+struct CliExecute {
+    request_id: String,
+    verifier: String,
+}
+
+async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> Response {
+    let Ok(verifier) = hex::decode(req.verifier) else {
+        return error(StatusCode::FORBIDDEN);
+    };
+    let Some(operation) = app.cli.consume(&req.request_id, &verifier, Instant::now()) else {
+        return error(StatusCode::FORBIDDEN);
+    };
+    let Ok(now) = current_timestamp() else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    match store(&app).and_then(|store| {
+        store.set_permissions_audited(
+            &operation.user_id,
+            &operation.channel,
+            operation.read,
+            operation.send,
+            AuditContext {
+                actor: AuditActor::Discord(&app.config.admin_user_id),
+                now,
+                retention_days: app.config.auth.audit.retention_days(),
+            },
+        )
+    }) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::channels::StoreError::Storage | crate::channels::StoreError::Decryption) => {
+            app.config.auth.audit.mark_failure();
+            error(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => error(StatusCode::UNPROCESSABLE_ENTITY),
+    }
 }
 
 async fn login(State(app): State<Shared>) -> Response {
@@ -804,6 +920,85 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
+        // The browser session is never supplied to the CLI endpoints.
+        use sha2::{Digest, Sha256};
+        let verifier = [42_u8; 32];
+        let challenge = hex::encode(Sha256::digest(verifier));
+        let started: rmcp::serde_json::Value = client
+            .post(format!("{origin}/v1/cli/requests"))
+            .json(&rmcp::serde_json::json!({"user_id":"457", "channel":"alerts", "read":true, "send":false, "challenge":challenge}))
+            .send().await.unwrap().json().await.unwrap();
+        let id = started["request_id"].as_str().unwrap();
+        let execute = || {
+            client
+                .post(format!("{origin}/v1/cli/execute"))
+                .json(&rmcp::serde_json::json!({"request_id":id, "verifier":hex::encode(verifier)}))
+        };
+        assert_eq!(
+            execute().send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let consent = format!("{origin}/admin/cli?request_id={id}");
+        let html = client
+            .get(&consent)
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains("457") && html.contains("alerts"));
+        assert_eq!(
+            client
+                .post(format!("{origin}/admin/cli"))
+                .form(&[("request_id", id)])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{origin}/admin/cli"))
+                .header(header::COOKIE, &session)
+                .header(header::ORIGIN, &origin)
+                .form(&[("request_id", id)])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{origin}/v1/cli/execute"))
+                .json(
+                    &rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode([43_u8; 32])})
+                )
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            execute().send().await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            store
+                .is_permitted("457", "alerts", ChannelAction::Read)
+                .unwrap()
+        );
+        store
+            .set_permissions("457", "alerts", false, false)
+            .unwrap();
+        assert_eq!(
+            execute().send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             client
                 .get(callback)
