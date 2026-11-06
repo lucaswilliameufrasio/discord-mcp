@@ -93,6 +93,106 @@ pub fn prepare_restored_copy(
     key: &[u8; 32],
     retention_days: u16,
 ) -> Result<RecoveryInvalidations, RecoveryError> {
+    prepare_restored_copy_inner(
+        source,
+        destination,
+        key,
+        retention_days,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::channels::{AuthorizationGrant, ChannelAction};
+    use std::cell::Cell;
+
+    #[test]
+    fn quarantine_audit_failure_never_publishes_and_preserves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let source = dir.path().join("source.db");
+        let destination = dir.path().join("restored.db");
+        let key = [154_u8; 32];
+        let resource = "https://example.invalid/mcp";
+        let store = ChannelStore::open(&source, &key).unwrap();
+        store.put_bot("alerts", "123", "synthetic-token").unwrap();
+        store.set_permissions("101", "alerts", true, false).unwrap();
+        let token = store.issue_access_token("101", resource, 1000, 60).unwrap();
+        let grant = AuthorizationGrant {
+            user_id: "101",
+            client_id: "client",
+            redirect_uri: "http://127.0.0.1/callback",
+            resource,
+            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        };
+        store.issue_authorization_code(&grant, 1000).unwrap();
+        drop(store);
+        let baseline = fs::read(&source).unwrap();
+        let injected = Cell::new(false);
+        let hook = |staged: &Path| {
+            let db = Connection::open(staged).unwrap();
+            db.execute_batch("CREATE TRIGGER synthetic_fail_quarantine_audit AFTER INSERT ON audit_events WHEN NEW.event_type='recovery_quarantined' BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END;").unwrap();
+            injected.set(true);
+        };
+        assert!(matches!(
+            prepare_restored_copy_inner(&source, &destination, &key, 90, Some(&hook)),
+            Err(RecoveryError::Storage)
+        ));
+        assert!(injected.get());
+        assert!(!destination.exists());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!sidecar(&destination, suffix).exists());
+        }
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".discord-mcp-recovery-")
+        }));
+        assert_eq!(fs::read(&source).unwrap(), baseline);
+        let source_store = ChannelStore::open(&source, &key).unwrap();
+        assert!(
+            source_store
+                .is_permitted("101", "alerts", ChannelAction::Read)
+                .unwrap()
+        );
+        assert_eq!(
+            source_store
+                .verify_access_token(&token, resource, 1001)
+                .unwrap()
+                .as_deref(),
+            Some("101")
+        );
+        drop(source_store);
+        let report = prepare_restored_copy(&source, &destination, &key, 90).unwrap();
+        assert_eq!((report.permissions, report.tokens, report.codes), (1, 1, 1));
+        let restored = ChannelStore::open(&destination, &key).unwrap();
+        assert!(restored.recovery_quarantined().unwrap());
+        assert_eq!(
+            restored
+                .verify_access_token(&token, resource, 1001)
+                .unwrap(),
+            None
+        );
+    }
+}
+
+fn prepare_restored_copy_inner(
+    source: &Path,
+    destination: &Path,
+    key: &[u8; 32],
+    retention_days: u16,
+    #[cfg(test)] before_quarantine: Option<&dyn Fn(&Path)>,
+) -> Result<RecoveryInvalidations, RecoveryError> {
     let start = Instant::now();
     private_directory(parent(source)?)?;
     private_directory(parent(destination)?)?;
@@ -232,6 +332,10 @@ pub fn prepare_restored_copy(
         staged
             .get_channel(&name)
             .map_err(|_| RecoveryError::InvalidKeyOrData)?;
+    }
+    #[cfg(test)]
+    if let Some(inject) = before_quarantine {
+        inject(temporary.path());
     }
     let invalidated = staged
         .quarantine_recovered_copy()

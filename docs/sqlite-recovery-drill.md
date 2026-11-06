@@ -99,6 +99,15 @@ preserva byte a byte a fonte; o outro canal e sua permissão seguem acessíveis.
 Esse teste não exercita queda brusca, fonte ativa, perda de chave ou recuperação
 de infraestrutura e não demonstra disponibilidade de backups reais.
 
+O teste `quarantine_audit_failure_never_publishes_and_preserves_source` injeta
+uma falha na auditoria de quarentena **somente no staging sintético**, através
+de um hook compilado apenas em testes. A preparação retorna erro, não publica
+destino ou sidecars e remove o staging normal; a fonte permanece igual byte a
+byte, com permissão e token ainda válidos. Uma nova tentativa sem injeção cria
+a cópia em quarentena e invalida permissão, token e código. O trigger de teste
+não está na fonte e não altera a regra que rejeita fontes com triggers. Isso não
+simula falha do filesystem, falta de espaço ou interrupção abrupta.
+
 O teste `recovery_prepare_cli_wrong_key_cleans_staging_and_allows_safe_retry`
 executa a CLI real sobre uma imagem sintética offline, sem serviços externos.
 Uma chave incorreta retorna erro, preserva a fonte byte a byte e não deixa
