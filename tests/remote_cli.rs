@@ -2571,6 +2571,82 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     sql.execute_batch("DROP TRIGGER synthetic_backup_finish_failure")
         .unwrap();
     println!("PASS backup audit: lost result after upload leaves durable inconclusive intent");
+    use age::secrecy::ExposeSecret;
+    let saved_object = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("service-backups/backup-2.age")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let audit_before = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    let mut verifier_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .args(["verify-floci", &address.to_string(), &bucket, "backup-2"])
+        .arg(dir.path())
+        .arg("--confirm-isolated")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input = format!(
+        "{}\n{}\n",
+        identity.to_string().expose_secret(),
+        hex::encode(key)
+    );
+    let mut stdin = verifier_cli.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).await.unwrap();
+    drop(stdin);
+    let checked = timeout(Duration::from_secs(30), verifier_cli.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "isolated verifier failed: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Synthetic verification passed"));
+    let audit_after = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    assert_eq!(audit_before, audit_after);
+    assert_eq!(
+        saved_object,
+        s3.get_object()
+            .bucket(&bucket)
+            .key("service-backups/backup-2.age")
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+    );
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".discord-mcp-verify-")
+    }));
+    println!("PASS local verification of inconclusive object: audit and Floci object unchanged");
     let fourth: Value = browser.post(format!("{origin}/v1/cli/backup-requests"))
         .json(&json!({"backup_id":"audit-start-failure", "challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
     let fourth_id = fourth["request_id"].as_str().unwrap();

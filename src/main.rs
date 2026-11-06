@@ -176,6 +176,13 @@ impl ServerHandler for DiscordMcp {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(feature = "encrypted-s3-backup")]
+    if let [command, endpoint, bucket, id, staging, confirm] = args.as_slice()
+        && command == "verify-floci"
+        && confirm == "--confirm-isolated"
+    {
+        return local_backup::verify(endpoint, bucket, id, staging).await;
+    }
+    #[cfg(feature = "encrypted-s3-backup")]
     if let [command, origin, id] = args.as_slice()
         && command == "remote-backup"
     {
@@ -291,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Server configuration and security requirements: see README.md.");
             #[cfg(feature = "encrypted-s3-backup")]
             println!(
-                "Synthetic loopback Floci only: backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT | restore-floci ADDRESS BUCKET OBJECT DESTINATION"
+                "Synthetic loopback Floci only: backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT | restore-floci ADDRESS BUCKET OBJECT DESTINATION | verify-floci ADDRESS BUCKET ID PRIVATE_STAGING --confirm-isolated"
             );
             return Ok(());
         }

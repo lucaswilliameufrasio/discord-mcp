@@ -74,6 +74,36 @@ fn s3_config(address: SocketAddr) -> aws_sdk_s3::Config {
         .build()
 }
 
+async fn run_verifier(
+    binary: &std::ffi::OsStr,
+    address: SocketAddr,
+    bucket: &str,
+    id: &str,
+    parent: &Path,
+    identity: &age::x25519::Identity,
+    key: &[u8; 32],
+) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    let mut child = tokio::process::Command::new(binary)
+        .env_clear()
+        .args(["verify-floci", &address.to_string(), bucket, id])
+        .arg(parent)
+        .arg("--confirm-isolated")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("missing verifier stdin")?;
+    let input = format!(
+        "{}\n{}\n",
+        identity.to_string().expose_secret(),
+        hex::encode(key)
+    );
+    stdin.write_all(input.as_bytes()).await?;
+    drop(stdin);
+    Ok(tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await??)
+}
+
 async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if address.ip() != IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || address.port() == 0 {
         return Err("only an explicit IPv4 loopback endpoint is allowed".into());
@@ -206,6 +236,111 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     )?;
     assert!(executor.snapshot("../escape").await.is_err());
     executor.snapshot("generation-1").await?;
+    let object_before = client
+        .get_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("service-backups/generation-1.age")
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    let verified = run_verifier(
+        &binary,
+        address,
+        "discord-mcp-synthetic-drill",
+        "generation-1",
+        directory,
+        &backup_identity,
+        &key,
+    )
+    .await?;
+    assert!(
+        verified.status.success(),
+        "isolated verifier failed: {}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("Synthetic verification passed"));
+    assert!(
+        !String::from_utf8_lossy(&verified.stdout)
+            .contains(backup_identity.to_string().expose_secret())
+    );
+    let wrong = run_verifier(
+        &binary,
+        address,
+        "discord-mcp-synthetic-drill",
+        "generation-1",
+        directory,
+        &age::x25519::Identity::generate(),
+        &key,
+    )
+    .await?;
+    assert!(!wrong.status.success());
+    let wrong_application = run_verifier(
+        &binary,
+        address,
+        "discord-mcp-synthetic-drill",
+        "generation-1",
+        directory,
+        &backup_identity,
+        &[174; 32],
+    )
+    .await?;
+    assert!(!wrong_application.status.success());
+    let missing = run_verifier(
+        &binary,
+        address,
+        "discord-mcp-synthetic-drill",
+        "missing-verify",
+        directory,
+        &backup_identity,
+        &key,
+    )
+    .await?;
+    assert!(!missing.status.success());
+    client
+        .put_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("service-backups/verifier-corrupt.age")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"synthetic corrupted object",
+        ))
+        .send()
+        .await?;
+    let corrupt = run_verifier(
+        &binary,
+        address,
+        "discord-mcp-synthetic-drill",
+        "verifier-corrupt",
+        directory,
+        &backup_identity,
+        &key,
+    )
+    .await?;
+    assert!(!corrupt.status.success());
+    let object_after = client
+        .get_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("service-backups/generation-1.age")
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(object_before, object_after);
+    assert!(!std::fs::read_dir(directory)?.any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".discord-mcp-verify-")
+    }));
+    assert_source_unchanged(&store, &token, resource);
+    println!(
+        "PASS isolated verifier: authenticated restore, wrong keys, missing object, no object mutation or staging residue"
+    );
     assert!(executor.snapshot("generation-1").await.is_err());
     let service_destination = directory.join("service-backup-restored.db");
     let service_report = discord_mcp::encrypted_backup::restore_quarantined(

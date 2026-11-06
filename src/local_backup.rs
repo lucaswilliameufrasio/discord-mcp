@@ -66,6 +66,28 @@ pub async fn restore(
     destination: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = client(endpoint)?;
+    let (identity, key) = read_recovery_input()?;
+    let report = tokio::time::timeout(
+        Duration::from_secs(60),
+        discord_mcp::encrypted_backup::restore_quarantined(
+            &client,
+            bucket,
+            object,
+            Path::new(destination),
+            &identity,
+            &key,
+            90,
+        ),
+    )
+    .await??;
+    println!(
+        "Quarantined synthetic copy prepared; invalidated permissions={}, tokens={}, codes={}. Review before activation.",
+        report.permissions, report.tokens, report.codes
+    );
+    Ok(())
+}
+
+fn read_recovery_input() -> Result<(age::x25519::Identity, [u8; 32]), Box<dyn std::error::Error>> {
     if std::io::stdin().is_terminal() {
         return Err(
             "supply recovery identity and application key on protected non-terminal stdin".into(),
@@ -92,21 +114,92 @@ pub async fn restore(
     if lines.next().is_some() {
         return Err("invalid recovery input".into());
     }
+    Ok((identity, key))
+}
+
+/// Explicit local synthetic verification; does not open or modify the live DB.
+pub async fn verify(
+    endpoint: &str,
+    bucket: &str,
+    id: &str,
+    parent: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid backup ID".into());
+    }
+    let client = client(endpoint)?;
+    let parent = Path::new(parent);
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.is_dir() {
+        return Err("private staging directory required".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("private staging directory required".into());
+        }
+    }
+    let (identity, key) = read_recovery_input()?;
+    let staging = tempfile::Builder::new()
+        .prefix(".discord-mcp-verify-")
+        .tempdir_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let destination = staging.path().join("quarantined.db");
+    let object = format!("service-backups/{id}.age");
     let report = tokio::time::timeout(
         Duration::from_secs(60),
         discord_mcp::encrypted_backup::restore_quarantined(
             &client,
             bucket,
-            object,
-            Path::new(destination),
+            &object,
+            &destination,
             &identity,
             &key,
             90,
         ),
     )
     .await??;
+    let store = discord_mcp::channels::ChannelStore::open_recovery_copy(&destination, &key)?;
+    if !store.recovery_quarantined()?
+        || !matches!(
+            store.list_active(),
+            Err(discord_mcp::channels::StoreError::RecoveryPending)
+        )
+    {
+        return Err("quarantine validation failed".into());
+    }
+    let channels = store.list()?.len();
+    drop(store);
+    let db = rusqlite::Connection::open_with_flags(
+        &destination,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err("integrity validation failed".into());
+    }
+    let violations: i64 =
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    let remaining: i64 = db.query_row("SELECT (SELECT count(*) FROM channel_permissions)+(SELECT count(*) FROM mcp_access_tokens)+(SELECT count(*) FROM mcp_authorization_codes)", [], |row| row.get(0))?;
+    if violations != 0 || remaining != 0 {
+        return Err("recovered authority validation failed".into());
+    }
+    drop(db);
+    staging.close()?;
     println!(
-        "Quarantined synthetic copy prepared; invalidated permissions={}, tokens={}, codes={}. Review before activation.",
+        "Synthetic verification passed: authenticated snapshot, SQLite integrity and quarantine; channels={channels}, invalidated permissions={}, tokens={}, codes={}. No activation performed.",
         report.permissions, report.tokens, report.codes
     );
     Ok(())

@@ -224,6 +224,28 @@ um 404 também não prova falha definitiva. A consulta não substitui restauraç
 isolada, nem autoriza reenviar ou excluir o objeto. O teste Floci inclui objeto
 corrompido que aparece como encontrado, mas é rejeitado na restauração.
 
+O comando experimental `verify-floci ADDRESS BUCKET ID PRIVATE_STAGING
+--confirm-isolated` permite ao operador local verificar um objeto sintético
+`service-backups/ID.age`. Recebe por stdin não interativo a identidade privada
+age e a chave da aplicação, em linhas separadas; não as recebe por argumentos.
+Em diretório temporário privado novo, baixa e autentica o objeto, prepara uma
+cópia em quarentena e verifica `integrity_check`, chaves estrangeiras e ausência
+de permissões, tokens e códigos restaurados. Não ativa a cópia, não abre o banco
+ativo e não modifica a auditoria ou o objeto; após sucesso remove o staging.
+Falha abrupta ou erro de remoção pode deixar arquivos temporários em claro; use
+somente um diretório privado sob custódia adequada. O timeout não interrompe
+trabalho síncrono durante a cópia ou criptografia.
+
+O teste Floci usa processos reais, chaves sintéticas, objeto ausente e corrompido,
+identidade age e chave da aplicação incorretas. Também verifica um objeto com ID
+de tentativa `unknown` e compara bytes do objeto e linhas da auditoria antes e
+depois. **Esta verificação ainda não faz parte do consentimento Discord nem
+comprova a associação de um objeto a uma tentativa específica**: o operador
+local seleciona manualmente o destino e o ID, e o vínculo da auditoria não é
+verificado pela CLI. Trata-se de evidência sobre a cópia examinada, não de
+reconciliação automática, garantia de recuperação de host ou validação da
+atividade após ativação. Não use essa interface para dados reais.
+
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
 ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci
