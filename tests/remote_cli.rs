@@ -18,9 +18,11 @@ use tokio::{
 
 // Compile the production router and Discord client with their existing
 // cfg(test) provider injection; no provider override is enabled in production.
-pub use discord_mcp::{channels, cli_authorization, http_auth};
+pub use discord_mcp::{channels, http_auth};
 #[path = "../src/admin_web.rs"]
 mod admin_web;
+#[path = "../src/cli_authorization.rs"]
+mod cli_authorization;
 #[path = "../src/discord_login.rs"]
 mod discord_login;
 
@@ -119,10 +121,15 @@ async fn cli_real_router_discord_login_and_consent() {
         admin_user_id: "123".into(),
         discord,
     };
+    let cli_requests = Arc::new(cli_authorization::CliAuthorizations::default());
+    let requests_for_server = cli_requests.clone();
     let service = tokio::spawn(async move {
-        axum::serve(listener, admin_web::router(config).unwrap())
-            .await
-            .unwrap()
+        axum::serve(
+            listener,
+            admin_web::router_with_cli(config, requests_for_server).unwrap(),
+        )
+        .await
+        .unwrap()
     });
     let mut cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
         .env_clear()
@@ -246,6 +253,68 @@ async fn cli_real_router_discord_login_and_consent() {
             .audit_events(None, Some("permission_change"), 10)
             .unwrap()
             .is_empty()
+    );
+    assert!(!forbidden_db.exists());
+    // Exercise expiration after approval through the real HTTP handlers and
+    // executable. Only the test registry exposes this deterministic time hook.
+    let mut expired_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &forbidden_db)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-set-permission", &origin, "102", "alerts", "read"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut expired_stderr = BufReader::new(expired_cli.stderr.take().unwrap());
+    let mut expired_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        expired_stderr.read_line(&mut expired_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let expired_url = reqwest::Url::parse(expired_line.split_whitespace().last().unwrap()).unwrap();
+    let expired_id = expired_url
+        .query_pairs()
+        .find(|(k, _)| k == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &expired_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    cli_requests.expire_for_test(&expired_id);
+    expired_cli
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .await
+        .unwrap();
+    assert!(
+        !timeout(Duration::from_secs(10), expired_cli.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !store
+            .is_permitted("102", "alerts", ChannelAction::Read)
+            .unwrap()
     );
     assert!(!forbidden_db.exists());
     service.abort();

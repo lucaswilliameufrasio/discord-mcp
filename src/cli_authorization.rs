@@ -39,6 +39,11 @@ pub struct CliAuthorizations {
 }
 
 impl CliAuthorizations {
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self, id: &str) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.get_mut(id).unwrap().expires = Instant::now();
+    }
     /// The challenge is SHA-256 of a high-entropy verifier held only by the CLI.
     pub fn begin(
         &self,
@@ -163,9 +168,10 @@ mod tests {
         );
         let approved = registry.begin(operation(), challenge, now).unwrap();
         assert!(registry.approve(&approved, now));
+        registry.expire_for_test(&approved);
         assert!(
             registry
-                .consume(&approved, &verifier, now + LIFETIME)
+                .consume(&approved, &verifier, Instant::now())
                 .is_none()
         );
     }

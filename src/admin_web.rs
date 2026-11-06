@@ -40,11 +40,18 @@ struct Inner {
     config: AdminConfig,
     attempts: Mutex<HashMap<String, Attempt>>,
     sessions: Mutex<HashMap<String, Instant>>,
-    cli: CliAuthorizations,
+    cli: Arc<CliAuthorizations>,
 }
 type Shared = Arc<Inner>;
 
 pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
+    router_with_cli(config, Arc::new(CliAuthorizations::default()))
+}
+
+pub(crate) fn router_with_cli(
+    config: AdminConfig,
+    cli: Arc<CliAuthorizations>,
+) -> Result<Router, &'static str> {
     if config.admin_user_id.is_empty()
         || config.admin_user_id.len() > 20
         || !config.admin_user_id.bytes().all(|v| v.is_ascii_digit())
@@ -57,7 +64,7 @@ pub fn router(config: AdminConfig) -> Result<Router, &'static str> {
         config,
         attempts: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
-        cli: CliAuthorizations::default(),
+        cli,
     });
     Ok(Router::new()
         .route("/admin", get(home))
