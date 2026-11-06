@@ -249,6 +249,14 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     );
     assert_eq!(std::fs::read(&protected)?, sentinel);
     restore_from_s3(&s3, "synthetic", &restored, RestoreTarget::Txid(1)).await?;
+    // The S3 restore is not directly usable: preparation must verify the
+    // independent application key before publishing a quarantined copy.
+    let restored_before = std::fs::read(&restored)?;
+    assert!(prepare_restored_copy(&restored, &prepared, &[174; 32], 90).is_err());
+    assert_no_destination(&prepared);
+    assert_eq!(std::fs::read(&restored)?, restored_before);
+    assert_source_unchanged(&store, &token, resource);
+    println!("PASS S3 restore with wrong application key: no prepared copy, source unchanged");
     let report = prepare_restored_copy(&restored, &prepared, &key, 90)?;
     assert_eq!((report.permissions, report.tokens, report.codes), (1, 1, 1));
     let restored_store = ChannelStore::open(&prepared, &key)?;

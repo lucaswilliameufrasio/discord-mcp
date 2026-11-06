@@ -87,6 +87,18 @@ S3 da biblioteca irmã baixa o repositório inteiro para staging temporário e
 exige espaço proporcional; limites de tamanho para um repositório remoto não
 são demonstrados por este exercício.
 
+Repetição em 2026-11-06 com o checkout irmão local modificado: o Floci passou
+duas gerações independentes, ausência e corrupção de objeto, cancelamento de
+requisição inicial e recusa de sobrescrita. Uma nova verificação restaura do
+Floci, tenta preparar com chave de aplicação incorreta, confirma que o destino
+não foi publicado e que a imagem restaurada não mudou, e então prepara com a
+chave correta. A fonte sintética continua com as revogações. O trecho medido
+levou 0,234 s, excluindo build e inicialização: não é RTO. A chave de aplicação
+cifra credenciais individuais, não demonstra criptografia integral dos objetos
+S3; o exercício não implementa nem comprova criptografia de backup ou custódia
+independente de chave. Não envie seus snapshots para armazenamento real com
+base nesta evidência.
+
 Execução local em 2026-11-05: `sqlite-replication` na revisão local
 `3553f91cce2535b4fbe521c6582bec64db94477d`, com alterações preexistentes em
 documentação e testes, e Discord MCP em `4dfdde4` mais o subprojeto deste
