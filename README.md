@@ -114,6 +114,11 @@ falhar após o consumo, confira o estado e a auditoria antes de iniciar outra
 solicitação. Tokens MCP não concedem autorização administrativa. O cookie da
 sessão web não é transferido para a CLI.
 
+Para alterações de permissão e cadastros remotos, o serviço também verifica
+na transação se o registro do canal permanece igual ao início da solicitação.
+Se tiver sido substituído, criado ou removido nesse intervalo, a operação é
+recusada; inicie outra solicitação e confira o consentimento novamente.
+
 Para consultar somente os nomes dos canais, use
 `discord-mcp remote-list-channels ORIGEM` e confirme a consulta no navegador.
 Essa é uma autorização distinta, também de uso único: ela não concede

@@ -1315,6 +1315,117 @@ async fn cli_real_router_discord_login_and_consent() {
     );
     assert!(store.list().unwrap().contains(&"alerts".to_owned()));
     assert!(!forbidden_db.exists());
+    for (kind, existed) in [
+        ("bot", false),
+        ("webhook", false),
+        ("bot", true),
+        ("webhook", true),
+    ] {
+        let name = format!("stale_{kind}_{existed}");
+        if existed {
+            store.put_bot(&name, "111", "synthetic-token").unwrap();
+        }
+        let body = if kind == "bot" {
+            json!({"channel":name,"discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})
+        } else {
+            json!({"channel":name,"webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})
+        };
+        let request: Value = browser
+            .post(format!("{origin}/v1/cli/{kind}-requests"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = request["request_id"].as_str().unwrap();
+        store
+            .put_bot(&name, "777", "replacement-synthetic")
+            .unwrap();
+        store.set_permissions("107", &name, true, false).unwrap();
+        assert_eq!(
+            browser
+                .post(format!("{origin}/admin/cli"))
+                .header(header::COOKIE, &session)
+                .header(header::ORIGIN, &origin)
+                .form(&[("request_id", id)])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let mut payload = json!({"request_id":id,"verifier":hex::encode(verifier)});
+        if kind == "bot" {
+            payload["bot_token"] = synthetic_token.into();
+        } else {
+            payload["webhook"] = synthetic_webhook.into();
+        }
+        assert_eq!(
+            browser
+                .post(format!("{origin}/v1/cli/execute"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(matches!(
+            store.get_channel(&name),
+            Ok(discord_mcp::channels::Channel::Bot(_))
+        ));
+        assert!(
+            store
+                .is_permitted("107", &name, ChannelAction::Read)
+                .unwrap()
+        );
+    }
+    let request: Value = browser.post(format!("{origin}/v1/cli/requests"))
+        .json(&json!({"user_id":"106","channel":"alerts","read":true,"send":false,"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let stale_permission_id = request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", stale_permission_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    store
+        .put_bot("alerts", "777", "replacement-synthetic")
+        .unwrap();
+    let stale_payload = json!({"request_id":stale_permission_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&stale_payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(
+        !store
+            .is_permitted("106", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&stale_payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         execute_permissions(hex::encode(verifier))
             .send()
@@ -1367,6 +1478,36 @@ async fn cli_real_router_discord_login_and_consent() {
             .status(),
         StatusCode::OK
     );
+    let quarantined_webhook: Value = browser.post(format!("{origin}/v1/cli/webhook-requests"))
+        .json(&json!({"channel":"quarantined","webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let quarantined_webhook_id = quarantined_webhook["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", quarantined_webhook_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let request: Value = browser.post(format!("{origin}/v1/cli/bot-requests"))
+        .json(&json!({"channel":"bot_quarantined","discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let id = request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     rusqlite::Connection::open(&database)
         .unwrap()
         .execute(
@@ -1395,38 +1536,8 @@ async fn cli_real_router_discord_login_and_consent() {
         StatusCode::SERVICE_UNAVAILABLE
     );
     assert!(store.list().unwrap().contains(&"alerts".to_owned()));
-    let quarantined_webhook: Value = browser.post(format!("{origin}/v1/cli/webhook-requests"))
-        .json(&json!({"channel":"quarantined","webhook_id":"888","commitment":hex::encode(Sha256::digest(synthetic_webhook.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
-    let quarantined_webhook_id = quarantined_webhook["request_id"].as_str().unwrap();
-    assert_eq!(
-        browser
-            .post(format!("{origin}/admin/cli"))
-            .header(header::COOKIE, &session)
-            .header(header::ORIGIN, &origin)
-            .form(&[("request_id", quarantined_webhook_id)])
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
     assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":quarantined_webhook_id,"verifier":hex::encode(verifier),"webhook":synthetic_webhook})).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(!store.list().unwrap().contains(&"quarantined".to_owned()));
-    let request: Value = browser.post(format!("{origin}/v1/cli/bot-requests"))
-        .json(&json!({"channel":"bot_quarantined","discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
-    let id = request["request_id"].as_str().unwrap();
-    assert_eq!(
-        browser
-            .post(format!("{origin}/admin/cli"))
-            .header(header::COOKIE, &session)
-            .header(header::ORIGIN, &origin)
-            .form(&[("request_id", id)])
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
     assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":id,"verifier":hex::encode(verifier),"bot_token":synthetic_token})).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         !store

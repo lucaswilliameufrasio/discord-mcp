@@ -23,6 +23,7 @@ pub struct PermissionChange {
     pub channel: String,
     pub read: bool,
     pub send: bool,
+    pub version: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,11 +35,13 @@ pub enum CliOperation {
         channel: String,
         webhook_id: String,
         commitment: [u8; 32],
+        version: Option<[u8; 32]>,
     },
     RegisterBot {
         channel: String,
         discord_channel_id: String,
         commitment: [u8; 32],
+        version: Option<[u8; 32]>,
     },
     DeleteChannel {
         channel: String,
@@ -111,6 +114,7 @@ impl CliAuthorizations {
         channel: String,
         webhook_id: String,
         commitment: [u8; 32],
+        version: Option<[u8; 32]>,
         challenge: [u8; 32],
         now: Instant,
     ) -> Result<String, &'static str> {
@@ -126,6 +130,7 @@ impl CliAuthorizations {
                 channel,
                 webhook_id,
                 commitment,
+                version,
             },
             challenge,
             now,
@@ -137,6 +142,7 @@ impl CliAuthorizations {
         channel: String,
         discord_channel_id: String,
         commitment: [u8; 32],
+        version: Option<[u8; 32]>,
         challenge: [u8; 32],
         now: Instant,
     ) -> Result<String, &'static str> {
@@ -152,6 +158,7 @@ impl CliAuthorizations {
                 channel,
                 discord_channel_id,
                 commitment,
+                version,
             },
             challenge,
             now,
@@ -259,6 +266,7 @@ mod tests {
             channel: "alerts".into(),
             read: true,
             send: false,
+            version: Some([3; 32]),
         }
     }
 

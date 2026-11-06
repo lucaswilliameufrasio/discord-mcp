@@ -384,12 +384,12 @@ impl ChannelStore {
 
     pub fn put_webhook(&self, name: &str, url: &str) -> Result<(), StoreError> {
         WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
-        self.put_secret(name, url, AuditActor::LocalOperator)
+        self.put_secret(name, url, AuditActor::LocalOperator, None)
     }
 
     pub fn put_bot(&self, name: &str, channel_id: &str, token: &str) -> Result<(), StoreError> {
         let bot = BotChannel::new(channel_id, token).ok_or(StoreError::InvalidInput)?;
-        self.put_secret(name, &bot.encode(), AuditActor::LocalOperator)
+        self.put_secret(name, &bot.encode(), AuditActor::LocalOperator, None)
     }
 
     pub fn put_webhook_as_discord(
@@ -397,12 +397,13 @@ impl ChannelStore {
         name: &str,
         url: &str,
         actor: &str,
+        version: Option<[u8; 32]>,
     ) -> Result<(), StoreError> {
         if !valid_user_id(actor) {
             return Err(StoreError::InvalidInput);
         }
         WebhookUrl::parse(url).map_err(|_| StoreError::InvalidInput)?;
-        self.put_secret(name, url, AuditActor::Discord(actor))
+        self.put_secret(name, url, AuditActor::Discord(actor), Some(version))
     }
 
     pub fn put_bot_as_discord(
@@ -411,15 +412,27 @@ impl ChannelStore {
         channel_id: &str,
         token: &str,
         actor: &str,
+        version: Option<[u8; 32]>,
     ) -> Result<(), StoreError> {
         if !valid_user_id(actor) {
             return Err(StoreError::InvalidInput);
         }
         let bot = BotChannel::new(channel_id, token).ok_or(StoreError::InvalidInput)?;
-        self.put_secret(name, &bot.encode(), AuditActor::Discord(actor))
+        self.put_secret(
+            name,
+            &bot.encode(),
+            AuditActor::Discord(actor),
+            Some(version),
+        )
     }
 
-    fn put_secret(&self, name: &str, url: &str, actor: AuditActor<'_>) -> Result<(), StoreError> {
+    fn put_secret(
+        &self,
+        name: &str,
+        url: &str,
+        actor: AuditActor<'_>,
+        version: Option<Option<[u8; 32]>>,
+    ) -> Result<(), StoreError> {
         if name.is_empty()
             || name.len() > 64
             || !name
@@ -446,6 +459,11 @@ impl ChannelStore {
         )
         .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
+        if let Some(expected) = version
+            && self.channel_version_in_snapshot(name)? != expected
+        {
+            return Err(StoreError::AuthorizationDenied);
+        }
         // A name can be repointed to a different Discord resource. Never carry
         // old grants over to a newly configured destination.
         let revoked = transaction
@@ -691,6 +709,30 @@ impl ChannelStore {
         can_send: bool,
         context: AuditContext<'_>,
     ) -> Result<(), StoreError> {
+        self.set_permissions_checked(user_id, channel, can_read, can_send, context, None)
+    }
+
+    pub fn set_permissions_audited_if_version(
+        &self,
+        user_id: &str,
+        channel: &str,
+        can_read: bool,
+        can_send: bool,
+        context: AuditContext<'_>,
+        version: [u8; 32],
+    ) -> Result<(), StoreError> {
+        self.set_permissions_checked(user_id, channel, can_read, can_send, context, Some(version))
+    }
+
+    fn set_permissions_checked(
+        &self,
+        user_id: &str,
+        channel: &str,
+        can_read: bool,
+        can_send: bool,
+        context: AuditContext<'_>,
+        version: Option<[u8; 32]>,
+    ) -> Result<(), StoreError> {
         if !valid_user_id(user_id) {
             return Err(StoreError::InvalidInput);
         }
@@ -706,6 +748,11 @@ impl ChannelStore {
         )
         .map_err(|_| StoreError::Storage)?;
         self.require_recovery_active()?;
+        if let Some(expected) = version
+            && self.channel_version_in_snapshot(channel)? != Some(expected)
+        {
+            return Err(StoreError::AuthorizationDenied);
+        }
         if can_read && matches!(self.get_channel(channel)?, Channel::Webhook(_)) {
             return Err(StoreError::InvalidInput);
         }

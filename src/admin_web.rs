@@ -150,10 +150,21 @@ async fn cli_begin_bot(State(app): State<Shared>, Json(req): Json<CliBeginBot>) 
     else {
         return error(StatusCode::BAD_REQUEST);
     };
+    let version = match store(&app).and_then(|store| store.channel_version(&req.channel)) {
+        Ok(version) => version,
+        Err(crate::channels::StoreError::RecoveryPending) => {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(_) => {
+            app.config.auth.audit.mark_failure();
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let id = match app.cli.begin_register_bot(
         req.channel,
         req.discord_channel_id,
         commitment,
+        version,
         challenge,
         Instant::now(),
     ) {
@@ -188,10 +199,21 @@ async fn cli_begin_webhook(
     else {
         return error(StatusCode::BAD_REQUEST);
     };
+    let version = match store(&app).and_then(|store| store.channel_version(&req.channel)) {
+        Ok(version) => version,
+        Err(crate::channels::StoreError::RecoveryPending) => {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(_) => {
+            app.config.auth.audit.mark_failure();
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let id = match app.cli.begin_register_webhook(
         req.channel,
         req.webhook_id,
         commitment,
+        version,
         challenge,
         Instant::now(),
     ) {
@@ -270,11 +292,34 @@ async fn cli_begin(State(app): State<Shared>, Json(req): Json<CliBegin>) -> Resp
     let Ok(challenge) = <[u8; 32]>::try_from(bytes) else {
         return error(StatusCode::BAD_REQUEST);
     };
+    if req.user_id.is_empty()
+        || req.user_id.len() > 20
+        || !req.user_id.bytes().all(|b| b.is_ascii_digit())
+        || req.channel.is_empty()
+        || req.channel.len() > 64
+        || !req
+            .channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return error(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let version = match store(&app).and_then(|store| store.channel_version(&req.channel)) {
+        Ok(version) => version,
+        Err(crate::channels::StoreError::RecoveryPending) => {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(_) => {
+            app.config.auth.audit.mark_failure();
+            return error(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let operation = PermissionChange {
         user_id: req.user_id,
         channel: req.channel,
         read: req.read,
         send: req.send,
+        version,
     };
     let id = match app.cli.begin(operation, challenge, Instant::now()) {
         Ok(id) => id,
@@ -413,6 +458,7 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
             channel,
             webhook_id,
             commitment,
+            version,
         } => {
             use sha2::{Digest, Sha256};
             let Some(webhook) = req.webhook else {
@@ -429,9 +475,12 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                 return error(StatusCode::FORBIDDEN);
             }
             return match store(&app).and_then(|store| {
-                store.put_webhook_as_discord(&channel, &webhook, &app.config.admin_user_id)
+                store.put_webhook_as_discord(&channel, &webhook, &app.config.admin_user_id, version)
             }) {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::channels::StoreError::AuthorizationDenied) => {
+                    error(StatusCode::CONFLICT)
+                }
                 Err(crate::channels::StoreError::RecoveryPending) => {
                     error(StatusCode::SERVICE_UNAVAILABLE)
                 }
@@ -448,6 +497,7 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
             channel,
             discord_channel_id,
             commitment,
+            version,
         } => {
             use sha2::{Digest, Sha256};
             let Some(token) = req.bot_token else {
@@ -463,9 +513,13 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                     &discord_channel_id,
                     &token,
                     &app.config.admin_user_id,
+                    version,
                 )
             }) {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::channels::StoreError::AuthorizationDenied) => {
+                    error(StatusCode::CONFLICT)
+                }
                 Err(crate::channels::StoreError::RecoveryPending) => {
                     error(StatusCode::SERVICE_UNAVAILABLE)
                 }
@@ -502,8 +556,11 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
     let Ok(now) = current_timestamp() else {
         return error(StatusCode::INTERNAL_SERVER_ERROR);
     };
+    let Some(version) = operation.version else {
+        return error(StatusCode::NOT_FOUND);
+    };
     match store(&app).and_then(|store| {
-        store.set_permissions_audited(
+        store.set_permissions_audited_if_version(
             &operation.user_id,
             &operation.channel,
             operation.read,
@@ -513,9 +570,12 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
                 now,
                 retention_days: app.config.auth.audit.retention_days(),
             },
+            version,
         )
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::channels::StoreError::AuthorizationDenied) => error(StatusCode::CONFLICT),
+        Err(crate::channels::StoreError::RecoveryPending) => error(StatusCode::SERVICE_UNAVAILABLE),
         Err(crate::channels::StoreError::Storage | crate::channels::StoreError::Decryption) => {
             app.config.auth.audit.mark_failure();
             error(StatusCode::INTERNAL_SERVER_ERROR)
