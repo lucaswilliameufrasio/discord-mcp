@@ -114,6 +114,128 @@ async fn exercise(address: SocketAddr, directory: &Path) -> Result<(), Box<dyn s
     store.revoke_access_token(&token)?;
     assert_source_unchanged(&store, &token, resource);
 
+    // Exercise the application's reusable feature directly against Floci.
+    let backup_identity = age::x25519::Identity::generate();
+    let backup_recipient = backup_identity.to_public();
+    println!("Starting reusable encrypted S3 upload");
+    discord_mcp::encrypted_backup::upload_snapshot(
+        &client,
+        "discord-mcp-synthetic-drill",
+        "app/snapshot.age",
+        &source,
+        directory,
+        &backup_recipient,
+    )
+    .await?;
+    println!("Reusable encrypted S3 upload accepted");
+    let app_object = client
+        .get_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("app/snapshot.age")
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert!(
+        !app_object
+            .windows(16)
+            .any(|part| part == b"SQLite format 3\0")
+    );
+    let mut tampered = app_object.to_vec();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    client
+        .put_object()
+        .bucket("discord-mcp-synthetic-drill")
+        .key("app/tampered.age")
+        .body(tampered.into())
+        .send()
+        .await?;
+    let rejected = directory.join("app-tampered.db");
+    assert!(
+        discord_mcp::encrypted_backup::restore_quarantined(
+            &client,
+            "discord-mcp-synthetic-drill",
+            "app/tampered.age",
+            &rejected,
+            &backup_identity,
+            &key,
+            90,
+        )
+        .await
+        .is_err()
+    );
+    assert_no_destination(&rejected);
+    assert!(
+        discord_mcp::encrypted_backup::upload_snapshot(
+            &client,
+            "discord-mcp-synthetic-drill",
+            "app/snapshot.age",
+            &source,
+            directory,
+            &backup_recipient,
+        )
+        .await
+        .is_err()
+    );
+    let app_destination = directory.join("app-restored.db");
+    assert!(
+        discord_mcp::encrypted_backup::restore_quarantined(
+            &client,
+            "discord-mcp-synthetic-drill",
+            "app/snapshot.age",
+            &app_destination,
+            &age::x25519::Identity::generate(),
+            &key,
+            90,
+        )
+        .await
+        .is_err()
+    );
+    assert_no_destination(&app_destination);
+    let report = discord_mcp::encrypted_backup::restore_quarantined(
+        &client,
+        "discord-mcp-synthetic-drill",
+        "app/snapshot.age",
+        &app_destination,
+        &backup_identity,
+        &key,
+        90,
+    )
+    .await?;
+    assert_eq!((report.permissions, report.tokens, report.codes), (0, 0, 1));
+    let app_restored = ChannelStore::open(&app_destination, &key)?;
+    assert!(app_restored.recovery_quarantined()?);
+    app_restored.activate_recovered_copy()?;
+    assert!(!app_restored.is_permitted("101", "support", ChannelAction::Read)?);
+    assert!(
+        app_restored
+            .verify_access_token(&token, resource, 1001)?
+            .is_none()
+    );
+    drop(app_restored);
+    let before = std::fs::read(&app_destination)?;
+    assert!(
+        discord_mcp::encrypted_backup::restore_quarantined(
+            &client,
+            "discord-mcp-synthetic-drill",
+            "app/snapshot.age",
+            &app_destination,
+            &backup_identity,
+            &key,
+            90,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&app_destination)?, before);
+    assert_source_unchanged(&store, &token, resource);
+    println!(
+        "PASS reusable encrypted S3 backup: conditional upload, wrong identity, quarantine and no overwrite"
+    );
+
     // A second full snapshot uses a distinct repository and remote prefix.
     // Reusing TXID 1 within the original repository would conflict with its
     // immutable object keys; this is not incremental replication.

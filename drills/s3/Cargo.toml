@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-discord-mcp = { path = "../.." }
+discord-mcp = { path = "../..", features = ["encrypted-s3-backup"] }
 sqlite-replication-core = { path = "../../../sqlite-replication/rust/crates/core" }
 sqlite-replication-storage-s3 = { path = "../../../sqlite-replication/rust/crates/storage-s3" }
 aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }

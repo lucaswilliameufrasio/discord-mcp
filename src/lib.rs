@@ -3,6 +3,8 @@ pub mod bot;
 pub mod channels;
 pub mod cli_authorization;
 pub mod discord_login;
+#[cfg(feature = "encrypted-s3-backup")]
+pub mod encrypted_backup;
 pub mod http_auth;
 pub mod http_mcp;
 pub mod oauth_web;

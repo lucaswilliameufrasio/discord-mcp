@@ -117,6 +117,30 @@ integração Ciphera, limites de produção, política de retenção nem fluxo d
 criptografado ligado ao serviço. O arquivo de snapshot temporário é plaintext.
 O teste não demonstra compatibilidade ou segurança de nenhum provedor real.
 
+### API experimental reutilizável
+
+A feature opcional `encrypted-s3-backup` adiciona `src/encrypted_backup.rs` à
+biblioteca. `upload_snapshot` usa a API de backup online SQLite para uma cópia
+em staging privado, cifra a imagem completa para um destinatário X25519 age e
+envia um único objeto com `If-None-Match: *`. `restore_quarantined` limita o
+download, autentica age antes de gravar e chama `prepare_restored_copy`, que
+publica somente em destino novo e em quarentena. O cliente S3 e as identidades
+são fornecidos pelo chamador; não há operação automática nem comandos CLI.
+
+O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
+ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
+ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci
+é descartável; isso não valida a condicional, IAM, TLS, versionamento ou
+consistência em outros provedores. O limite é 64 MiB de snapshot e 65 MiB de
+objeto; dados em claro são mantidos em memória e em arquivos privados de staging,
+que podem persistir após encerramento abrupto. Não há proteção contra usuários
+com acesso ao processo ou diretório, nem limpeza segura garantida. O trabalho
+SQLite e a criptografia são síncronos dentro da chamada async; o chamador deve
+isolá-los de tarefas sensíveis à latência. Configure timeouts do cliente S3.
+Sem identidade de recuperação guardada separadamente, coordenação operacional
+dos escritores e ferramenta de recuperação reproduzível, isto não qualifica
+recuperação de produção e não habilita replicação incremental.
+
 Execução local em 2026-11-05: `sqlite-replication` na revisão local
 `3553f91cce2535b4fbe521c6582bec64db94477d`, com alterações preexistentes em
 documentação e testes, e Discord MCP em `4dfdde4` mais o subprojeto deste

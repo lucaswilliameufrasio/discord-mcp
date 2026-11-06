@@ -1032,6 +1032,8 @@ dependencies = [
 name = "discord-mcp"
 version = "0.1.0"
 dependencies = [
+ "age",
+ "aws-sdk-s3",
  "axum",
  "base64 0.23.1",
  "chacha20poly1305 0.11.0",
