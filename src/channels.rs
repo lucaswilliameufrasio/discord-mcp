@@ -12,6 +12,69 @@ use subtle::ConstantTimeEq;
 
 use crate::{bot::BotChannel, webhook::WebhookUrl};
 
+fn validate_permission_revisions(db: &Connection) -> Result<(), StoreError> {
+    let mut columns = db
+        .prepare("PRAGMA table_xinfo(channel_permission_revisions)")
+        .map_err(|_| StoreError::Storage)?;
+    let rows = columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|_| StoreError::Storage)?;
+    let columns: Vec<_> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|_| StoreError::Storage)?;
+    if columns.len() != 2
+        || columns[0].0 != "channel_name"
+        || !columns[0].1.eq_ignore_ascii_case("TEXT")
+        || columns[0].2 != 1
+        || columns[0].3 != 1
+        || columns[0].4 != 0
+        || columns[1].0 != "revision"
+        || !columns[1].1.eq_ignore_ascii_case("INTEGER")
+        || columns[1].2 != 1
+        || columns[1].3 != 0
+        || columns[1].4 != 0
+    {
+        return Err(StoreError::Storage);
+    }
+    let mut foreign_keys = db
+        .prepare("PRAGMA foreign_key_list(channel_permission_revisions)")
+        .map_err(|_| StoreError::Storage)?;
+    let rows = foreign_keys
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|_| StoreError::Storage)?;
+    let keys: Vec<_> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|_| StoreError::Storage)?;
+    if keys.len() != 1
+        || keys[0].0 != "channels"
+        || keys[0].1 != "channel_name"
+        || keys[0].2 != "name"
+        || !keys[0].3.eq_ignore_ascii_case("CASCADE")
+    {
+        return Err(StoreError::Storage);
+    }
+    let invalid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM channel_permission_revisions r LEFT JOIN channels c ON c.name=r.channel_name WHERE typeof(r.channel_name) != 'text' OR typeof(r.revision) != 'integer' OR r.revision < 0 OR c.name IS NULL)", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+    if invalid {
+        return Err(StoreError::Storage);
+    }
+    Ok(())
+}
+
 pub enum Channel {
     Webhook(WebhookUrl),
     Bot(BotChannel),
@@ -228,6 +291,7 @@ impl ChannelStore {
             )
             .map_err(|_| StoreError::Storage)?;
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS channel_permission_revisions (channel_name TEXT PRIMARY KEY NOT NULL REFERENCES channels(name) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision >= 0));").map_err(|_| StoreError::Storage)?;
+        validate_permission_revisions(&store.db)?;
         store
             .db
             .execute_batch(

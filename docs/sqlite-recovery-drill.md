@@ -111,6 +111,23 @@ brusca, restart do Floci, falhas reais de rede, perda de host ou provedores reai
 
 ### Investigação da integração operacional — 2026-11-05
 
+#### Revisões de permissões e restauração sintética
+
+`tests/legacy_permission_recovery.rs` usa um banco criado pela aplicação atual
+com a tabela de revisões removida, não uma captura de uma versão antiga. Os
+testes verificam migração e aberturas simultâneas sem perda das permissões da
+fonte, quarentena da cópia, invalidação das permissões restauradas e ativação
+isolada. Tabelas de revisão com colunas, chave primária ou chave estrangeira
+incompatíveis, revisões inválidas ou registros órfãos são recusadas antes da
+publicação. A validação confere os dados existentes na abertura; não transforma
+escritores externos ou versões antigas em participantes do controle de revisão.
+
+O exercício filesystem opt-in passou usando o binário já existente em
+`target/replication-drill/debug/examples/snapshot-restore`. Sua proveniência
+não está fixada: o resultado não comprova build reproduzível da biblioteca,
+captura incremental, isolamento de todos os escritores ou recuperação
+operacional. Nenhum serviço ou backup real foi usado.
+
 #### Requisitos de execução esclarecidos pelo usuário
 
 **Mapa de acessos revisto em 2026-11-06:** no modo HTTP, `src/server.rs`,
