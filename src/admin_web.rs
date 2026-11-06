@@ -80,10 +80,46 @@ pub(crate) fn router_with_cli(
         .route("/v1/cli/list-requests", post(cli_begin_list))
         .route("/v1/cli/permission-requests", post(cli_begin_permissions))
         .route("/v1/cli/webhook-requests", post(cli_begin_webhook))
+        .route("/v1/cli/bot-requests", post(cli_begin_bot))
         .route("/v1/cli/execute", post(cli_execute))
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[derive(Deserialize)]
+struct CliBeginBot {
+    channel: String,
+    discord_channel_id: String,
+    commitment: String,
+    challenge: String,
+}
+
+async fn cli_begin_bot(State(app): State<Shared>, Json(req): Json<CliBeginBot>) -> Response {
+    let Ok(challenge) = hex::decode(&req.challenge)
+        .and_then(|v| <[u8; 32]>::try_from(v).map_err(|_| hex::FromHexError::InvalidStringLength))
+    else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let Ok(commitment) = hex::decode(&req.commitment)
+        .and_then(|v| <[u8; 32]>::try_from(v).map_err(|_| hex::FromHexError::InvalidStringLength))
+    else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let id = match app.cli.begin_register_bot(
+        req.channel,
+        req.discord_channel_id,
+        commitment,
+        challenge,
+        Instant::now(),
+    ) {
+        Ok(id) => id,
+        Err("invalid operation") => return error(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id": id})).into_response();
+    headers(&mut response);
+    response
 }
 
 #[derive(Deserialize)]
@@ -243,6 +279,15 @@ async fn cli_consent(
             escape(&channel),
             escape(&webhook_id)
         ),
+        CliOperation::RegisterBot {
+            channel,
+            discord_channel_id,
+            ..
+        } => format!(
+            "Cadastrar bot<br>Canal: {}<br>ID do canal Discord: {}<br>Substituir um canal existente revoga suas permissões.",
+            escape(&channel),
+            escape(&discord_channel_id)
+        ),
     };
     page(format!(
         "<h1>Autorizar solicitação da CLI</h1><p>{description}</p><form method=\"post\" action=\"/admin/cli\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Autorizar esta operação</button></form>",
@@ -269,6 +314,7 @@ struct CliExecute {
     request_id: String,
     verifier: String,
     webhook: Option<String>,
+    bot_token: Option<String>,
 }
 
 async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> Response {
@@ -336,6 +382,40 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
             }
             return match store(&app).and_then(|store| {
                 store.put_webhook_as_discord(&channel, &webhook, &app.config.admin_user_id)
+            }) {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::channels::StoreError::RecoveryPending) => {
+                    error(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                Err(
+                    crate::channels::StoreError::Storage | crate::channels::StoreError::Decryption,
+                ) => {
+                    app.config.auth.audit.mark_failure();
+                    error(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+                Err(_) => error(StatusCode::UNPROCESSABLE_ENTITY),
+            };
+        }
+        CliOperation::RegisterBot {
+            channel,
+            discord_channel_id,
+            commitment,
+        } => {
+            use sha2::{Digest, Sha256};
+            let Some(token) = req.bot_token else {
+                return error(StatusCode::BAD_REQUEST);
+            };
+            let digest = Sha256::digest(token.as_bytes());
+            if !bool::from(commitment.as_slice().ct_eq(digest.as_slice())) {
+                return error(StatusCode::FORBIDDEN);
+            }
+            return match store(&app).and_then(|store| {
+                store.put_bot_as_discord(
+                    &channel,
+                    &discord_channel_id,
+                    &token,
+                    &app.config.admin_user_id,
+                )
             }) {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
                 Err(crate::channels::StoreError::RecoveryPending) => {

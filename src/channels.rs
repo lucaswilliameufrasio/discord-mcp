@@ -405,6 +405,20 @@ impl ChannelStore {
         self.put_secret(name, url, AuditActor::Discord(actor))
     }
 
+    pub fn put_bot_as_discord(
+        &self,
+        name: &str,
+        channel_id: &str,
+        token: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        if !valid_user_id(actor) {
+            return Err(StoreError::InvalidInput);
+        }
+        let bot = BotChannel::new(channel_id, token).ok_or(StoreError::InvalidInput)?;
+        self.put_secret(name, &bot.encode(), AuditActor::Discord(actor))
+    }
+
     fn put_secret(&self, name: &str, url: &str, actor: AuditActor<'_>) -> Result<(), StoreError> {
         if name.is_empty()
             || name.len() > 64

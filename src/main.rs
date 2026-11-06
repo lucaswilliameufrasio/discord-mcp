@@ -9,7 +9,7 @@ mod process_guard;
 mod server;
 
 use discord_mcp::{
-    bot::BotClient,
+    bot::{BotChannel, BotClient},
     channels::{Channel, ChannelStore},
     webhook::{WebhookClient, WebhookUrl},
 };
@@ -195,19 +195,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         remote_operation(origin, RemoteOperation::ShowPermissions(channel)).await?;
         return Ok(());
     }
+    if let [command, origin, channel, discord_channel_id] = args.as_slice()
+        && command == "remote-add-bot"
+    {
+        let token = read_remote_secret()?;
+        remote_operation(
+            origin,
+            RemoteOperation::RegisterBot(
+                channel,
+                discord_channel_id,
+                token.trim_end_matches(['\r', '\n']),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
     if let [command, origin, channel] = args.as_slice()
         && command == "remote-add-webhook"
     {
-        if std::io::stdin().is_terminal() {
-            return Err(
-                "provide the webhook on a protected non-terminal stdin, not as an argument".into(),
-            );
-        }
-        let mut input = String::new();
-        std::io::stdin().lock().take(4097).read_line(&mut input)?;
-        if input.len() > 4096 || !input.ends_with('\n') {
-            return Err("invalid webhook input".into());
-        }
+        let input = read_remote_secret()?;
         let webhook = input.trim_end_matches(['\r', '\n']);
         remote_operation(origin, RemoteOperation::RegisterWebhook(channel, webhook)).await?;
         return Ok(());
@@ -258,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.is_empty() {
         if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
             println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|remote-add-bot ORIGIN CHANNEL DISCORD_CHANNEL_ID|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
             );
             println!("Server configuration and security requirements: see README.md.");
             return Ok(());
@@ -355,12 +361,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn read_remote_secret() -> Result<String, Box<dyn std::error::Error>> {
+    if std::io::stdin().is_terminal() {
+        return Err(
+            "provide the credential on protected non-terminal stdin, not as an argument".into(),
+        );
+    }
+    let mut input = String::new();
+    std::io::stdin().lock().take(4097).read_line(&mut input)?;
+    if input.len() > 4096 || !input.ends_with('\n') {
+        return Err("invalid credential input".into());
+    }
+    Ok(input)
+}
+
 #[derive(Clone, Copy)]
 enum RemoteOperation<'a> {
     SetPermission(&'a str, &'a str, &'a str),
     ListChannels,
     ShowPermissions(&'a str),
     RegisterWebhook(&'a str, &'a str),
+    RegisterBot(&'a str, &'a str, &'a str),
 }
 
 async fn remote_operation(
@@ -422,6 +443,14 @@ async fn remote_operation(
                 rmcp::serde_json::json!({"channel":channel,"webhook_id":parsed.id(),"commitment":hex::encode(Sha256::digest(webhook.as_bytes())),"challenge":challenge}),
             )
         }
+        RemoteOperation::RegisterBot(channel, discord_channel_id, token) => {
+            BotChannel::new(discord_channel_id, token)
+                .ok_or("invalid bot credential or channel ID")?;
+            (
+                "/v1/cli/bot-requests",
+                rmcp::serde_json::json!({"channel":channel,"discord_channel_id":discord_channel_id,"commitment":hex::encode(Sha256::digest(token.as_bytes())),"challenge":challenge}),
+            )
+        }
     };
     let response = client
         .post(url.join(endpoint)?)
@@ -447,6 +476,9 @@ async fn remote_operation(
     let mut execution = rmcp::serde_json::json!({"request_id":id,"verifier":hex::encode(verifier)});
     if let RemoteOperation::RegisterWebhook(_, webhook) = operation {
         execution["webhook"] = webhook.into();
+    }
+    if let RemoteOperation::RegisterBot(_, _, token) = operation {
+        execution["bot_token"] = token.into();
     }
     let response = client
         .post(url.join("/v1/cli/execute")?)
@@ -500,6 +532,12 @@ async fn remote_operation(
                 return Err("authorization denied, expired, consumed or operation failed".into());
             }
             eprintln!("Webhook channel configured by remote service.");
+        }
+        RemoteOperation::RegisterBot(..) => {
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err("authorization denied, expired, consumed or operation failed".into());
+            }
+            eprintln!("Bot channel configured by remote service.");
         }
     }
     Ok(())

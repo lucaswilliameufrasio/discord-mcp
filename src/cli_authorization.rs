@@ -35,6 +35,11 @@ pub enum CliOperation {
         webhook_id: String,
         commitment: [u8; 32],
     },
+    RegisterBot {
+        channel: String,
+        discord_channel_id: String,
+        commitment: [u8; 32],
+    },
 }
 
 fn valid_channel(channel: &str) -> bool {
@@ -116,6 +121,32 @@ impl CliAuthorizations {
             CliOperation::RegisterWebhook {
                 channel,
                 webhook_id,
+                commitment,
+            },
+            challenge,
+            now,
+        )
+    }
+
+    pub fn begin_register_bot(
+        &self,
+        channel: String,
+        discord_channel_id: String,
+        commitment: [u8; 32],
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        if !valid_channel(&channel)
+            || discord_channel_id.is_empty()
+            || discord_channel_id.len() > 20
+            || !discord_channel_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err("invalid operation");
+        }
+        self.begin_operation(
+            CliOperation::RegisterBot {
+                channel,
+                discord_channel_id,
                 commitment,
             },
             challenge,

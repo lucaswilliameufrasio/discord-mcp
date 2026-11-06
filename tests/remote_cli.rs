@@ -662,6 +662,223 @@ async fn cli_real_router_discord_login_and_consent() {
             .any(|part| part == b"synthetic-secret")
     );
     assert!(!forbidden_db.exists());
+    let synthetic_token = "synthetic-bot-credential";
+    let mut bot_cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &forbidden_db)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-add-bot", &origin, "bot_new", "321"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    bot_cli
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{synthetic_token}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut bot_stderr = BufReader::new(bot_cli.stderr.take().unwrap());
+    let mut bot_line = String::new();
+    timeout(Duration::from_secs(10), bot_stderr.read_line(&mut bot_line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!bot_line.contains(synthetic_token));
+    let bot_url = reqwest::Url::parse(bot_line.split_whitespace().last().unwrap()).unwrap();
+    let bot_id = bot_url
+        .query_pairs()
+        .find(|(k, _)| k == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let html = browser
+        .get(bot_url)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("Cadastrar bot")
+            && html.contains("bot_new")
+            && html.contains("321")
+            && html.contains("revoga")
+    );
+    assert!(!html.contains(synthetic_token));
+    assert!(!store.list().unwrap().contains(&"bot_new".to_owned()));
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &bot_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    bot_cli
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .await
+        .unwrap();
+    let result = timeout(Duration::from_secs(10), bot_cli.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(!String::from_utf8_lossy(&result.stdout).contains(synthetic_token));
+    assert!(matches!(
+        store.get_channel("bot_new"),
+        Ok(discord_mcp::channels::Channel::Bot(_))
+    ));
+    store.set_permissions("103", "bot_new", true, true).unwrap();
+    assert!(
+        store
+            .is_permitted("103", "bot_new", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        store
+            .is_permitted("103", "bot_new", ChannelAction::Send)
+            .unwrap()
+    );
+    assert!(
+        store
+            .audit_events(None, Some("channel_configured"), 20)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.actor_kind == "discord"
+                && entry.actor_id.as_deref() == Some("123")
+                && entry.channel.as_deref() == Some("bot_new"))
+    );
+    let encrypted: Vec<u8> = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT ciphertext FROM channels WHERE name='bot_new'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !encrypted
+            .windows(synthetic_token.len())
+            .any(|part| part == synthetic_token.as_bytes())
+    );
+    let request: Value = browser.post(format!("{origin}/v1/cli/bot-requests"))
+        .json(&json!({"channel":"bot_second","discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let request_id = request["request_id"].as_str().unwrap();
+    let payload = json!({"request_id":request_id,"verifier":hex::encode(verifier),"bot_token":synthetic_token});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", request_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":request_id,"verifier":hex::encode(verifier),"bot_token":"different-synthetic"})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(!store.list().unwrap().contains(&"bot_second".to_owned()));
+    let expired: Value = browser.post(format!("{origin}/v1/cli/bot-requests"))
+        .json(&json!({"channel":"bot_second","discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let expired_id = expired["request_id"].as_str().unwrap();
+    cli_requests.expire_for_test(expired_id);
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", expired_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let request: Value = browser.post(format!("{origin}/v1/cli/bot-requests"))
+        .json(&json!({"channel":"bot_new","discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let id = request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let payload =
+        json!({"request_id":id,"verifier":hex::encode(verifier),"bot_token":synthetic_token});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        !store
+            .is_permitted("103", "bot_new", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        store
+            .audit_events(None, Some("channel_grants_revoked"), 20)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.actor_kind == "discord"
+                && entry.actor_id.as_deref() == Some("123")
+                && entry.channel.as_deref() == Some("bot_new"))
+    );
     let request: Value = browser
         .post(format!("{origin}/v1/cli/permission-requests"))
         .json(&json!({"channel":"alerts","challenge":hex::encode(Sha256::digest(verifier))}))
@@ -892,6 +1109,28 @@ async fn cli_real_router_discord_login_and_consent() {
     );
     assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":quarantined_webhook_id,"verifier":hex::encode(verifier),"webhook":synthetic_webhook})).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(!store.list().unwrap().contains(&"quarantined".to_owned()));
+    let request: Value = browser.post(format!("{origin}/v1/cli/bot-requests"))
+        .json(&json!({"channel":"bot_quarantined","discord_channel_id":"654","commitment":hex::encode(Sha256::digest(synthetic_token.as_bytes())),"challenge":hex::encode(Sha256::digest(verifier))})).send().await.unwrap().json().await.unwrap();
+    let id = request["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(browser.post(format!("{origin}/v1/cli/execute")).json(&json!({"request_id":id,"verifier":hex::encode(verifier),"bot_token":synthetic_token})).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !store
+            .list()
+            .unwrap()
+            .contains(&"bot_quarantined".to_owned())
+    );
     assert!(!forbidden_db.exists());
     service.abort();
     provider_task.abort();

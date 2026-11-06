@@ -146,6 +146,17 @@ corpos de requisições. Uma
 falha ou perda da resposta após consumo exige verificar o estado e a auditoria
 antes de tentar novamente. Esse comando cadastra webhook, não token de bot.
 
+Para cadastrar um canal com bot, use
+`discord-mcp remote-add-bot ORIGEM CANAL ID_CANAL_DISCORD`. Forneça o token do
+bot por stdin protegido não terminal, com uma quebra de linha, e mantenha o
+stdin aberto para a confirmação após o consentimento no navegador, como no
+exemplo anterior. O consentimento mostra o nome e o ID do canal Discord, não o
+token; a autorização é vinculada ao token e de uso único. A substituição de
+um canal revoga suas concessões anteriores. O serviço cifra o token no banco e
+registra o administrador Discord na auditoria; o proxy não deve registrar
+corpos de requisição. O cadastro não verifica o token nem as permissões do bot
+no Discord: isso exige validação posterior no ambiente autorizado.
+
 Em `/admin/observability`, a conta administradora pode consultar as últimas 24
 horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
 envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,
