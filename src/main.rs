@@ -176,6 +176,12 @@ impl ServerHandler for DiscordMcp {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(feature = "encrypted-s3-backup")]
+    if let [command, origin, id] = args.as_slice()
+        && command == "remote-backup"
+    {
+        return remote_operation(origin, RemoteOperation::Backup(id)).await;
+    }
+    #[cfg(feature = "encrypted-s3-backup")]
     if let [command, endpoint, bucket, object, destination] = args.as_slice()
         && command == "restore-floci"
     {
@@ -408,6 +414,8 @@ fn read_remote_secret() -> Result<String, Box<dyn std::error::Error>> {
 
 #[derive(Clone, Copy)]
 enum RemoteOperation<'a> {
+    #[cfg(feature = "encrypted-s3-backup")]
+    Backup(&'a str),
     SetPermission(&'a str, &'a str, &'a str),
     ListChannels,
     ShowPermissions(&'a str),
@@ -442,11 +450,24 @@ async fn remote_operation(
     let mut verifier = [0u8; 32];
     getrandom::fill(&mut verifier)?;
     let challenge = hex::encode(Sha256::digest(verifier));
+    #[cfg(feature = "encrypted-s3-backup")]
+    let timeout_secs = if matches!(operation, RemoteOperation::Backup(_)) {
+        90
+    } else {
+        15
+    };
+    #[cfg(not(feature = "encrypted-s3-backup"))]
+    let timeout_secs = 15;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()?;
     let (endpoint, body) = match operation {
+        #[cfg(feature = "encrypted-s3-backup")]
+        RemoteOperation::Backup(id) => (
+            "/v1/cli/backup-requests",
+            rmcp::serde_json::json!({"backup_id":id,"challenge":challenge}),
+        ),
         RemoteOperation::SetPermission(user, channel, permission) => {
             let (read, send) = match permission {
                 "none" => (false, false),
@@ -522,6 +543,13 @@ async fn remote_operation(
         .send()
         .await?;
     match operation {
+        #[cfg(feature = "encrypted-s3-backup")]
+        RemoteOperation::Backup(_) => {
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err("backup was not confirmed; inspect the object before retrying".into());
+            }
+            eprintln!("Encrypted backup confirmed by remote service.");
+        }
         RemoteOperation::SetPermission(..) => {
             if response.status() != reqwest::StatusCode::NO_CONTENT {
                 return Err("authorization denied, expired, consumed or operation failed".into());

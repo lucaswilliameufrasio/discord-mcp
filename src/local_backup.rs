@@ -12,7 +12,7 @@ use aws_sdk_s3::{
     config::{Credentials, Region},
 };
 
-fn client(endpoint: &str) -> Result<Client, Box<dyn std::error::Error>> {
+pub(crate) fn client(endpoint: &str) -> Result<Client, Box<dyn std::error::Error>> {
     let address: SocketAddr = endpoint
         .parse()
         .map_err(|_| "expected IPv4 loopback address and port")?;

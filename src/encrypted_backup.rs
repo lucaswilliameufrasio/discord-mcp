@@ -43,6 +43,9 @@ pub struct ServiceBackup {
 }
 
 impl ServiceBackup {
+    pub fn destination_description(&self) -> (String, String) {
+        (self.bucket.clone(), self.recipient.to_string())
+    }
     pub fn new(
         client: Client,
         bucket: String,

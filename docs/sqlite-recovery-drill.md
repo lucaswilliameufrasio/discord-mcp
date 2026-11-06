@@ -156,10 +156,23 @@ em quarentena. Uma falha ou cancelamento de requisição pode ter resultado remo
 desconhecido; a gravação condicional impede sobrescrita, não comprova que uma
 tentativa de resultado perdido não criou o objeto. Não há persistência de job.
 
-**O executor ainda não está ligado ao servidor HTTP, autenticação Discord,
-consentimento ou CLI remota.** Ele não impõe por si próprio propriedade do
-SQLite nem valida acesso do chamador; não deve ser exposto diretamente. O
-acionamento mediado e a custódia real continuam pendentes.
+Com a feature `encrypted-s3-backup`, o servidor pode habilitar explicitamente o
+teste com `DISCORD_MCP_FLOCI_BACKUP_ADDRESS` (`127.0.0.1:porta`),
+`DISCORD_MCP_FLOCI_BACKUP_BUCKET` e `DISCORD_MCP_FLOCI_BACKUP_RECIPIENT` (chave
+pública age). `remote-backup ORIGIN ID` inicia uma solicitação específica; a
+tela de consentimento exibe ID, bucket e destinatário. A execução exige o
+verificador de uso único da CLI, ocorre no processo HTTP e não entrega chave
+privada ao serviço. O endereço e as credenciais S3 do modelo são exclusivamente
+para Floci sintético; não são integração com S3 real ou Ciphera.
+
+O teste opt-in inicia roteador real com Discord sintético e confirma CLI,
+consentimento, upload Floci e recuperação em quarentena; também testa recusa
+antes de consentir, verificador errado, replay e duplicata. O binário de servidor
+usa o lock cooperativo já existente, mas o executor não impõe a propriedade do
+SQLite sozinho. Cancelamento ou resposta perdida pode deixar resultado remoto
+desconhecido. A operação não tem job durável nem evento de auditoria próprio;
+há I/O e criptografia síncronos no executor async. Sem resolver esses limites,
+custódia, coordenação e política de recuperação, não usar em produção.
 
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e

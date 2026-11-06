@@ -29,6 +29,8 @@ pub struct PermissionChange {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliOperation {
+    #[cfg(feature = "encrypted-s3-backup")]
+    Backup(String),
     PermissionChange(PermissionChange),
     ListChannels,
     ShowPermissions(String),
@@ -72,6 +74,23 @@ pub struct CliAuthorizations {
 }
 
 impl CliAuthorizations {
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub fn begin_backup(
+        &self,
+        id: String,
+        challenge: [u8; 32],
+        now: Instant,
+    ) -> Result<String, &'static str> {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err("invalid operation");
+        }
+        self.begin_operation(CliOperation::Backup(id), challenge, now)
+    }
     #[cfg(test)]
     pub(crate) fn expire_for_test(&self, id: &str) {
         let mut entries = self.entries.lock().unwrap();

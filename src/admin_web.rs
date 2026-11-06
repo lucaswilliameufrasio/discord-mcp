@@ -30,6 +30,8 @@ pub struct AdminConfig {
     pub public_origin: String,
     pub admin_user_id: String,
     pub discord: DiscordLoginClient,
+    #[cfg(feature = "encrypted-s3-backup")]
+    pub backup: Option<Arc<crate::encrypted_backup::ServiceBackup>>,
 }
 
 struct Attempt {
@@ -82,10 +84,46 @@ pub(crate) fn router_with_cli(
         .route("/v1/cli/webhook-requests", post(cli_begin_webhook))
         .route("/v1/cli/bot-requests", post(cli_begin_bot))
         .route("/v1/cli/delete-requests", post(cli_begin_delete))
+        .route("/v1/cli/backup-requests", post(cli_begin_backup))
         .route("/v1/cli/execute", post(cli_execute))
         .route("/admin/cli", get(cli_consent).post(cli_approve))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app))
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+#[derive(Deserialize)]
+struct CliBeginBackup {
+    backup_id: String,
+    challenge: String,
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn cli_begin_backup(State(app): State<Shared>, Json(req): Json<CliBeginBackup>) -> Response {
+    if app.config.backup.is_none() {
+        return error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let Ok(challenge) = hex::decode(&req.challenge)
+        .and_then(|v| <[u8; 32]>::try_from(v).map_err(|_| hex::FromHexError::InvalidStringLength))
+    else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    let id = match app
+        .cli
+        .begin_backup(req.backup_id, challenge, Instant::now())
+    {
+        Ok(id) => id,
+        Err("invalid operation") => return error(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response = Json(rmcp::serde_json::json!({"request_id": id})).into_response();
+    headers(&mut response);
+    response
+}
+
+#[cfg(not(feature = "encrypted-s3-backup"))]
+async fn cli_begin_backup() -> Response {
+    error(StatusCode::NOT_FOUND)
 }
 
 #[derive(Deserialize)]
@@ -350,6 +388,19 @@ async fn cli_consent(
         return error(StatusCode::NOT_FOUND);
     };
     let description = match operation {
+        #[cfg(feature = "encrypted-s3-backup")]
+        CliOperation::Backup(id) => {
+            let Some(backup) = &app.config.backup else {
+                return error(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            let (bucket, recipient) = backup.destination_description();
+            format!(
+                "Criar backup criptografado<br>ID: {}<br>Bucket: {}<br>Destinatário age: {}",
+                escape(&id),
+                escape(&bucket),
+                escape(&recipient)
+            )
+        }
         CliOperation::PermissionChange(operation) => format!(
             "Alterar permissão<br>Usuário: {}<br>Canal: {}<br>Leitura: {}<br>Envio: {}",
             escape(&operation.user_id),
@@ -420,6 +471,19 @@ async fn cli_execute(State(app): State<Shared>, Json(req): Json<CliExecute>) -> 
         return error(StatusCode::FORBIDDEN);
     };
     let operation = match operation {
+        #[cfg(feature = "encrypted-s3-backup")]
+        CliOperation::Backup(id) => {
+            let Some(backup) = &app.config.backup else {
+                return error(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            if store(&app).and_then(|store| store.list_active()).is_err() {
+                return error(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            return match backup.snapshot(&id).await {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => error(StatusCode::BAD_GATEWAY),
+            };
+        }
         CliOperation::PermissionChange(operation) => operation,
         CliOperation::ListChannels => {
             return match store(&app).and_then(|store| store.list_active()) {
@@ -1253,6 +1317,8 @@ mod tests {
             public_origin: origin.clone(),
             admin_user_id: "123".into(),
             discord,
+            #[cfg(feature = "encrypted-s3-backup")]
+            backup: None,
         };
         let server = tokio::spawn(async move {
             axum::serve(listener, router(config).unwrap())

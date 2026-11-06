@@ -18,6 +18,8 @@ use tokio::{
 
 // Compile the production router and Discord client with their existing
 // cfg(test) provider injection; no provider override is enabled in production.
+#[cfg(feature = "encrypted-s3-backup")]
+pub use discord_mcp::encrypted_backup;
 pub use discord_mcp::{channels, http_auth, webhook};
 #[path = "../src/admin_web.rs"]
 mod admin_web;
@@ -118,6 +120,8 @@ async fn invalid_revision_blocks_admin_form_and_approved_real_cli() {
         public_origin: origin.clone(),
         admin_user_id: "123".into(),
         discord,
+        #[cfg(feature = "encrypted-s3-backup")]
+        backup: None,
     };
     let service = tokio::spawn(async move {
         axum::serve(listener, admin_web::router(config).unwrap())
@@ -324,6 +328,8 @@ async fn cli_real_router_discord_login_and_consent() {
         public_origin: origin.clone(),
         admin_user_id: "123".into(),
         discord,
+        #[cfg(feature = "encrypted-s3-backup")]
+        backup: None,
     };
     let cli_requests = Arc::new(cli_authorization::CliAuthorizations::default());
     let requests_for_server = cli_requests.clone();
@@ -1864,4 +1870,330 @@ async fn remote_cli_uses_http_without_opening_local_storage() {
     );
     assert!(!db.exists());
     server.abort();
+}
+
+#[cfg(all(feature = "encrypted-s3-backup", unix))]
+#[tokio::test]
+#[ignore = "requires isolated local Floci fixture"]
+async fn mediated_backup_requires_consent_and_restores_from_floci() {
+    use axum::http::header;
+    use discord_mcp::channels::{ChannelAction, ChannelStore};
+    use discord_mcp::http_auth::AuthState;
+    use std::os::unix::fs::PermissionsExt;
+
+    let address: std::net::SocketAddr = std::env::var("DISCORD_MCP_FLOCI_FIXTURE_ADDRESS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        address.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    let config = aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(format!("http://{address}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "test", "test", None, None, "fixture",
+        ))
+        .build();
+    let s3 = aws_sdk_s3::Client::from_conf(config);
+    let bucket = format!("discord-mcp-mediated-{}", std::process::id());
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = dir.path().join("service.db");
+    let cli_database = dir.path().join("must-not-open.db");
+    let key = [91_u8; 32];
+    let store = ChannelStore::open(&database, &key).unwrap();
+    store.put_bot("alerts", "123", "synthetic-token").unwrap();
+    store.set_permissions("101", "alerts", true, false).unwrap();
+    let identity = age::x25519::Identity::generate();
+    let executor = Arc::new(
+        encrypted_backup::ServiceBackup::new(
+            s3.clone(),
+            bucket.clone(),
+            database.clone(),
+            dir.path().into(),
+            identity.to_public(),
+        )
+        .unwrap(),
+    );
+    let provider = Router::new()
+        .route(
+            "/api/oauth2/token",
+            post(|| async { Json(json!({"access_token":"synthetic","token_type":"Bearer"})) }),
+        )
+        .route(
+            "/api/v10/users/@me",
+            axum::routing::get(|| async { Json(json!({"id":"123","username":"Admin"})) }),
+        );
+    let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_url = reqwest::Url::parse(&format!(
+        "http://{}/",
+        provider_listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let provider_task =
+        tokio::spawn(async move { axum::serve(provider_listener, provider).await.unwrap() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let discord = discord_login::DiscordLoginClient::new(
+        "123",
+        "synthetic-secret",
+        &format!("{origin}/admin/discord/callback"),
+    )
+    .unwrap()
+    .with_test_base(provider_url);
+    let admin = admin_web::AdminConfig {
+        auth: AuthState {
+            database_path: database,
+            encryption_key: key,
+            resource: format!("{origin}/mcp"),
+            metrics: Default::default(),
+            audit: Default::default(),
+        },
+        public_origin: origin.clone(),
+        admin_user_id: "123".into(),
+        discord,
+        backup: Some(executor),
+    };
+    let service = tokio::spawn(async move {
+        axum::serve(listener, admin_web::router(admin).unwrap())
+            .await
+            .unwrap()
+    });
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let login = browser_login(&browser, &origin).await;
+    let session = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+        .env_clear()
+        .env("DISCORD_MCP_DB", &cli_database)
+        .env("DISCORD_MCP_KEY", "invalid")
+        .args(["remote-backup", &origin, "backup-1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(cli.stderr.take().unwrap());
+    let mut line = String::new();
+    timeout(Duration::from_secs(10), stderr.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let consent = reqwest::Url::parse(line.split_whitespace().last().unwrap()).unwrap();
+    let id = consent
+        .query_pairs()
+        .find(|(key, _)| key == "request_id")
+        .unwrap()
+        .1
+        .into_owned();
+    let page = browser
+        .get(consent)
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("backup-1")
+            && page.contains(&bucket)
+            && page.contains(&identity.to_public().to_string())
+    );
+    assert!(
+        s3.get_object()
+            .bucket(&bucket)
+            .key("service-backups/backup-1.age")
+            .send()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    cli.stdin.take().unwrap().write_all(b"\n").await.unwrap();
+    assert!(
+        timeout(Duration::from_secs(30), cli.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!cli_database.exists());
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", &id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let restored = dir.path().join("restored.db");
+    let report = encrypted_backup::restore_quarantined(
+        &s3,
+        &bucket,
+        "service-backups/backup-1.age",
+        &restored,
+        &identity,
+        &key,
+        90,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.permissions, 1);
+    let recovered = ChannelStore::open(&restored, &key).unwrap();
+    assert!(recovered.recovery_quarantined().unwrap());
+    recovered.activate_recovered_copy().unwrap();
+    assert!(
+        !recovered
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    assert!(
+        store
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    let verifier = [44_u8; 32];
+    let challenge = hex::encode(Sha256::digest(verifier));
+    let begin: Value = browser
+        .post(format!("{origin}/v1/cli/backup-requests"))
+        .json(&json!({"backup_id":"backup-2", "challenge":challenge}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request_id = begin["request_id"].as_str().unwrap();
+    let execute = json!({"request_id":request_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&execute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", request_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let wrong = json!({"request_id":request_id,"verifier":hex::encode([45_u8; 32])});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&wrong)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&execute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&execute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let duplicate: Value = browser
+        .post(format!("{origin}/v1/cli/backup-requests"))
+        .json(&json!({"backup_id":"backup-2", "challenge":hex::encode(Sha256::digest(verifier))}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let duplicate_id = duplicate["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", duplicate_id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let duplicate_execution = json!({"request_id":duplicate_id,"verifier":hex::encode(verifier)});
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&duplicate_execution)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/v1/cli/execute"))
+            .json(&duplicate_execution)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    println!("PASS backup approval: denied before consent, wrong verifier denied, replay denied");
+    println!(
+        "PASS remote CLI consent -> service-owned encrypted backup -> Floci -> quarantined restore"
+    );
+    service.abort();
+    provider_task.abort();
 }

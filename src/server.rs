@@ -66,6 +66,8 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         public_origin: origin.clone(),
         admin_user_id: required("DISCORD_MCP_ADMIN_ID")?,
         discord: admin_discord,
+        #[cfg(feature = "encrypted-s3-backup")]
+        backup: floci_backup(&storage)?,
     };
     let config = OAuthWebConfig {
         auth,
@@ -115,6 +117,37 @@ pub async fn run(storage: StorageConfig) -> Result<(), Box<dyn std::error::Error
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+fn floci_backup(
+    storage: &StorageConfig,
+) -> Result<
+    Option<std::sync::Arc<discord_mcp::encrypted_backup::ServiceBackup>>,
+    Box<dyn std::error::Error>,
+> {
+    let address = match std::env::var("DISCORD_MCP_FLOCI_BACKUP_ADDRESS") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err("invalid Floci address".into()),
+    };
+    let bucket = required("DISCORD_MCP_FLOCI_BACKUP_BUCKET")?;
+    let recipient: age::x25519::Recipient = required("DISCORD_MCP_FLOCI_BACKUP_RECIPIENT")?
+        .parse()
+        .map_err(|_| "invalid age recipient")?;
+    let parent = storage
+        .path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("database requires a private parent")?;
+    let backup = discord_mcp::encrypted_backup::ServiceBackup::new(
+        crate::local_backup::client(&address)?,
+        bucket,
+        storage.path.clone(),
+        parent.to_path_buf(),
+        recipient,
+    )?;
+    Ok(Some(std::sync::Arc::new(backup)))
 }
 
 #[cfg(unix)]

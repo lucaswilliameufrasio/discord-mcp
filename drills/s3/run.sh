@@ -49,3 +49,7 @@ PY
 timeout 120s env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp/opencode}" \
     DISCORD_MCP_DRILL_BINARY="$root/target/s3-drill/debug/discord-mcp" \
     "$root/target/s3-drill/debug/discord-mcp-s3-drill" "$address"
+timeout 180s env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp/opencode}" \
+    CARGO_NET_OFFLINE=true DISCORD_MCP_FLOCI_FIXTURE_ADDRESS="$address" \
+    cargo test --locked --manifest-path "$root/Cargo.toml" --features encrypted-s3-backup \
+    --test remote_cli mediated_backup_requires_consent_and_restores_from_floci -- --ignored --nocapture
