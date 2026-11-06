@@ -2596,6 +2596,35 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
         StatusCode::CONFLICT
     );
     println!("PASS preexisting object rejected when ciphertext commitment differs");
+    let before_comparison = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    let divergent = browser
+        .post(format!("{origin}/admin/backup-compare"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", duplicate_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        divergent.contains("diverge do compromisso") && divergent.contains("continua inconclusiva")
+    );
+    assert_eq!(
+        before_comparison,
+        store
+            .recent_backup_audit()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.request_id, row.state))
+            .collect::<Vec<_>>()
+    );
     let legacy_commitment_id = "c".repeat(64);
     store
         .begin_backup_audit(
@@ -2651,6 +2680,18 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     );
     assert_eq!(legacy_response.bytes().await.unwrap(), object_before);
     println!("PASS legacy attempt remains unbound without changing old audit records");
+    let old = browser
+        .post(format!("{origin}/admin/backup-compare"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", &legacy_commitment_id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(old.contains("Sem compromisso pré-envio") && old.contains("nenhuma consulta"));
     println!(
         "PASS remote verification: unapproved, wrong verifier, changed binding and replay refused"
     );
@@ -3151,4 +3192,330 @@ async fn mediated_backup_requires_consent_and_restores_from_floci() {
     );
     service.abort();
     provider_task.abort();
+}
+
+#[cfg(all(feature = "encrypted-s3-backup", unix))]
+async fn drop_successful_put_proxy(
+    upstream: std::net::SocketAddr,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let result = dropped.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut incoming, _)) = listener.accept().await else {
+                break;
+            };
+            let dropped = dropped.clone();
+            tokio::spawn(async move {
+                let mut headers = Vec::new();
+                let mut byte = [0_u8; 1];
+                while headers.len() < 32768 {
+                    if incoming.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if !headers.ends_with(b"\r\n\r\n") {
+                    return;
+                }
+                let is_put = headers.starts_with(b"PUT ");
+                let Ok(mut outgoing) = tokio::net::TcpStream::connect(upstream).await else {
+                    return;
+                };
+                if outgoing.write_all(&headers).await.is_err() {
+                    return;
+                }
+                let (mut client_read, mut client_write) = incoming.into_split();
+                let (mut upstream_read, mut upstream_write) = outgoing.into_split();
+                let upload = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+                });
+                loop {
+                    let mut response_headers = Vec::new();
+                    while response_headers.len() < 32768 {
+                        if upstream_read.read_exact(&mut byte).await.is_err() {
+                            upload.abort();
+                            return;
+                        }
+                        response_headers.push(byte[0]);
+                        if response_headers.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if !response_headers.ends_with(b"\r\n\r\n") {
+                        upload.abort();
+                        return;
+                    }
+                    if is_put
+                        && (response_headers.starts_with(b"HTTP/1.1 200 ")
+                            || response_headers.starts_with(b"HTTP/1.1 201 "))
+                    {
+                        dropped.fetch_add(1, Ordering::SeqCst);
+                        upload.abort();
+                        return;
+                    }
+                    if client_write.write_all(&response_headers).await.is_err() {
+                        upload.abort();
+                        return;
+                    }
+                    if response_headers.starts_with(b"HTTP/1.1 100 ") {
+                        continue;
+                    }
+                    let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+                    upload.abort();
+                    return;
+                }
+            });
+        }
+    });
+    (address, result, task)
+}
+
+#[cfg(all(feature = "encrypted-s3-backup", unix))]
+#[tokio::test]
+#[ignore = "requires isolated local Floci fixture"]
+async fn lost_put_response_authorized_comparison_with_floci() {
+    use axum::http::header;
+    use discord_mcp::channels::{ChannelAction, ChannelStore};
+    use discord_mcp::http_auth::AuthState;
+    use std::os::unix::fs::PermissionsExt;
+    let upstream: std::net::SocketAddr = std::env::var("DISCORD_MCP_FLOCI_FIXTURE_ADDRESS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        upstream.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    let s3_config = aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(format!("http://{upstream}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "test", "test", None, None, "fixture",
+        ))
+        .build();
+    let s3 = aws_sdk_s3::Client::from_conf(s3_config);
+    let bucket = format!("discord-mcp-lost-{}", std::process::id());
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+    let (proxy_address, dropped, proxy) = drop_successful_put_proxy(upstream).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = dir.path().join("service.db");
+    let key = [57_u8; 32];
+    let store = ChannelStore::open(&database, &key).unwrap();
+    store.put_bot("alerts", "123", "synthetic-token").unwrap();
+    store.set_permissions("101", "alerts", true, false).unwrap();
+    let identity = age::x25519::Identity::generate();
+    let executor = Arc::new(
+        encrypted_backup::ServiceBackup::new_floci(
+            proxy_address,
+            bucket.clone(),
+            database.clone(),
+            dir.path().into(),
+            identity.to_public(),
+        )
+        .unwrap(),
+    );
+    let provider = Router::new()
+        .route(
+            "/api/oauth2/token",
+            post(|| async { Json(json!({"access_token":"synthetic","token_type":"Bearer"})) }),
+        )
+        .route(
+            "/api/v10/users/@me",
+            axum::routing::get(|| async { Json(json!({"id":"123","username":"Admin"})) }),
+        );
+    let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_url = reqwest::Url::parse(&format!(
+        "http://{}/",
+        provider_listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let provider_task =
+        tokio::spawn(async move { axum::serve(provider_listener, provider).await.unwrap() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let discord = discord_login::DiscordLoginClient::new(
+        "123",
+        "synthetic-secret",
+        &format!("{origin}/admin/discord/callback"),
+    )
+    .unwrap()
+    .with_test_base(provider_url);
+    let admin = admin_web::AdminConfig {
+        auth: AuthState {
+            database_path: database,
+            encryption_key: key,
+            resource: format!("{origin}/mcp"),
+            metrics: Default::default(),
+            audit: Default::default(),
+        },
+        public_origin: origin.clone(),
+        admin_user_id: "123".into(),
+        discord,
+        backup: Some(executor),
+    };
+    let service = tokio::spawn(async move {
+        axum::serve(listener, admin_web::router(admin).unwrap())
+            .await
+            .unwrap()
+    });
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap();
+    let login = browser_login(&browser, &origin).await;
+    let session = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let verifier = [72_u8; 32];
+    let begin: Value = browser
+        .post(format!("{origin}/v1/cli/backup-requests"))
+        .json(
+            &json!({"backup_id":"response-lost","challenge":hex::encode(Sha256::digest(verifier))}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = begin["request_id"].as_str().unwrap();
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/cli"))
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, &origin)
+            .form(&[("request_id", id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let result = browser
+        .post(format!("{origin}/v1/cli/execute"))
+        .json(&json!({"request_id":id,"verifier":hex::encode(verifier)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        dropped.load(Ordering::SeqCst) > 0,
+        "proxy did not discard a successful PUT response"
+    );
+    let before_object = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("service-backups/response-lost.age")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    let commitment = store.backup_ciphertext_commitment(id).unwrap().unwrap();
+    assert_eq!(
+        commitment.0.as_slice(),
+        Sha256::digest(&before_object).as_slice()
+    );
+    assert_eq!(commitment.1, before_object.len() as u64);
+    let before = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    assert!(
+        before
+            .iter()
+            .any(|(request, state)| request == id && state == "unknown")
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-compare"))
+            .form(&[("request_id", id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        browser
+            .post(format!("{origin}/admin/backup-compare"))
+            .header(header::COOKIE, &session)
+            .form(&[("request_id", id)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let compared = browser
+        .post(format!("{origin}/admin/backup-compare"))
+        .header(header::COOKIE, &session)
+        .header(header::ORIGIN, &origin)
+        .form(&[("request_id", id)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        compared.contains("ciphertext observado coincide")
+            && compared.contains("não comprova quem gravou")
+            && compared.contains("recuperabilidade")
+    );
+    let after = store
+        .recent_backup_audit()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.request_id, row.state))
+        .collect::<Vec<_>>();
+    assert_eq!(before, after);
+    let after_object = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("service-backups/response-lost.age")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(before_object, after_object);
+    assert!(
+        store
+            .is_permitted("101", "alerts", ChannelAction::Read)
+            .unwrap()
+    );
+    println!(
+        "PASS Floci committed PUT; proxy dropped success response; authorized comparison matches commitment while audit remains unknown"
+    );
+    service.abort();
+    provider_task.abort();
+    proxy.abort();
 }

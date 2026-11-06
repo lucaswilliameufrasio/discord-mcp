@@ -75,6 +75,7 @@ pub(crate) fn router_with_cli(
         .route("/admin/audit", get(audit))
         .route("/admin/backup-audit", get(backup_audit))
         .route("/admin/backup-investigate", post(backup_investigate))
+        .route("/admin/backup-compare", post(backup_compare))
         .route("/admin/login", get(login))
         .route("/admin/discord/callback", get(callback))
         .route("/admin/channel", get(channel))
@@ -199,7 +200,8 @@ async fn backup_audit(
     for entry in entries {
         let action = if entry.state == "started" || entry.state == "unknown" {
             format!(
-                "<form method=\"post\" action=\"/admin/backup-investigate\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Investigar destino atual</button></form>",
+                "<form method=\"post\" action=\"/admin/backup-investigate\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Investigar destino atual</button></form><form method=\"post\" action=\"/admin/backup-compare\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button>Comparar ciphertext com compromisso</button></form>",
+                escape(&entry.request_id),
                 escape(&entry.request_id)
             )
         } else {
@@ -218,6 +220,70 @@ async fn backup_audit(
     page(format!(
         "<h1>Auditoria de backups</h1><p>Últimas 100 tentativas. started sem resultado e unknown são inconclusivos; verifique o objeto antes de repetir. Não inclui solicitações que não chegaram à execução.</p><form method=\"get\" action=\"/admin/backup-audit\"><label for=\"days\">Pré-visualizar confirmações com mais de quantos dias?</label><input id=\"days\" name=\"days\" type=\"number\" min=\"1\" max=\"36500\" required><button>Pré-visualizar</button></form>{preview}<table><thead><tr><th>ID</th><th>Tentativa</th><th>Administrador</th><th>Início UTC (epoch)</th><th>Estado</th><th>Ação</th></tr></thead><tbody>{rows}</tbody></table>"
     ))
+}
+
+#[cfg(feature = "encrypted-s3-backup")]
+async fn backup_compare(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Form(req): Form<CliRequestId>,
+) -> Response {
+    if !allowed_post(&app, &headers) {
+        return error(StatusCode::FORBIDDEN);
+    }
+    let Some(backup) = &app.config.backup else {
+        return error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let (id, target) = match store(&app)
+        .and_then(|store| store.inconclusive_backup_target(&req.request_id))
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => return error(StatusCode::NOT_FOUND),
+        Err(crate::channels::StoreError::InvalidInput) => return error(StatusCode::BAD_REQUEST),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let Some(target) = target else {
+        return page("<h1>Comparação inconclusiva</h1><p>Registro antigo sem vínculo de destino; nenhuma consulta foi realizada.</p>".into());
+    };
+    if target.as_slice() != backup.destination_binding() {
+        return page("<h1>Comparação inconclusiva</h1><p>Destino divergente; nenhuma consulta foi realizada.</p>".into());
+    }
+    let expected = match store(&app).and_then(|store| store.backup_ciphertext_commitment(&req.request_id)) {
+        Ok(Some(value)) => value,
+        Ok(None) => return page("<h1>Comparação inconclusiva</h1><p>Sem compromisso pré-envio; nenhuma consulta foi realizada.</p>".into()),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let bytes = match backup.fetch_ciphertext(&id).await {
+        Ok(bytes) => bytes,
+        Err(_) => return page("<h1>Comparação inconclusiva</h1><p>Objeto indisponível ou consulta falhou; não se pode inferir ausência ou falha definitiva.</p>".into()),
+    };
+    let current = store(&app).and_then(|store| {
+        let target = store.inconclusive_backup_target(&req.request_id)?;
+        let commitment = store.backup_ciphertext_commitment(&req.request_id)?;
+        Ok((target, commitment))
+    });
+    if !matches!(current, Ok((Some((ref current_id, Some(ref current_target))), Some(current_commitment))) if current_id == &id && current_target == &target && current_commitment == expected)
+    {
+        return page(
+            "<h1>Comparação inconclusiva</h1><p>A tentativa mudou durante a consulta.</p>".into(),
+        );
+    }
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let result = if digest == expected.0 && bytes.len() as u64 == expected.1 {
+        "O ciphertext observado coincide com o compromisso pré-envio."
+    } else {
+        "O ciphertext observado diverge do compromisso pré-envio."
+    };
+    page(format!(
+        "<h1>Comparação de backup</h1><p>ID: {}</p><p>{result}</p><p>A correspondência não comprova quem gravou o objeto, sua integridade semântica ou recuperabilidade. O servidor pode ter sido substituído. A tentativa continua inconclusiva; nenhum registro ou objeto foi alterado. Não reenvie automaticamente.</p><p><a href=\"/admin/backup-audit\">Voltar</a></p>",
+        escape(&id)
+    ))
+}
+
+#[cfg(not(feature = "encrypted-s3-backup"))]
+async fn backup_compare() -> Response {
+    error(StatusCode::NOT_FOUND)
 }
 
 #[cfg(feature = "encrypted-s3-backup")]

@@ -267,6 +267,23 @@ resposta depois do PUT pode ser investigada comparando esses bytes; não há
 reconciliação automática, garantia de recuperação de host ou validação após
 ativação. O fluxo é somente para Floci e Discord sintéticos, não dados reais.
 
+Na auditoria, o administrador autenticado também pode acionar **Comparar
+ciphertext com compromisso** para uma tentativa inconclusiva. O servidor exige
+sessão e origem válidas, confere o fingerprint de destino, baixa no máximo
+65 MiB, compara SHA-256 e tamanho e verifica novamente a tentativa antes de
+mostrar o resultado. Ausência de compromisso ou vínculo antigo, destino
+divergente, objeto indisponível ou tentativa alterada permanece inconclusiva;
+nenhum registro ou objeto é modificado. Mesmo com correspondência, a página não
+afirma autoria, integridade semântica ou recuperabilidade, nem muda `unknown`.
+
+No exercício local, um proxy TCP próprio encaminhou o PUT ao Floci e descartou
+a resposta HTTP de sucesso. O objeto foi observado no Floci, a tentativa ficou
+`unknown` e a comparação autenticada encontrou os bytes do compromisso sem
+alterar auditoria ou objeto. Também foram testados ciphertext divergente e
+registro legado sem compromisso. Isso simula a perda daquela resposta na rede
+local; não demonstra comportamento de provedores reais, perda de energia ou
+reconciliação automática.
+
 O teste opt-in Floci chama essas APIs reais contra um banco SQLite sintético
 ativo. Verifica conflito na segunda gravação, recusa de identidade errada e
 ciphertext adulterado, quarentena, revogações e recusa de sobrescrita. O Floci
