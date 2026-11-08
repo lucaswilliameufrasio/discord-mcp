@@ -41,7 +41,9 @@ jobs:
               raise SystemExit('Tag must be a stable SemVer matching Cargo.toml')
           PY
       - name: Select Rust toolchain
-        run: rustup default 1.99.1
+        run: |
+          rustup default 1.99.1
+          rustup component add --toolchain 1.99.1 rustfmt clippy
       - name: Check and test
         run: |
           cargo fmt --check
