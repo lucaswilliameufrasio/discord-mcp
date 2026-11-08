@@ -1,0 +1,65 @@
+services:
+  discord-mcp:
+    image: ${DISCORD_MCP_IMAGE:-ghcr.io/lucaswilliameufrasio/discord-mcp:latest}
+    restart: unless-stopped
+    init: true
+    pids_limit: 128
+    stop_grace_period: 25s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DISCORD_MCP_DB: /data/discord-mcp.sqlite
+      DISCORD_MCP_KEY:
+      DISCORD_MCP_LISTEN: 127.0.0.1:8000
+      DISCORD_MCP_PUBLIC_ORIGIN:
+      DISCORD_MCP_DISCORD_CLIENT_ID:
+      DISCORD_MCP_DISCORD_CLIENT_SECRET:
+      DISCORD_MCP_ADMIN_ID:
+      DISCORD_MCP_CLIENT_ID:
+      DISCORD_MCP_CLIENT_NAME:
+      DISCORD_MCP_CLIENT_REDIRECT:
+      DISCORD_MCP_SECRET_PROVIDER:
+      DISCORD_MCP_INFISICAL_ORIGIN:
+      DISCORD_MCP_INFISICAL_PROJECT_ID:
+      DISCORD_MCP_INFISICAL_ENVIRONMENT:
+      DISCORD_MCP_INFISICAL_SECRET_PATH:
+      DISCORD_MCP_INFISICAL_TOKEN:
+      DISCORD_MCP_AWS_SECRET_ID:
+      DISCORD_MCP_AWS_PARAMETER_NAME:
+      DISCORD_MCP_METRICS_RETENTION_DAYS:
+      DISCORD_MCP_AUDIT_RETENTION_DAYS:
+      AWS_REGION:
+      AWS_DEFAULT_REGION:
+    volumes:
+      - discord-mcp-data:/data
+    ports:
+      - "127.0.0.1:${DISCORD_MCP_HOST_PORT:-8000}:8080"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+
+  loopback-relay:
+    image: ${DISCORD_MCP_RELAY_IMAGE:-ghcr.io/lucaswilliameufrasio/discord-mcp-relay:latest}
+    network_mode: service:discord-mcp
+    depends_on:
+      discord-mcp:
+        condition: service_started
+        restart: true
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      XDG_CONFIG_HOME: /tmp/caddy-config
+      XDG_DATA_HOME: /tmp/caddy-data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+
+volumes:
+  discord-mcp-data:

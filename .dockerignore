@@ -9,3 +9,8 @@
 !deploy/docker/
 !deploy/docker/Dockerfile
 !deploy/docker/Relay.Dockerfile
+!deploy/docker/ReleaseRelay.Dockerfile
+!deploy/docker/relay.Caddyfile
+!dist/
+!dist/discord-mcp
+!Dockerfile

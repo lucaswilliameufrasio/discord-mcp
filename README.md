@@ -6,7 +6,9 @@ Servidor MCP em Rust para enviar mensagens ao Discord por webhook ou bot e ler m
 
 ## Começar
 
-Requer Rust e Cargo. Compile com `cargo build --locked --release` e execute o binário em `target/release/discord-mcp`.
+Para compilar a partir do código, instale Rust e Cargo, execute `cargo build --locked --release` e use o binário em `target/release/discord-mcp`.
+
+O fluxo de release e o Compose para Linux estão descritos em [Releases e containers](docs/releases.md). O mesmo executável atende a CLI local/stdio e ao servidor com o comando `serve`; proxy HTTPS e deploy são responsabilidade do operador.
 
 1. Execute `discord-mcp setup local` para conferir os requisitos de configuração.
 2. Configure `DISCORD_MCP_DB` e `DISCORD_MCP_KEY` por um mecanismo seguro. A chave deve ter 32 bytes aleatórios em hexadecimal; mantenha uma cópia de recuperação separada do banco.

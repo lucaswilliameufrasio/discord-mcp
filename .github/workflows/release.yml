@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate release version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          tag = os.environ['TAG']
+          with open('Cargo.toml', 'rb') as source:
+              version = tomllib.load(source)['package']['version']
+          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag) or tag != 'v' + version:
+              raise SystemExit('Tag must be a stable SemVer matching Cargo.toml')
+          PY
+      - name: Select Rust toolchain
+        run: rustup default 1.99.1
+      - name: Check and test
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features -- --test-threads=1
+      - name: Build release binary
+        run: |
+          cargo build --locked --release --features encrypted-s3-backup,aws-secrets-manager,aws-parameter-store
+          mkdir -p dist
+          cp target/release/discord-mcp dist/discord-mcp
+          dist/discord-mcp --help
+      - name: Package binary
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          tar -C dist -czf "discord-mcp-${TAG}-${TARGET}.tar.gz" discord-mcp
+          sha256sum "discord-mcp-${TAG}-${TARGET}.tar.gz" > "discord-mcp-${TAG}-${TARGET}.tar.gz.sha256"
+          mkdir smoke
+          tar -C smoke -xzf "discord-mcp-${TAG}-${TARGET}.tar.gz"
+          python3 drills/release/smoke.py smoke/discord-mcp
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            discord-mcp-*.tar.gz
+            discord-mcp-*.tar.gz.sha256
+          if-no-files-found: error
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, smoke test and push native image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker build -t "$IMAGE:$TAG-$ARCH" .
+          docker run --rm --network none "$IMAGE:$TAG-$ARCH" --help
+          docker push "$IMAGE:$TAG-$ARCH"
+      - name: Build and push internal relay image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}-relay
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker build -f deploy/docker/ReleaseRelay.Dockerfile -t "$IMAGE:$TAG-$ARCH" .
+          docker run --rm --network none --user 10001:10001 --tmpfs /tmp "$IMAGE:$TAG-$ARCH" validate --config /etc/caddy/relay.Caddyfile --adapter caddyfile
+          docker push "$IMAGE:$TAG-$ARCH"
+      - name: Exercise Compose over host loopback
+        env:
+          DISCORD_MCP_IMAGE: ghcr.io/${{ github.repository }}:${{ github.ref_name }}-${{ matrix.arch }}
+          DISCORD_MCP_RELAY_IMAGE: ghcr.io/${{ github.repository }}-relay:${{ github.ref_name }}-${{ matrix.arch }}
+        run: python3 drills/release/compose_smoke.py
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$TAG" -t "$IMAGE:latest" "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+          RELAY="$IMAGE-relay"
+          docker buildx imagetools create -t "$RELAY:$TAG" -t "$RELAY:latest" "$RELAY:$TAG-amd64" "$RELAY:$TAG-arm64"
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp compose.yaml release/compose.yaml
+          (cd release && sha256sum -c ./*.sha256 && sha256sum compose.yaml > compose.yaml.sha256)
+          gh release create "$TAG" release/* --verify-tag --generate-notes
