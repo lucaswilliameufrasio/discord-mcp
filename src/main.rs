@@ -9,6 +9,7 @@ mod local_web;
 #[cfg(target_os = "linux")]
 mod process_guard;
 mod server;
+mod setup;
 
 use discord_mcp::{
     bot::{BotChannel, BotClient},
@@ -175,6 +176,569 @@ impl ServerHandler for DiscordMcp {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["setup", "local", "vault", "compare-oauth", "--confirm"] {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if std::io::stdin().is_terminal() {
+            return Err("provide the candidate on protected non-terminal stdin".into());
+        }
+        let mut input = String::new();
+        std::io::stdin()
+            .lock()
+            .take(515)
+            .read_to_string(&mut input)?;
+        let line = input
+            .strip_suffix('\n')
+            .ok_or("provide exactly one newline-terminated candidate")?;
+        let candidate = line.strip_suffix('\r').unwrap_or(line);
+        let result = ChannelStore::compare_embedded_secret_read_only(
+            &storage.path,
+            &storage.key,
+            discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret,
+            candidate,
+        )?;
+        match result {
+            Some(true) => println!("Snapshot: candidate matches the embedded OAuth secret."),
+            Some(false) => println!("Snapshot: candidate differs from the embedded OAuth secret."),
+            None => println!("Snapshot: no embedded OAuth secret is present."),
+        }
+        println!(
+            "This does not prove the outcome of a particular operation, upstream validity, revocation status, or consumer adoption. Do not restore old credentials automatically."
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "aws-parameter-store")]
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-aws-parameter-store",
+            "--preview",
+        ]
+    {
+        println!(
+            "Preview: copy the configured AWS Parameter Store OAuth SecureString into an existing embedded vault only if absent. Confirmation required. Source and provider selection remain unchanged. No provider is contacted by this preview."
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "aws-parameter-store")]
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-aws-parameter-store",
+            "--confirm",
+        ]
+    {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        let store = storage.open()?;
+        let secret = discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret;
+        match store.get_embedded_secret(secret) {
+            Err(discord_mcp::channels::StoreError::NotFound) => {}
+            Ok(_) => {
+                return Err(
+                    "embedded OAuth secret already exists; use explicit rotation instead".into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let value = server::aws_parameter_store_oauth_secret().await?;
+        store.insert_embedded_secret(secret, &value)?;
+        eprintln!(
+            "AWS Parameter Store OAuth secret copied to the embedded vault. Source and provider selection were not changed; verify adoption before removing any source."
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "aws-secrets-manager")]
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-aws-secrets-manager",
+            "--preview",
+        ]
+    {
+        println!(
+            "Preview: read the configured AWS Secrets Manager OAuth secret and copy it to an existing embedded vault only if absent. Confirmation is required. The source and provider selection are not changed. This preview reads no secrets and contacts no provider."
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "aws-secrets-manager")]
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-aws-secrets-manager",
+            "--confirm",
+        ]
+    {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        let store = storage.open()?;
+        let secret = discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret;
+        match store.get_embedded_secret(secret) {
+            Err(discord_mcp::channels::StoreError::NotFound) => {}
+            Ok(_) => {
+                return Err(
+                    "embedded OAuth secret already exists; use explicit rotation instead".into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let value = server::aws_secrets_manager_oauth_secret().await?;
+        store.insert_embedded_secret(secret, &value)?;
+        eprintln!(
+            "AWS Secrets Manager OAuth secret copied to the embedded vault. Source and provider selection were not changed; verify adoption before removing any source."
+        );
+        return Ok(());
+    }
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-infisical",
+            "--preview",
+        ]
+    {
+        println!(
+            "Preview: read the configured Infisical OAuth secret and copy it to an existing embedded vault only if absent. Confirmation is required. The source and provider selection are not changed. This preview reads no secrets and contacts no provider."
+        );
+        return Ok(());
+    }
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-infisical",
+            "--confirm",
+        ]
+    {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        let store = storage.open()?;
+        let secret = discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret;
+        match store.get_embedded_secret(secret) {
+            Err(discord_mcp::channels::StoreError::NotFound) => {}
+            Ok(_) => {
+                return Err(
+                    "embedded OAuth secret already exists; use explicit rotation instead".into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let value = server::infisical_oauth_secret().await?;
+        store.insert_embedded_secret(secret, &value)?;
+        eprintln!(
+            "Infisical OAuth secret copied to the embedded vault. Source and provider selection were not changed; verify adoption before removing any source."
+        );
+        return Ok(());
+    }
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "rotate-oauth-tracked",
+            "--preview",
+        ]
+    {
+        println!(
+            "Preview: atomically replace the local secret and create an unknown tracking record for one instance. Supply independently generated non-secret 16-byte hex operation and instance IDs before --confirm, and current/replacement secrets on protected non-terminal stdin. No upstream or consumer verification occurs."
+        );
+        return Ok(());
+    }
+    if let [setup, local, vault, command, operation, instance, confirm] = args.as_slice()
+        && setup == "setup"
+        && local == "local"
+        && vault == "vault"
+        && command == "rotate-oauth-tracked"
+        && confirm == "--confirm"
+    {
+        let revision: [u8; 16] = hex::decode(operation)
+            .map_err(|_| "invalid operation ID")?
+            .try_into()
+            .map_err(|_| "operation ID must be 16 bytes in hex")?;
+        let instance: [u8; 16] = hex::decode(instance)
+            .map_err(|_| "invalid instance ID")?
+            .try_into()
+            .map_err(|_| "instance ID must be 16 bytes in hex")?;
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        if std::io::stdin().is_terminal() {
+            return Err(
+                "provide current and replacement secrets on protected non-terminal stdin".into(),
+            );
+        }
+        let mut input = String::new();
+        std::io::stdin()
+            .lock()
+            .take(1029)
+            .read_to_string(&mut input)?;
+        let parts: Vec<_> = input.split('\n').collect();
+        if parts.len() != 3 || !parts[2].is_empty() || input.len() > 1028 {
+            return Err("provide exactly two newline-terminated secret values".into());
+        }
+        storage.open()?.rotate_embedded_secret_tracked(
+            discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret,
+            parts[0].strip_suffix('\r').unwrap_or(parts[0]),
+            parts[1].strip_suffix('\r').unwrap_or(parts[1]),
+            revision,
+            &[instance],
+        )?;
+        eprintln!(
+            "Local replacement and tracking committed. Publication status is unknown; upstream validity and consumer adoption were not verified."
+        );
+        return Ok(());
+    }
+    if let [setup, local, vault, command, operation, instance] = args.as_slice()
+        && setup == "setup"
+        && local == "local"
+        && vault == "vault"
+        && command == "rotation-status"
+    {
+        let revision: [u8; 16] = hex::decode(operation)
+            .map_err(|_| "invalid operation ID")?
+            .try_into()
+            .map_err(|_| "invalid operation ID")?;
+        let instance: [u8; 16] = hex::decode(instance)
+            .map_err(|_| "invalid instance ID")?
+            .try_into()
+            .map_err(|_| "invalid instance ID")?;
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        let store = storage.open()?;
+        let oauth = store.rotation_login_observed(
+            revision,
+            instance,
+            discord_mcp::rotation_progress::Consumer::OAuth,
+        )?;
+        let admin = store.rotation_login_observed(
+            revision,
+            instance,
+            discord_mcp::rotation_progress::Consumer::Admin,
+        )?;
+        println!(
+            "oauth_login_observed={oauth} admin_login_observed={admin} workload_identity_verified=false adoption_verified=false; historical local observations only, instance label is operator supplied; current validity and adoption are not proven"
+        );
+        return Ok(());
+    }
+    if let [setup, local, vault, command, operation] = args.as_slice()
+        && setup == "setup"
+        && local == "local"
+        && vault == "vault"
+        && command == "rotation-status"
+    {
+        let revision: [u8; 16] = hex::decode(operation)
+            .map_err(|_| "invalid operation ID")?
+            .try_into()
+            .map_err(|_| "operation ID must be 16 bytes in hex")?;
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        match storage.open()?.get_rotation_progress(revision)? {
+            Some((version, state)) => println!(
+                "version={version} publication={:?} all_consumers_reported={} workload_identity_verified=false adoption_verified=false (reports are not authenticated proof)",
+                state.publication(),
+                state.all_consumers_reported()
+            ),
+            None => println!(
+                "No tracking record found. This does not prove an upstream operation was rolled back."
+            ),
+        }
+        return Ok(());
+    }
+    if args.as_slice() == ["setup", "local", "vault", "rotate-oauth", "--preview"] {
+        println!(
+            "Preview: replace the existing embedded OAuth secret only if the supplied current secret still matches. Requires --confirm and exactly two lines on protected non-terminal stdin: current secret, then replacement. Stop the service first. No upstream rotation or server restart is performed."
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["setup", "local", "vault", "rotate-oauth", "--confirm"] {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        if std::io::stdin().is_terminal() {
+            return Err(
+                "provide current and replacement secrets on protected non-terminal stdin".into(),
+            );
+        }
+        let mut input = String::new();
+        std::io::stdin()
+            .lock()
+            .take(1029)
+            .read_to_string(&mut input)?;
+        let parts: Vec<_> = input.split('\n').collect();
+        if parts.len() != 3 || !parts[2].is_empty() || input.len() > 1028 {
+            return Err("provide exactly two newline-terminated secret values".into());
+        }
+        storage.open()?.rotate_embedded_secret(
+            discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret,
+            parts[0].strip_suffix('\r').unwrap_or(parts[0]),
+            parts[1].strip_suffix('\r').unwrap_or(parts[1]),
+        )?;
+        eprintln!(
+            "Embedded OAuth secret replaced. Upstream rotation and running-server adoption were not verified. Do not automatically restore revoked credentials."
+        );
+        return Ok(());
+    }
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-env",
+            "--preview",
+        ]
+    {
+        println!(
+            "Preview: copy DISCORD_MCP_DISCORD_CLIENT_SECRET into the existing encrypted database only if no OAuth secret is stored. Requires --confirm. The source, provider selection, and server are not changed. No files are changed by this preview."
+        );
+        return Ok(());
+    }
+    if args.as_slice()
+        == [
+            "setup",
+            "local",
+            "vault",
+            "migrate-oauth-from-env",
+            "--confirm",
+        ]
+    {
+        let value = std::env::var("DISCORD_MCP_DISCORD_CLIENT_SECRET")
+            .map_err(|_| "missing or invalid DISCORD_MCP_DISCORD_CLIENT_SECRET")?;
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        storage.open()?.insert_embedded_secret(
+            discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret,
+            &value,
+        )?;
+        eprintln!(
+            "OAuth secret copied to the embedded vault. Source configuration and provider selection were not changed; validate adoption before removing any source."
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["setup", "local", "vault", "discord-oauth", "--preview"] {
+        println!(
+            "Preview: add the Discord OAuth client secret to an existing encrypted database. Requires --confirm and protected non-terminal stdin; existing secrets are never replaced. No files are changed by this preview."
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["setup", "local", "vault", "discord-oauth", "--confirm"] {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, false)?;
+        if !storage.path.is_file() {
+            return Err("an existing database is required".into());
+        }
+        let input = read_remote_secret()?;
+        let value = input.trim_end_matches(['\r', '\n']);
+        storage.open()?.insert_embedded_secret(
+            discord_mcp::channels::EmbeddedSecret::DiscordOAuthClientSecret,
+            value,
+        )?;
+        eprintln!("OAuth secret stored. Existing secrets were not replaced.");
+        return Ok(());
+    }
+    if let [command, mode, kind, hostname, preview] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "bundle"
+        && preview == "--preview"
+    {
+        return setup::preview_remote_bundle(hostname);
+    }
+    if let [command, mode, kind, hostname, directory, confirm] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "bundle"
+        && confirm == "--confirm"
+    {
+        return setup::prepare_remote_bundle(hostname, std::path::Path::new(directory));
+    }
+    if args.first().is_some_and(|arg| arg == "setup")
+        && args.get(1).is_some_and(|arg| arg == "remote")
+        && args.get(2).is_some_and(|arg| arg == "bundle")
+    {
+        return Err("use setup remote bundle HOST --preview or setup remote bundle HOST NEW_DIRECTORY --confirm".into());
+    }
+    if let [command, mode, kind, hostname, preview] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "caddy"
+        && preview == "--preview"
+    {
+        return setup::preview_caddy(hostname);
+    }
+    if let [command, mode, kind, hostname, directory, confirm] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "caddy"
+        && confirm == "--confirm"
+    {
+        return setup::install_caddy(hostname, std::path::Path::new(directory));
+    }
+    if args.first().is_some_and(|arg| arg == "setup")
+        && args.get(1).is_some_and(|arg| arg == "remote")
+        && args.get(2).is_some_and(|arg| arg == "caddy")
+    {
+        return Err("use setup remote caddy HOST --preview or setup remote caddy HOST ABSOLUTE_DIRECTORY --confirm".into());
+    }
+    if args.as_slice() == ["setup", "local", "--generate-key", "--preview"] {
+        eprintln!(
+            "Preview: generate a new 32-byte key and write its hexadecimal encoding only to non-terminal stdout. No configuration or files are changed. Direct stdout to a trusted secret manager; preserve an independent recovery copy. Never replace the key for an existing database."
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["setup", "local", "--generate-key", "--confirm"] {
+        return setup::generate_key();
+    }
+    if args.first().is_some_and(|arg| arg == "setup")
+        && args.get(1).is_some_and(|arg| arg == "local")
+        && args.get(2).is_some_and(|arg| arg == "--generate-key")
+    {
+        return Err("use setup local --generate-key --preview or --confirm".into());
+    }
+    if args.as_slice() == ["setup", "remote", "systemd", "--preview"] {
+        setup::preview_systemd();
+        return Ok(());
+    }
+    if let [command, mode, kind, action, directory, confirm] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "systemd"
+        && action == "--install-ciphera-dropin"
+        && confirm == "--confirm"
+    {
+        return setup::install_ciphera_dropin(std::path::Path::new(directory));
+    }
+    if let [command, mode, kind, action, directory, confirm] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "systemd"
+        && action == "--install-env-template"
+        && confirm == "--confirm"
+    {
+        return setup::install_systemd_env_template(std::path::Path::new(directory));
+    }
+    if let [command, mode, kind, action, directory, confirm] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "systemd"
+        && action == "--install-unit"
+        && confirm == "--confirm"
+    {
+        return setup::install_systemd_unit(std::path::Path::new(directory));
+    }
+    if let [command, mode, kind, destination, confirm] = args.as_slice()
+        && command == "setup"
+        && mode == "remote"
+        && kind == "systemd"
+        && !destination.starts_with('-')
+        && confirm == "--confirm"
+    {
+        return setup::prepare_systemd(std::path::Path::new(destination));
+    }
+    if args.first().is_some_and(|arg| arg == "setup")
+        && args.get(1).is_some_and(|arg| arg == "remote")
+        && args.get(2).is_some_and(|arg| arg == "systemd")
+    {
+        return Err(
+            "use setup remote systemd --preview, setup remote systemd NEW_DIRECTORY --confirm, or setup remote systemd --install-unit ABSOLUTE_DIRECTORY --confirm"
+                .into(),
+        );
+    }
+    if args.as_slice() == ["setup", "remote", "--check"] {
+        if std::env::var_os("DISCORD_MCP_SECRET_PROVIDER").is_some_and(|value| {
+            value == "embedded"
+                || value == "infisical"
+                || value == "aws-secrets-manager"
+                || value == "aws-parameter-store"
+        }) {
+            return Err("read-only remote preflight does not open the selected secret provider; validate it through an isolated service start".into());
+        }
+        setup::check_remote()?;
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        server::check_configuration(&storage).await?;
+        println!("Server configuration validation passed; no service was started.");
+        return Ok(());
+    }
+    if args.as_slice() == ["setup", "remote", "--check-storage"] {
+        return setup::check_storage();
+    }
+    if args.as_slice() == ["setup", "remote", "--check-https-origin"] {
+        return setup::check_https_origin();
+    }
+    if args.as_slice() == ["setup", "local", "--init"] {
+        let storage = StorageConfig::from_environment()?
+            .ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY first")?;
+        #[cfg(target_os = "linux")]
+        let _guard = process_guard::acquire(&storage.path, false, true)?;
+        let store = storage.open()?;
+        if store.recovery_quarantined()? {
+            return Err(
+                "database is quarantined; review and explicitly activate recovery first".into(),
+            );
+        }
+        println!("Local storage initialized. Start `discord-mcp web` to add channels.");
+        return Ok(());
+    }
+    if let [command, mode] = args.as_slice()
+        && command == "setup"
+    {
+        return setup::run(mode);
+    }
+    if args.first().is_some_and(|command| command == "setup") {
+        return Err("invalid setup command; use --help".into());
+    }
     #[cfg(feature = "encrypted-s3-backup")]
     if let [command, origin, attempt, staging, confirm] = args.as_slice()
         && command == "remote-verify-backup"
@@ -289,39 +853,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if let [command, _, _, permission] = args.as_slice()
+        && command == "set-permission"
+        && !matches!(permission.as_str(), "none" | "read" | "send" | "both")
+    {
+        return Err("permission must be none, read, send or both".into());
+    }
+    if !valid_remaining_arguments(&args) {
+        return Err("unknown or malformed command; use --help".into());
+    }
+    if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
+        println!(
+            "discord-mcp: [setup local [--init]|setup remote|serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|remote-add-bot ORIGIN CHANNEL DISCORD_CHANNEL_ID|remote-delete-channel ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
+        );
+        println!("Server configuration and security requirements: see README.md.");
+        println!("Recovery planning: setup recovery (read-only).");
+        println!(
+            "Embedded OAuth secret: setup local vault discord-oauth --preview (requires existing encrypted database for enrollment)."
+        );
+        println!(
+            "Copy existing OAuth environment secret: setup local vault migrate-oauth-from-env --preview."
+        );
+        println!(
+            "Copy OAuth secret from Infisical: setup local vault migrate-oauth-from-infisical --preview."
+        );
+        #[cfg(feature = "aws-secrets-manager")]
+        println!(
+            "Copy OAuth secret from Secrets Manager: setup local vault migrate-oauth-from-aws-secrets-manager --preview."
+        );
+        println!("Replace embedded OAuth secret: setup local vault rotate-oauth --preview.");
+        println!(
+            "Generate a new local key: setup local --generate-key --preview (no files changed)."
+        );
+        println!("Remote configuration preflight: setup remote --check (read-only).");
+        println!("Remote bundle: setup remote bundle HOST --preview (no installation).");
+        println!("Caddy HTTPS site: setup remote caddy HOST --preview (no installation).");
+        println!(
+            "Configuration template: setup remote systemd --install-env-template ABSOLUTE_DIRECTORY --confirm (no secrets)."
+        );
+        println!(
+            "Ciphera: setup remote systemd --install-ciphera-dropin ABSOLUTE_DIRECTORY --confirm (no credentials or restart)."
+        );
+        println!("Existing storage metadata: setup remote --check-storage (read-only).");
+        println!("HTTPS origin syntax: setup remote --check-https-origin (no network).");
+        println!(
+            "Systemd bundle: setup remote systemd --preview | setup remote systemd NEW_DIRECTORY --confirm (local files only)."
+        );
+        #[cfg(feature = "encrypted-s3-backup")]
+        println!(
+            "Synthetic loopback Floci only: backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT | restore-floci ADDRESS BUCKET OBJECT DESTINATION | verify-floci ADDRESS BUCKET ID PRIVATE_STAGING --confirm-isolated"
+        );
+        #[cfg(feature = "encrypted-s3-backup")]
+        println!(
+            "Mediated verification: remote-verify-backup ORIGIN ATTEMPT_ID PRIVATE_STAGING --confirm-isolated"
+        );
+        return Ok(());
+    }
     let storage = StorageConfig::from_environment()?;
     let recovery_activation =
         matches!(args.first(), Some(command) if command == "recovery-activate");
     // The lock is cooperative: it separates this program's remote and local
     // processes, but does not confine other programs or protect replication.
     #[cfg(target_os = "linux")]
-    let _guard = if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
-        None
-    } else if let Some(config) = &storage {
+    let _guard = if let Some(config) = &storage {
         Some(process_guard::acquire(
             &config.path,
             args.as_slice() == ["serve"],
-            !recovery_activation && args.first().is_none_or(|command| command != "backup-floci"),
+            !recovery_activation
+                && args.first().is_none_or(|command| command != "backup-floci")
+                && !(args.as_slice() == ["serve"]
+                    && std::env::var_os("DISCORD_MCP_SECRET_PROVIDER").is_some_and(|value| {
+                        value == "embedded"
+                            || value == "infisical"
+                            || value == "aws-secrets-manager"
+                            || value == "aws-parameter-store"
+                    })),
         )?)
     } else {
         None
     };
     if !args.is_empty() {
-        if args.as_slice() == ["--help"] || args.as_slice() == ["help"] {
-            println!(
-                "discord-mcp: [serve|web|add-channel NAME|list-channels|set-permission USER CHANNEL none|read|send|both|remote-set-permission ORIGIN USER CHANNEL none|read|send|both|remote-list-channels ORIGIN|remote-show-permissions ORIGIN CHANNEL|remote-add-webhook ORIGIN CHANNEL|remote-add-bot ORIGIN CHANNEL DISCORD_CHANNEL_ID|remote-delete-channel ORIGIN CHANNEL|show-permissions CHANNEL|recovery-prepare SOURCE DESTINATION|recovery-activate --confirm]"
-            );
-            println!("Server configuration and security requirements: see README.md.");
-            #[cfg(feature = "encrypted-s3-backup")]
-            println!(
-                "Synthetic loopback Floci only: backup-floci ADDRESS BUCKET OBJECT AGE_RECIPIENT | restore-floci ADDRESS BUCKET OBJECT DESTINATION | verify-floci ADDRESS BUCKET ID PRIVATE_STAGING --confirm-isolated"
-            );
-            #[cfg(feature = "encrypted-s3-backup")]
-            println!(
-                "Mediated verification: remote-verify-backup ORIGIN ATTEMPT_ID PRIVATE_STAGING --confirm-isolated"
-            );
-            return Ok(());
-        }
         let storage = storage.ok_or("configure DISCORD_MCP_DB and DISCORD_MCP_KEY")?;
         #[cfg(feature = "encrypted-s3-backup")]
         if let [command, endpoint, bucket, object, recipient] = args.as_slice()
@@ -423,6 +1034,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     server.waiting().await?;
     Ok(())
+}
+
+fn valid_remaining_arguments(args: &[String]) -> bool {
+    match args {
+        [] => true,
+        [command] => matches!(
+            command.as_str(),
+            "--help" | "help" | "serve" | "web" | "list-channels"
+        ),
+        [command, value] => {
+            matches!(command.as_str(), "add-channel" | "show-permissions")
+                || (command == "recovery-activate" && value == "--confirm")
+        }
+        [command, _, _, permission] => {
+            command == "set-permission"
+                && matches!(permission.as_str(), "none" | "read" | "send" | "both")
+        }
+        #[cfg(feature = "encrypted-s3-backup")]
+        [command, _, _, _, _] => command == "backup-floci",
+        _ => false,
+    }
 }
 
 fn read_remote_secret() -> Result<String, Box<dyn std::error::Error>> {

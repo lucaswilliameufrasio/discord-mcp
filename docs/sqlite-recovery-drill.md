@@ -6,6 +6,57 @@ Não recebe caminho de banco, segredo ou backup real. O teste cria seus próprio
 arquivos em um diretório temporário privado e os remove ao terminar normalmente.
 Interrupção forçada pode deixar arquivos temporários do próprio teste.
 
+## Jornada local de setup e quarentena
+
+Em 2026-11-07, uma VM Debian 13.7 descartável executou a CLI compilada no host
+com bancos sintéticos: destino existente e chave incorreta foram recusados, a
+origem permaneceu inalterada e a cópia exigiu confirmação para ativação. Esse
+exercício não incluiu backup externo nem restauração de dados reais.
+
+`cargo test --locked --all-features --test setup_recovery` executa uma jornada
+independente do exemplo de replicação: inicializa um banco sintético pela CLI,
+cria um canal e permissões de teste, rejeita destino existente e chave errada,
+prepara uma cópia em quarentena e exige confirmação para ativação. O teste
+confere que a origem e o destino preexistente permanecem intactos e que canal
+restaurado não recupera permissões ou tokens antigos. Não é um backup externo,
+nem testa TLS, Ciphera ou recuperação de um host real.
+
+## Testes mediados com Floci isolado
+
+`drills/s3/run-isolated.sh` executa os dois testes opt-in de backup mediado,
+restauração isolada e comparação após resposta perdida. Ele exige um Floci
+descartável, dedicado e em memória, já iniciado no mesmo namespace de rede
+isolado, com somente loopback, e `FLOCI_ADDRESS=127.0.0.1:PORTA`. Exemplo,
+**dentro desse sandbox**: `FLOCI_ADDRESS=127.0.0.1:4566 bash
+drills/s3/run-isolated.sh`. O script rejeita endereço não loopback e interfaces
+adicionais, usa Cargo offline e ambiente limitado, não inicia Docker e não
+recebe socket do daemon. A verificação de interfaces não é uma fronteira de
+segurança: o operador deve garantir que o endpoint seja exclusivamente o fixture
+sintético, sem serviços ou credenciais reais no namespace. Os testes criam
+buckets e objetos no fixture. Use diretório temporário privado e descarte o
+fixture após o teste; interrupções forçadas podem deixar arquivos temporários.
+
+Este exercício não valida backup remoto real, política de retenção, Ciphera,
+restauração operacional, RPO ou RTO.
+
+Execução isolada posterior: os dois testes `remote_cli` opt-in passaram usando
+Floci 2.3.0 da imagem fixada pelo digest no script, com o executável extraído
+de contêiner rootless sem rede e iniciado em namespace só de loopback, sem
+socket Docker ou credenciais reais. O S3 usou o modo `memory`; o Floci informou
+que o serviço auxiliar Resource Explorer permaneceu em modo híbrido, com seu
+diretório exclusivo no fixture. O processo foi encerrado após o teste; os arquivos
+do fixture de validação permanecem no diretório persistente de build. Isso não
+valida armazenamento remoto real nem recuperação operacional.
+
+O teste opt-in `ciphera_injected_key_recovers_without_overwriting_or_restoring_authority`
+em `tests/ciphera_cli.rs` conecta a CLI Ciphera real a uma API sintética de
+loopback e usa a chave injetada para preparar e ativar uma cópia em quarentena.
+Ele exercita recusa, 503, chave ausente e destino ocupado, preservando a origem;
+confere que canal persiste, mas permissões e tokens antigos não são reativados.
+Requer `CIPHERA_TEST_BINARY` apontando para uma CLI verificada e um sandbox sem
+rede externa. Não acessa Ciphera, S3 ou systemd reais e não comprova custódia,
+backup remoto ou recuperação operacional.
+
 ## Dependência e execução
 
 O exercício usa o exemplo Rust `snapshot-restore` do checkout irmão
@@ -34,6 +85,11 @@ alterações não commitadas, inclusive em código Rust da biblioteca; portanto,
 esse resultado não identifica uma árvore reproduzível nem qualifica uma versão
 publicada. A duração é apenas do teste, não um RTO. O exercício confirma somente
 o cenário local sintético descrito, não perda de host ou recuperação operacional.
+
+Nova execução em 2026-11-07: `snapshot_and_restore_isolated_synthetic_wal_database`
+passou em sandbox com loopback isolado, usando o exemplo preexistente de SHA-256
+`d4a75c6e46ca99c51d703ae4db6ad2a7a10ac7ff5514c187afd5b291d1a1b004`.
+O exemplo não foi recompilado; o hash não comprova proveniência nem versão.
 
 Repetição em 2026-11-06, após as alterações de abertura e ativação: o teste
 passou em namespace de rede isolado com loopback próprio, usando o binário já

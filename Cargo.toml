@@ -3,9 +3,14 @@ name = "discord-mcp"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(discord_mcp_synthetic_authority)'] }
+
 [features]
 benchmark-fixture = []
 encrypted-s3-backup = ["dep:age", "dep:aws-sdk-s3"]
+aws-secrets-manager = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
+aws-parameter-store = ["dep:aws-config", "dep:aws-sdk-ssm"]
 
 [[example]]
 name = "mcp_benchmark"
@@ -13,7 +18,10 @@ required-features = ["benchmark-fixture"]
 
 [dependencies]
 age = { version = "=0.12.1", optional = true }
+aws-config = { version = "=1.13.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process"], optional = true }
 aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"], optional = true }
+aws-sdk-secretsmanager = { version = "=1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-ssm = { version = "=1.134.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 axum = { version = "0.8.9", features = ["form"] }
 base64 = "0.23.1"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
@@ -28,3 +36,6 @@ sha2 = "0.11.1"
 subtle = "2.6.1"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "signal", "net", "time", "sync", "io-util", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["net"] }

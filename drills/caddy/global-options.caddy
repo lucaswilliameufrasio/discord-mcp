@@ -1,0 +1,7 @@
+{
+	admin off
+	local_certs
+	https_port 8443
+	auto_https disable_redirects
+	skip_install_trust
+}

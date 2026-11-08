@@ -1,4 +1,8 @@
 pub mod admin_web;
+#[cfg(feature = "aws-parameter-store")]
+pub mod aws_parameter_store;
+#[cfg(feature = "aws-secrets-manager")]
+pub mod aws_secrets;
 pub mod bot;
 pub mod channels;
 pub mod cli_authorization;
@@ -7,6 +11,10 @@ pub mod discord_login;
 pub mod encrypted_backup;
 pub mod http_auth;
 pub mod http_mcp;
+pub mod infisical;
+#[cfg(target_os = "linux")]
+pub mod linux_peer_identity;
 pub mod oauth_web;
 pub mod recovery;
+pub mod rotation_progress;
 pub mod webhook;

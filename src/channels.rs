@@ -237,7 +237,701 @@ pub struct ChannelStore {
     audit_retention_days: u16,
 }
 
+fn rotation_ciphertext_commitment(nonce: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"discord-mcp:rotation-ciphertext:v1");
+    digest.update(nonce);
+    digest.update(ciphertext);
+    digest.finalize().into()
+}
+
+/// A recoverable application secret, not the key that unlocks this store.
+#[derive(Clone, Copy)]
+pub enum EmbeddedSecret {
+    DiscordOAuthClientSecret,
+}
+
+impl EmbeddedSecret {
+    fn name(self) -> &'static str {
+        match self {
+            Self::DiscordOAuthClientSecret => "discord_oauth_client_secret",
+        }
+    }
+
+    fn associated_data(self) -> &'static [u8] {
+        match self {
+            Self::DiscordOAuthClientSecret => {
+                b"discord-mcp:embedded-secret:v1:discord_oauth_client_secret"
+            }
+        }
+    }
+}
+
 impl ChannelStore {
+    /// Insert a new tracking record; no provider or consumer is contacted.
+    pub fn create_rotation_progress(
+        &self,
+        revision: [u8; 16],
+        instances: &[[u8; 16]],
+    ) -> Result<(), StoreError> {
+        let state = crate::rotation_progress::RotationProgress::new(revision, instances)
+            .map_err(|_| StoreError::InvalidInput)?;
+        let payload = rmcp::serde_json::to_vec(&state).map_err(|_| StoreError::Storage)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS rotation_progress (revision BLOB PRIMARY KEY NOT NULL CHECK(length(revision)=16), version INTEGER NOT NULL CHECK(version>=0), state BLOB NOT NULL)").map_err(|_| StoreError::Storage)?;
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO rotation_progress(revision,version,state) VALUES (?1,0,?2)",
+                params![revision.as_slice(), payload],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    /// Read a single SQLite snapshot; a returned report is not authenticated proof.
+    pub fn get_rotation_progress(
+        &self,
+        revision: [u8; 16],
+    ) -> Result<Option<(u64, crate::rotation_progress::RotationProgress)>, StoreError> {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_progress')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Ok(None);
+        }
+        let row: Option<(i64, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT version,state FROM rotation_progress WHERE revision=?1",
+                [revision.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        let Some((version, payload)) = row else {
+            return Ok(None);
+        };
+        let version = u64::try_from(version).map_err(|_| StoreError::Storage)?;
+        if payload.len() > 65536 {
+            return Err(StoreError::Storage);
+        }
+        let state: crate::rotation_progress::RotationProgress =
+            rmcp::serde_json::from_slice(&payload).map_err(|_| StoreError::Storage)?;
+        if !state.valid_for(revision) {
+            return Err(StoreError::Storage);
+        }
+        Ok(Some((version, state)))
+    }
+
+    /// Resolve a tracked candidate in the same snapshot as its operation and
+    /// instance binding. This is not an authenticated adoption receipt.
+    pub fn get_tracked_embedded_secret(
+        &self,
+        revision: [u8; 16],
+        instance: [u8; 16],
+    ) -> Result<String, StoreError> {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let (payload, nonce, ciphertext, commitment): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = transaction.query_row(
+            "SELECT p.state,s.nonce,s.ciphertext,b.commitment FROM rotation_progress p JOIN rotation_secret_binding b ON b.revision=p.revision JOIN embedded_secrets s ON s.name=b.name WHERE p.revision=?1",
+            [revision.as_slice()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).optional().map_err(|_| StoreError::Storage)?.ok_or(StoreError::NotFound)?;
+        if !bool::from(
+            rotation_ciphertext_commitment(&nonce, &ciphertext)
+                .as_slice()
+                .ct_eq(&commitment),
+        ) {
+            return Err(StoreError::NotFound);
+        }
+        if payload.len() > 65536 {
+            return Err(StoreError::Storage);
+        }
+        let state: crate::rotation_progress::RotationProgress =
+            rmcp::serde_json::from_slice(&payload).map_err(|_| StoreError::Storage)?;
+        if !state.valid_for(revision) {
+            return Err(StoreError::Storage);
+        }
+        if !state.accepts_instance(instance) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let nonce: &[u8; 24] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        let plaintext = self
+            .cipher
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: &ciphertext,
+                    aad: EmbeddedSecret::DiscordOAuthClientSecret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Decryption)?;
+        String::from_utf8(plaintext).map_err(|_| StoreError::Decryption)
+    }
+
+    /// Start a fresh local process epoch. This is not authenticated machine identity.
+    pub fn begin_rotation_process(
+        &self,
+        revision: [u8; 16],
+        instance: [u8; 16],
+        boot: [u8; 16],
+        used_secret: &str,
+    ) -> Result<(), StoreError> {
+        if boot == [0; 16] {
+            return Err(StoreError::InvalidInput);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        self.validate_rotation_candidate(&tx, revision, instance, used_secret)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS rotation_process_epoch (revision BLOB NOT NULL REFERENCES rotation_progress(revision) ON DELETE CASCADE, instance BLOB NOT NULL CHECK(length(instance)=16), boot BLOB NOT NULL CHECK(length(boot)=16), PRIMARY KEY(revision,instance))").map_err(|_| StoreError::Storage)?;
+        tx.execute("INSERT INTO rotation_process_epoch(revision,instance,boot) VALUES(?1,?2,?3) ON CONFLICT(revision,instance) DO UPDATE SET boot=excluded.boot", params![revision.as_slice(),instance.as_slice(),boot.as_slice()]).map_err(|_| StoreError::Storage)?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_login_observation')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if exists {
+            tx.execute(
+                "DELETE FROM rotation_login_observation WHERE revision=?1 AND instance=?2",
+                params![revision.as_slice(), instance.as_slice()],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        }
+        tx.commit().map_err(|_| StoreError::Storage)
+    }
+
+    /// Validate a local tracking snapshot; this neither authenticates a process
+    /// nor proves that a credential remains accepted by the upstream provider.
+    pub fn check_rotation_process_epoch(
+        &self,
+        revision: [u8; 16],
+        instance: [u8; 16],
+        boot: [u8; 16],
+    ) -> Result<(), StoreError> {
+        let tx =
+            rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let row = tx.query_row(
+            "SELECT p.state,s.nonce,s.ciphertext,b.commitment FROM rotation_progress p JOIN rotation_secret_binding b ON b.revision=p.revision JOIN embedded_secrets s ON s.name=b.name JOIN rotation_process_epoch e ON e.revision=p.revision AND e.instance=?2 AND e.boot=?3 WHERE p.revision=?1",
+            params![revision.as_slice(),instance.as_slice(),boot.as_slice()], |row| Ok((row.get::<_, Vec<u8>>(0)?,row.get::<_, Vec<u8>>(1)?,row.get::<_, Vec<u8>>(2)?,row.get::<_, Vec<u8>>(3)?)),
+        ).optional().map_err(|_| StoreError::Storage)?;
+        let (payload, nonce, ciphertext, commitment) = row.ok_or(StoreError::NotFound)?;
+        if payload.len() > 65536
+            || !bool::from(
+                rotation_ciphertext_commitment(&nonce, &ciphertext)
+                    .as_slice()
+                    .ct_eq(&commitment),
+            )
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let state: crate::rotation_progress::RotationProgress =
+            rmcp::serde_json::from_slice(&payload).map_err(|_| StoreError::Storage)?;
+        if !state.valid_for(revision) || !state.accepts_instance(instance) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let nonce: &[u8; 24] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        self.cipher
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: &ciphertext,
+                    aad: EmbeddedSecret::DiscordOAuthClientSecret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Decryption)?;
+        Ok(())
+    }
+
+    fn validate_rotation_candidate(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        revision: [u8; 16],
+        instance: [u8; 16],
+        used_secret: &str,
+    ) -> Result<(), StoreError> {
+        let (payload, nonce, ciphertext, commitment): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = tx.query_row("SELECT p.state,s.nonce,s.ciphertext,b.commitment FROM rotation_progress p JOIN rotation_secret_binding b ON b.revision=p.revision JOIN embedded_secrets s ON s.name=b.name WHERE p.revision=?1", [revision.as_slice()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|_| StoreError::Storage)?.ok_or(StoreError::NotFound)?;
+        if payload.len() > 65536
+            || !bool::from(
+                rotation_ciphertext_commitment(&nonce, &ciphertext)
+                    .as_slice()
+                    .ct_eq(&commitment),
+            )
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let state: crate::rotation_progress::RotationProgress =
+            rmcp::serde_json::from_slice(&payload).map_err(|_| StoreError::Storage)?;
+        if !state.valid_for(revision) || !state.accepts_instance(instance) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let nonce: &[u8; 24] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        let plaintext = self
+            .cipher
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: &ciphertext,
+                    aad: EmbeddedSecret::DiscordOAuthClientSecret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Decryption)?;
+        if !bool::from(plaintext.as_slice().ct_eq(used_secret.as_bytes())) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        Ok(())
+    }
+
+    /// Best-effort local observation after a successful provider exchange.
+    /// The instance label is operator configured, not a machine identity.
+    pub fn record_rotation_login_observation(
+        &self,
+        revision: [u8; 16],
+        instance: [u8; 16],
+        boot: [u8; 16],
+        consumer: crate::rotation_progress::Consumer,
+        used_secret: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        self.validate_rotation_candidate(&transaction, revision, instance, used_secret)?;
+        let active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM rotation_process_epoch WHERE revision=?1 AND instance=?2 AND boot=?3)", params![revision.as_slice(),instance.as_slice(),boot.as_slice()], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if !active {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let label = match consumer {
+            crate::rotation_progress::Consumer::OAuth => "oauth",
+            crate::rotation_progress::Consumer::Admin => "admin",
+        };
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS rotation_login_observation (revision BLOB NOT NULL REFERENCES rotation_progress(revision) ON DELETE CASCADE, instance BLOB NOT NULL CHECK(length(instance)=16), consumer TEXT NOT NULL CHECK(consumer IN ('oauth','admin')), observed_at INTEGER NOT NULL, PRIMARY KEY(revision,instance,consumer))").map_err(|_| StoreError::Storage)?;
+        transaction.execute("INSERT INTO rotation_login_observation(revision,instance,consumer,observed_at) VALUES(?1,?2,?3,?4) ON CONFLICT(revision,instance,consumer) DO UPDATE SET observed_at=excluded.observed_at", params![revision.as_slice(),instance.as_slice(),label,current_timestamp()?]).map_err(|_| StoreError::Storage)?;
+        transaction.commit().map_err(|_| StoreError::Storage)
+    }
+
+    /// Read local observations only while the same candidate is still bound.
+    pub fn rotation_login_observed(
+        &self,
+        revision: [u8; 16],
+        instance: [u8; 16],
+        consumer: crate::rotation_progress::Consumer,
+    ) -> Result<bool, StoreError> {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let (payload, nonce, ciphertext, commitment): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = transaction.query_row("SELECT p.state,s.nonce,s.ciphertext,b.commitment FROM rotation_progress p JOIN rotation_secret_binding b ON b.revision=p.revision JOIN embedded_secrets s ON s.name=b.name WHERE p.revision=?1", [revision.as_slice()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional().map_err(|_| StoreError::Storage)?.ok_or(StoreError::NotFound)?;
+        if payload.len() > 65536
+            || !bool::from(
+                rotation_ciphertext_commitment(&nonce, &ciphertext)
+                    .as_slice()
+                    .ct_eq(&commitment),
+            )
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let state: crate::rotation_progress::RotationProgress =
+            rmcp::serde_json::from_slice(&payload).map_err(|_| StoreError::Storage)?;
+        if !state.valid_for(revision) || !state.accepts_instance(instance) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        let label = match consumer {
+            crate::rotation_progress::Consumer::OAuth => "oauth",
+            crate::rotation_progress::Consumer::Admin => "admin",
+        };
+        let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_login_observation')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Ok(false);
+        }
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM rotation_login_observation WHERE revision=?1 AND instance=?2 AND consumer=?3)", params![revision.as_slice(),instance.as_slice(),label], |row| row.get(0)).map_err(|_| StoreError::Storage)
+    }
+
+    /// Atomically apply an event to the expected version; stale updates fail closed.
+    pub fn advance_rotation_progress(
+        &self,
+        revision: [u8; 16],
+        expected: u64,
+        event: crate::rotation_progress::ProgressEvent,
+    ) -> Result<u64, StoreError> {
+        let expected = i64::try_from(expected).map_err(|_| StoreError::InvalidInput)?;
+        let next = expected.checked_add(1).ok_or(StoreError::InvalidInput)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let row: Option<(i64, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT version,state FROM rotation_progress WHERE revision=?1",
+                [revision.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        let (version, payload) = row.ok_or(StoreError::NotFound)?;
+        if version != expected {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        if payload.len() > 65536 {
+            return Err(StoreError::Storage);
+        }
+        let mut state: crate::rotation_progress::RotationProgress =
+            rmcp::serde_json::from_slice(&payload).map_err(|_| StoreError::Storage)?;
+        if !state.valid_for(revision) {
+            return Err(StoreError::Storage);
+        }
+        state
+            .apply(revision, event)
+            .map_err(|_| StoreError::InvalidInput)?;
+        if matches!(
+            event,
+            crate::rotation_progress::ProgressEvent::Uncertain
+                | crate::rotation_progress::ProgressEvent::Revoked
+        ) {
+            let has_epoch: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_process_epoch')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+            if has_epoch {
+                transaction
+                    .execute(
+                        "DELETE FROM rotation_process_epoch WHERE revision=?1",
+                        [revision.as_slice()],
+                    )
+                    .map_err(|_| StoreError::Storage)?;
+            }
+            let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_login_observation')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+            if exists {
+                transaction
+                    .execute(
+                        "DELETE FROM rotation_login_observation WHERE revision=?1",
+                        [revision.as_slice()],
+                    )
+                    .map_err(|_| StoreError::Storage)?;
+            }
+        }
+        let payload = rmcp::serde_json::to_vec(&state).map_err(|_| StoreError::Storage)?;
+        let changed = transaction
+            .execute(
+                "UPDATE rotation_progress SET version=?1,state=?2 WHERE revision=?3 AND version=?4",
+                params![next, payload, revision.as_slice(), expected],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if changed != 1 {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        u64::try_from(next).map_err(|_| StoreError::Storage)
+    }
+    /// Compare against the current committed snapshot without creating or changing schema.
+    /// A match does not establish which operation wrote the value or whether it is valid.
+    pub fn compare_embedded_secret_read_only(
+        path: &Path,
+        key: &[u8; 32],
+        secret: EmbeddedSecret,
+        candidate: &str,
+    ) -> Result<Option<bool>, StoreError> {
+        if candidate.is_empty()
+            || candidate.len() > 512
+            || !candidate.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| StoreError::Storage)?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+                return Err(StoreError::Storage);
+            }
+        }
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| StoreError::Storage)?;
+        db.busy_timeout(Duration::from_secs(5))
+            .map_err(|_| StoreError::Storage)?;
+        db.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")
+            .map_err(|_| StoreError::Storage)?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| StoreError::Storage)?;
+        let cipher = XChaCha20Poly1305::new(key.into());
+        let (nonce, ciphertext): (Vec<u8>, Vec<u8>) = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM key_check WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| StoreError::Storage)?;
+        let nonce: &[u8; 24] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        let check = cipher
+            .decrypt(nonce.into(), ciphertext.as_slice())
+            .map_err(|_| StoreError::Decryption)?;
+        if check != b"discord-mcp-key-check" {
+            return Err(StoreError::Decryption);
+        }
+        let quarantined: bool = transaction
+            .query_row(
+                "SELECT COALESCE((SELECT quarantined FROM recovery_control WHERE id=1), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if quarantined {
+            return Err(StoreError::RecoveryPending);
+        }
+        let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='embedded_secrets')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Ok(None);
+        }
+        let row: Option<(Vec<u8>, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM embedded_secrets WHERE name=?1",
+                [secret.name()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        let Some((nonce, ciphertext)) = row else {
+            return Ok(None);
+        };
+        let nonce: &[u8; 24] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        let value = cipher
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: &ciphertext,
+                    aad: secret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Decryption)?;
+        Ok(Some(bool::from(
+            value.as_slice().ct_eq(candidate.as_bytes()),
+        )))
+    }
+
+    /// Insert only. Existing secrets are never replaced implicitly.
+    pub fn insert_embedded_secret(
+        &self,
+        secret: EmbeddedSecret,
+        value: &str,
+    ) -> Result<(), StoreError> {
+        if value.is_empty()
+            || value.len() > 512
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|_| StoreError::Storage)?;
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: value.as_bytes(),
+                    aad: secret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Storage)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS embedded_secrets (name TEXT PRIMARY KEY NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL)")
+            .map_err(|_| StoreError::Storage)?;
+        let inserted = transaction.execute("INSERT OR IGNORE INTO embedded_secrets(name, nonce, ciphertext) VALUES (?1, ?2, ?3)",
+            params![secret.name(), nonce.as_slice(), ciphertext]).map_err(|_| StoreError::Storage)?;
+        if inserted != 1 {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(())
+    }
+
+    /// Read in the same SQLite snapshot as the recovery quarantine check.
+    pub fn get_embedded_secret(&self, secret: EmbeddedSecret) -> Result<String, StoreError> {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='embedded_secrets')", [], |row| row.get(0))
+            .map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+        let row = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM embedded_secrets WHERE name=?1",
+                [secret.name()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?;
+        let (nonce, ciphertext) = row.ok_or(StoreError::NotFound)?;
+        let nonce: &[u8; 24] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        let plaintext = self
+            .cipher
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: &ciphertext,
+                    aad: secret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Decryption)?;
+        String::from_utf8(plaintext).map_err(|_| StoreError::Decryption)
+    }
+
+    /// Replace only if the independently supplied current value still matches.
+    /// This does not rotate the upstream credential or restart running consumers.
+    pub fn rotate_embedded_secret(
+        &self,
+        secret: EmbeddedSecret,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<(), StoreError> {
+        self.rotate_embedded_secret_inner(secret, expected, replacement, None)
+    }
+
+    /// Atomically replace the local secret and create an initially uncertain
+    /// tracking record. This does not authenticate or contact any consumer.
+    pub fn rotate_embedded_secret_tracked(
+        &self,
+        secret: EmbeddedSecret,
+        expected: &str,
+        replacement: &str,
+        revision: [u8; 16],
+        instances: &[[u8; 16]],
+    ) -> Result<(), StoreError> {
+        let progress = crate::rotation_progress::RotationProgress::new(revision, instances)
+            .map_err(|_| StoreError::InvalidInput)?;
+        let payload = rmcp::serde_json::to_vec(&progress).map_err(|_| StoreError::Storage)?;
+        self.rotate_embedded_secret_inner(secret, expected, replacement, Some((revision, payload)))
+    }
+
+    fn rotate_embedded_secret_inner(
+        &self,
+        secret: EmbeddedSecret,
+        expected: &str,
+        replacement: &str,
+        tracking: Option<([u8; 16], Vec<u8>)>,
+    ) -> Result<(), StoreError> {
+        for value in [expected, replacement] {
+            if value.is_empty()
+                || value.len() > 512
+                || !value.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| StoreError::Storage)?;
+        self.require_recovery_active()?;
+        let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='embedded_secrets')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+        let (old_nonce, old_ciphertext): (Vec<u8>, Vec<u8>) = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM embedded_secrets WHERE name=?1",
+                [secret.name()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Storage)?
+            .ok_or(StoreError::NotFound)?;
+        let old_nonce: &[u8; 24] = old_nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decryption)?;
+        let old_value = self
+            .cipher
+            .decrypt(
+                old_nonce.into(),
+                Payload {
+                    msg: &old_ciphertext,
+                    aad: secret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Decryption)?;
+        if !bool::from(old_value.as_slice().ct_eq(expected.as_bytes())) {
+            return Err(StoreError::AuthorizationDenied);
+        }
+        if bool::from(old_value.as_slice().ct_eq(replacement.as_bytes())) {
+            return Err(StoreError::InvalidInput);
+        }
+        if let Some((revision, ref payload)) = tracking {
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS rotation_progress (revision BLOB PRIMARY KEY NOT NULL CHECK(length(revision)=16), version INTEGER NOT NULL CHECK(version>=0), state BLOB NOT NULL)").map_err(|_| StoreError::Storage)?;
+            let inserted = transaction.execute("INSERT OR IGNORE INTO rotation_progress(revision,version,state) VALUES (?1,0,?2)", params![revision.as_slice(),payload]).map_err(|_| StoreError::Storage)?;
+            if inserted != 1 {
+                return Err(StoreError::AuthorizationDenied);
+            }
+        }
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|_| StoreError::Storage)?;
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: replacement.as_bytes(),
+                    aad: secret.associated_data(),
+                },
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if let Some((revision, _)) = tracking {
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS rotation_secret_binding (revision BLOB PRIMARY KEY NOT NULL REFERENCES rotation_progress(revision) ON DELETE CASCADE, name TEXT NOT NULL, commitment BLOB NOT NULL CHECK(length(commitment)=32))").map_err(|_| StoreError::Storage)?;
+            let commitment = rotation_ciphertext_commitment(&nonce, &ciphertext);
+            transaction.execute("INSERT INTO rotation_secret_binding(revision,name,commitment) VALUES (?1,?2,?3)", params![revision.as_slice(), secret.name(), commitment.as_slice()]).map_err(|_| StoreError::Storage)?;
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE embedded_secrets SET nonce=?1, ciphertext=?2 WHERE name=?3",
+                params![nonce.as_slice(), ciphertext, secret.name()],
+            )
+            .map_err(|_| StoreError::Storage)?;
+        if updated != 1 {
+            return Err(StoreError::Storage);
+        }
+        transaction.commit().map_err(|_| StoreError::Storage)?;
+        Ok(())
+    }
+
     /// The key is supplied independently of the database and must be backed up separately.
     pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self, StoreError> {
         Self::open_inner(path, key, true)
@@ -634,6 +1328,36 @@ impl ChannelStore {
         let codes = transaction
             .execute("DELETE FROM mcp_authorization_codes", [])
             .map_err(|_| StoreError::Storage)?;
+        let has_embedded: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='embedded_secrets')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_embedded {
+            transaction
+                .execute("DELETE FROM embedded_secrets", [])
+                .map_err(|_| StoreError::Storage)?;
+        }
+        let has_epoch: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_process_epoch')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_epoch {
+            transaction
+                .execute("DELETE FROM rotation_process_epoch", [])
+                .map_err(|_| StoreError::Storage)?;
+        }
+        let has_observation: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_login_observation')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_observation {
+            transaction
+                .execute("DELETE FROM rotation_login_observation", [])
+                .map_err(|_| StoreError::Storage)?;
+        }
+        let has_binding: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_secret_binding')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_binding {
+            transaction
+                .execute("DELETE FROM rotation_secret_binding", [])
+                .map_err(|_| StoreError::Storage)?;
+        }
+        let has_rotation: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_progress')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_rotation {
+            transaction
+                .execute("DELETE FROM rotation_progress", [])
+                .map_err(|_| StoreError::Storage)?;
+        }
         self.append_audit(
             current_timestamp()?,
             self.audit_retention_days,
@@ -666,6 +1390,63 @@ impl ChannelStore {
         let remaining: i64 = transaction.query_row("SELECT (SELECT COUNT(*) FROM channel_permissions) + (SELECT COUNT(*) FROM mcp_access_tokens) + (SELECT COUNT(*) FROM mcp_authorization_codes)", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
         if remaining != 0 {
             return Err(StoreError::InvalidInput);
+        }
+        let has_embedded: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='embedded_secrets')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_embedded {
+            let remaining: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM embedded_secrets", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| StoreError::Storage)?;
+            if remaining != 0 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let has_epoch: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_process_epoch')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_epoch {
+            let remaining: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM rotation_process_epoch", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| StoreError::Storage)?;
+            if remaining != 0 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let has_observation: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_login_observation')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_observation {
+            let remaining: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM rotation_login_observation",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| StoreError::Storage)?;
+            if remaining != 0 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let has_binding: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_secret_binding')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_binding {
+            let remaining: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM rotation_secret_binding", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| StoreError::Storage)?;
+            if remaining != 0 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let has_rotation: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_progress')", [], |row| row.get(0)).map_err(|_| StoreError::Storage)?;
+        if has_rotation {
+            let remaining: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM rotation_progress", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| StoreError::Storage)?;
+            if remaining != 0 {
+                return Err(StoreError::InvalidInput);
+            }
         }
         transaction
             .execute("UPDATE recovery_control SET quarantined=0 WHERE id=1", [])

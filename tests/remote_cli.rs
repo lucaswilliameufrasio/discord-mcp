@@ -20,13 +20,13 @@ use tokio::{
 // cfg(test) provider injection; no provider override is enabled in production.
 #[cfg(feature = "encrypted-s3-backup")]
 pub use discord_mcp::encrypted_backup;
-pub use discord_mcp::{channels, http_auth, webhook};
+pub use discord_mcp::{channels, http_auth, rotation_progress, webhook};
 #[path = "../src/admin_web.rs"]
 mod admin_web;
 #[path = "../src/cli_authorization.rs"]
 mod cli_authorization;
 #[path = "../src/discord_login.rs"]
-mod discord_login;
+pub mod discord_login;
 
 async fn browser_login(browser: &reqwest::Client, origin: &str) -> reqwest::Response {
     use axum::http::header;

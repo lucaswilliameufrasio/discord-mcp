@@ -224,7 +224,7 @@ fn json_response(status: StatusCode, body: rmcp::serde_json::Value) -> Response 
     response
 }
 
-fn valid_origin(value: &str) -> bool {
+pub fn valid_origin(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
@@ -586,6 +586,309 @@ mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_http_router_adopts_vault_secret_and_rejects_revoked_credentials() {
+        use crate::channels::EmbeddedSecret;
+        use axum::{
+            Router,
+            extract::State,
+            routing::{get, post},
+        };
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use std::{
+            process::{Command, Stdio},
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+
+        if let Ok(path) = std::env::var("DISCORD_TEST_RESTART_DB") {
+            let key = [93; 32];
+            let addr = std::env::var("DISCORD_TEST_RESTART_ADDR").unwrap();
+            let origin = format!("http://{addr}");
+            let fixture =
+                Url::parse(&std::env::var("DISCORD_TEST_RESTART_AUTHORITY").unwrap()).unwrap();
+            assert_eq!(fixture.host_str(), Some("127.0.0.1"));
+            let store = ChannelStore::open(std::path::Path::new(&path), &key).unwrap();
+            let secret = store
+                .get_embedded_secret(EmbeddedSecret::DiscordOAuthClientSecret)
+                .unwrap();
+            let discord = DiscordLoginClient::new(
+                "123",
+                &secret,
+                &format!("{origin}/oauth/discord/callback"),
+            )
+            .unwrap()
+            .with_test_base(fixture.clone());
+            let admin_discord = DiscordLoginClient::new(
+                "123",
+                &secret,
+                &format!("{origin}/admin/discord/callback"),
+            )
+            .unwrap()
+            .with_test_base(fixture);
+            let auth = AuthState {
+                database_path: path.into(),
+                encryption_key: key,
+                resource: format!("{origin}/mcp"),
+                metrics: crate::http_auth::MetricsState::default(),
+                audit: crate::http_auth::AuditState::default(),
+            };
+            let admin = crate::admin_web::AdminConfig {
+                auth: auth.clone(),
+                public_origin: origin.clone(),
+                admin_user_id: "123".into(),
+                discord: admin_discord,
+                #[cfg(feature = "encrypted-s3-backup")]
+                backup: None,
+            };
+            let config = OAuthWebConfig {
+                auth,
+                public_origin: origin,
+                client_id: "trusted-client".into(),
+                client_name: "Fixture".into(),
+                redirect_uri: "http://127.0.0.1:8765/callback".into(),
+                discord,
+            };
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            axum::serve(
+                listener,
+                crate::http_mcp::router(config)
+                    .unwrap()
+                    .merge(crate::admin_web::router(admin).unwrap()),
+            )
+            .await
+            .unwrap();
+            return;
+        }
+        async fn token(
+            State(epoch): State<Arc<AtomicUsize>>,
+            headers: axum::http::HeaderMap,
+        ) -> axum::response::Response {
+            let expected = match epoch.load(Ordering::SeqCst) {
+                0 => "123:synthetic-old",
+                1 => "123:synthetic-new",
+                _ => "123:no-valid-credential",
+            };
+            let auth = format!("Basic {}", STANDARD.encode(expected));
+            if headers
+                .get(header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                != Some(auth.as_str())
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            axum::Json(
+                rmcp::serde_json::json!({"access_token":"synthetic-access","token_type":"Bearer"}),
+            )
+            .into_response()
+        }
+        async fn identity() -> axum::Json<rmcp::serde_json::Value> {
+            axum::Json(rmcp::serde_json::json!({"id":"123","username":"fixture"}))
+        }
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/oauth2/token", post(token))
+            .route("/api/v10/users/@me", get(identity))
+            .with_state(epoch.clone());
+        let authority = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority_url = format!("http://{}/", authority.local_addr().unwrap());
+        let fixture_task = tokio::spawn(async move { axum::serve(authority, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        let key = [93; 32];
+        let secret = EmbeddedSecret::DiscordOAuthClientSecret;
+        let store = ChannelStore::open(&db, &key).unwrap();
+        store
+            .insert_embedded_secret(secret, "synthetic-old")
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let origin = format!("http://{addr}");
+        let spawn = || {
+            Child(Command::new(std::env::current_exe().unwrap()).env_clear()
+            .env("DISCORD_TEST_RESTART_DB", &db).env("DISCORD_TEST_RESTART_ADDR", addr.to_string())
+            .env("DISCORD_TEST_RESTART_AUTHORITY", &authority_url)
+            .args(["--exact", "oauth_web::tests::restart_http_router_adopts_vault_secret_and_rejects_revoked_credentials", "--nocapture"])
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap())
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        async fn ready(client: &reqwest::Client, origin: &str) {
+            for _ in 0..100 {
+                if client
+                    .get(format!("{origin}/.well-known/oauth-authorization-server"))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("synthetic HTTP process did not start");
+        }
+        async fn login(client: &reqwest::Client, origin: &str) -> StatusCode {
+            let mut url = Url::parse(&format!("{origin}/oauth/authorize")).unwrap();
+            url.query_pairs_mut()
+                .append_pair("client_id", "trusted-client")
+                .append_pair("redirect_uri", "http://127.0.0.1:8765/callback")
+                .append_pair("response_type", "code")
+                .append_pair(
+                    "code_challenge",
+                    "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                )
+                .append_pair("code_challenge_method", "S256")
+                .append_pair("resource", &format!("{origin}/mcp"))
+                .append_pair("state", "client-state");
+            let response = client.get(url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let target =
+                Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+            let state = target
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            let mut callback = Url::parse(&format!("{origin}/oauth/discord/callback")).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("state", &state)
+                .append_pair("code", "synthetic-code")
+                .append_pair("iss", "https://discord.com");
+            client
+                .get(callback)
+                .header(header::COOKIE, cookie)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+        async fn admin_login(
+            client: &reqwest::Client,
+            origin: &str,
+        ) -> (StatusCode, Option<String>) {
+            let response = client
+                .get(format!("{origin}/admin/login"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let target =
+                Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+            let state = target
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            let mut callback = Url::parse(&format!("{origin}/admin/discord/callback")).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("state", &state)
+                .append_pair("code", "synthetic-code")
+                .append_pair("iss", "https://discord.com");
+            let response = client
+                .get(callback)
+                .header(header::COOKIE, cookie)
+                .send()
+                .await
+                .unwrap();
+            let session = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap().to_owned())
+                .find(|value| value.starts_with("discord_mcp_admin_session="));
+            (response.status(), session)
+        }
+        let first = spawn();
+        ready(&client, &origin).await;
+        assert_eq!(login(&client, &origin).await, StatusCode::SEE_OTHER);
+        let (status, session) = admin_login(&client, &origin).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let session = session.expect("admin session cookie");
+        assert_eq!(
+            client
+                .get(format!("{origin}/admin/channels"))
+                .header(header::COOKIE, &session)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        store
+            .rotate_embedded_secret(secret, "synthetic-old", "synthetic-new")
+            .unwrap();
+        epoch.store(1, Ordering::SeqCst);
+        assert_eq!(login(&client, &origin).await, StatusCode::FORBIDDEN);
+        assert_eq!(admin_login(&client, &origin).await.0, StatusCode::FORBIDDEN);
+        // Existing sessions are local; revoking the OAuth client secret alone does not revoke them.
+        assert_eq!(
+            client
+                .get(format!("{origin}/admin/channels"))
+                .header(header::COOKIE, &session)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        drop(first);
+        let second = spawn();
+        ready(&client, &origin).await;
+        assert_eq!(
+            client
+                .get(format!("{origin}/admin/channels"))
+                .header(header::COOKIE, &session)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(login(&client, &origin).await, StatusCode::SEE_OTHER);
+        assert_eq!(admin_login(&client, &origin).await.0, StatusCode::SEE_OTHER);
+        epoch.store(2, Ordering::SeqCst);
+        assert_eq!(login(&client, &origin).await, StatusCode::FORBIDDEN);
+        assert_eq!(admin_login(&client, &origin).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(store.get_embedded_secret(secret).unwrap(), "synthetic-new");
+        drop(second);
+        fixture_task.abort();
+    }
 
     fn fake_discord() -> (Url, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -1,272 +1,205 @@
 # Discord MCP
 
-> Em desenvolvimento. O modo HTTP é experimental, não foi validado com o
-> Discord real e não deve ser utilizado como serviço de produção.
+Servidor MCP em Rust para enviar mensagens ao Discord por webhook ou bot e ler mensagens por bot.
 
-Servidor MCP em Rust planejado para integrar canais do Discord por webhook ou
-bot. Webhooks permitem apenas envio; bots podem enviar e consultar mensagens
-conforme as permissões concedidas no Discord.
+> **Estado:** o modo HTTP remoto é experimental e ainda não foi validado com o Discord real. Não exponha o listener diretamente à internet.
 
-## Estado atual
+## Começar
 
-O protocolo stdio oferece envio para um webhook configurado na variável de
-ambiente `DISCORD_WEBHOOK_URL`; mensagens não permitem menções automáticas. O
-modo servidor HTTP possui OAuth e controle de acesso experimentais; a gestão
-guiada de segredos ainda falta.
+Requer Rust e Cargo. Compile com `cargo build --locked --release` e execute o binário em `target/release/discord-mcp`.
 
-Também é possível cadastrar múltiplos webhooks em SQLite local e selecionar o
-canal pelo nome no argumento `channel` da ferramenta `send_message`. Configure
-`DISCORD_MCP_DB` com o caminho do banco e `DISCORD_MCP_KEY` com uma chave
-aleatória de 32 bytes codificada em hexadecimal, fornecida pelo gerenciador de
-segredos do ambiente. Mantenha a chave e sua cópia de recuperação separadas do
-banco: sem ela não é possível recuperar os webhooks. A chave em variável de
-ambiente pode ser acessível a processos privilegiados ou ao próprio usuário;
-ela não substitui um gerenciador de segredos. Não inclua chave nem webhook em
-arquivos versionados, argumentos de processo ou histórico do shell.
+1. Execute `discord-mcp setup local` para conferir os requisitos de configuração.
+2. Configure `DISCORD_MCP_DB` e `DISCORD_MCP_KEY` por um mecanismo seguro. A chave deve ter 32 bytes aleatórios em hexadecimal; mantenha uma cópia de recuperação separada do banco.
+3. Execute `discord-mcp setup local --init` para inicializar o banco, sem substituir canais existentes.
+4. Execute `discord-mcp web`, abra o endereço local exibido e use o código de uso único para cadastrar canais.
+5. Configure o cliente MCP para iniciar `discord-mcp` sem argumentos, com as mesmas variáveis. Não coloque segredos em argumentos, histórico ou arquivos versionados.
 
-`discord-mcp add-channel NOME` recebe a URL do webhook na entrada padrão, sem
-exibi-la. Use uma entrada segura e não a digite em terminal com eco habilitado.
-`discord-mcp list-channels` lista apenas nomes. O arquivo de banco novo é criado
-com permissões restritas no Unix; um arquivo existente com permissões de grupo
-ou outros usuários é recusado. O fluxo guiado de gerenciamento de chaves ainda
-não existe.
+Sem `--init`, a CLI apenas orienta e confere o formato da chave quando presente; não valida credenciais no Discord. Também é possível usar um webhook único em `DISCORD_WEBHOOK_URL` sem banco; consulte o [guia de operação](docs/operations.md).
 
-### Interface web local
+### Segredo OAuth no cofre embutido
 
-Com as variáveis de banco e chave configuradas, execute `discord-mcp web` em
-outro terminal. O comando apresenta o endereço em `127.0.0.1` e um código de
-uso único válido por cinco minutos. Abra o endereço informado e insira o código
-para cadastrar, substituir ou remover canais. A sessão vale enquanto o processo
-estiver ativo; reinicie-o para gerar outro código. Não compartilhe o código.
+O modo HTTP pode usar o banco cifrado existente para guardar o segredo OAuth,
+sem depender de Ciphera ou outro provedor. Primeiro inicialize o banco e revise
+`discord-mcp setup local vault discord-oauth --preview`. Com `--confirm`, forneça
+o segredo por stdin protegido **não terminal**, terminado por uma quebra de
+linha. A operação exige banco existente, não imprime nem substitui o segredo.
+Selecione `DISCORD_MCP_SECRET_PROVIDER=embedded` para `serve` e não defina
+`DISCORD_MCP_DISCORD_CLIENT_SECRET` nesse modo; conflitos são recusados. A chave
+`DISCORD_MCP_KEY` continua sendo necessária e deve ter custódia e recuperação
+independentes do banco. O modo padrão de variável de ambiente continua compatível.
 
-A interface valida o host e a origem de formulários, usa cookie HttpOnly com
-SameSite estrito e não exibe webhooks já cadastrados. É uma interface local,
-não um servidor acessível remotamente. Ela roda em processo separado do MCP
-stdio e utiliza o mesmo banco. Não protege contra outro processo com os mesmos
-privilégios do usuário que consiga ler a chave ou controlar o navegador.
-Na remoção, a confirmação é vinculada à versão do canal exibida; se o canal
-for substituído antes da confirmação, a interface recusa e pede nova revisão.
-Nos formulários de cadastro, o estado dos canais é registrado quando a página
-é carregada e verificado na transação de gravação. Se um canal for criado,
-substituído ou removido nesse intervalo, a gravação é recusada. O formulário
-vale por cinco minutos e é de uso único; carregar outra página autenticada
-invalida formulários anteriores, inclusive em outras abas. Em caso de conflito,
-volte à lista e informe a credencial novamente. O estado temporário contém nomes
-e versões dos registros cifrados, não URLs nem tokens. A interface recusa gerar
-o formulário se houver mais de 10.000 canais.
+A preparação de recuperação remove o segredo OAuth da cópia em quarentena; após
+ativação, cadastre uma credencial válida deliberadamente. Não reutilize segredo
+revogado. O preflight `setup remote --check` ainda não abre o cofre embutido e
+recusa essa seleção; ele não prova que o servidor iniciará.
 
-### Servidor HTTP experimental
+Para copiar uma configuração OAuth existente do ambiente, revise
+`discord-mcp setup local vault migrate-oauth-from-env --preview`; use o mesmo
+comando com `--confirm` para copiar `DISCORD_MCP_DISCORD_CLIENT_SECRET` para um
+banco já existente. Ele não modifica a fonte nem troca o provedor e recusa
+sobrescrever o destino. Uma gravação bem-sucedida não prova que uma instância
+em execução adotou o cofre. Faça backup, valide a nova configuração em ambiente
+autorizado e só depois remova a fonte antiga; não deixe a variável antiga no
+ambiente de um servidor selecionado com `embedded`, pois o conflito é recusado.
 
-Modelos alternativos para Linux com systemd ou Docker e seus limites estão em
-[`docs/remote-runtime-options.md`](docs/remote-runtime-options.md). Eles não
-instalam serviços, não configuram backups e não são prontos para produção.
+Para copiar do Infisical ao cofre, configure as variáveis `DISCORD_MCP_INFISICAL_*`
+descritas abaixo e revise `discord-mcp setup local vault
+migrate-oauth-from-infisical --preview`. Com `--confirm`, a CLI consulta o
+Infisical e insere no banco existente apenas se o cofre ainda não contiver esse
+segredo; erro de provedor, conflito ou quarentena recusam a operação. Não defina
+a variável OAuth antiga durante essa cópia. A origem e a seleção de provedor
+não são alteradas. A migração não verifica a validade do segredo no Discord nem
+prova a adoção por uma instância em execução. Se o processo for interrompido ou
+o resultado da gravação for desconhecido, não presuma que houve rollback nem
+remova a origem; use a comparação local descrita abaixo.
 
-O comando `discord-mcp serve` inicia OAuth e MCP HTTP usando o mesmo banco de
-canais. O processo só aceita escutar em endereço de loopback; não o exponha
-diretamente em uma interface pública. O servidor ainda não foi validado com o
-Discord real nem preparado para produção. Para acesso remoto é necessário um
-proxy HTTPS configurado pelo operador, que preserve o `Host` público correto e
-proteja logs de URLs de callback, códigos OAuth, cookies e cabeçalhos de
-autorização. O proxy e sua configuração não são fornecidos aqui.
+Para substituir o segredo já guardado, revise `discord-mcp setup local vault
+rotate-oauth --preview`. Com `--confirm`, forneça por stdin protegido não terminal
+duas linhas terminadas por quebra: o segredo atual seguido do substituto. A troca
+é atômica e rejeita o valor atual incorreto ou desatualizado; concorrentes que
+usam o mesmo valor atual não sobrescrevem a mudança um do outro. No Linux, o
+lock cooperativo exige parar a instância HTTP que usa esse banco antes da troca.
 
-No Linux, processos desta aplicação usam um lock consultivo no arquivo SQLite:
-`serve` exige exclusividade, enquanto múltiplas instâncias stdio e comandos
-locais podem coexistir. Outros processos desta aplicação recusam acesso enquanto
-`serve` está ativo, e vice-versa. O lock é liberado ao encerrar o processo.
-Ele **não é uma fronteira de segurança**: outras ferramentas SQLite podem
-ignorá-lo, processos com acesso ao diretório podem substituir o arquivo, e o
-mecanismo não é aplicado a outras plataformas. Restrinja arquivo, diretório e
-chave ao serviço por isolamento de sistema operacional adequado. Esse lock
-não habilita nem protege captura incremental ou recuperação operacional.
+**Isso apenas substitui a cópia local.** Não cria nem revoga credenciais no
+Discord, não verifica se a nova credencial funciona e não reinicia consumidores.
+Valide a adoção por uma nova instância e o fluxo de recuperação no ambiente
+autorizado. Nunca restaure automaticamente uma credencial revogada ou
+comprometida: o cofre não consulta o estado de revogação do Discord e não impede
+que um operador recadastre manualmente uma credencial antiga.
 
-Além de `DISCORD_MCP_DB` e `DISCORD_MCP_KEY`, configure:
+A revogação do segredo OAuth não encerra automaticamente sessões administrativas
+já abertas no processo: em teste sintético elas permaneceram válidas até o
+reinício. Trate revogação de sessões e tokens MCP separadamente; o teste não
+comprovou invalidação em outras instâncias ou no Discord real. Um teste do
+binário real também confirmou que um token MCP existente permanece utilizável
+após rotação local e reinício: revogue-o separadamente quando necessário.
 
-| Variável | Finalidade |
-| --- | --- |
-| `DISCORD_MCP_LISTEN` | Endereço de loopback; padrão `127.0.0.1:8000`. |
-| `DISCORD_MCP_PUBLIC_ORIGIN` | Origem pública HTTPS, sem caminho; HTTP só em loopback na porta do listener. |
-| `DISCORD_MCP_DISCORD_CLIENT_ID` | ID da aplicação OAuth Discord. |
-| `DISCORD_MCP_DISCORD_CLIENT_SECRET` | Segredo OAuth Discord, fornecido por mecanismo de segredos. |
-| `DISCORD_MCP_ADMIN_ID` | ID numérico da conta Discord autorizada a administrar permissões. |
-| `DISCORD_MCP_CLIENT_ID` | ID de um cliente MCP previamente registrado pelo operador. |
-| `DISCORD_MCP_CLIENT_NAME` | Nome do cliente mostrado no consentimento. |
-| `DISCORD_MCP_CLIENT_REDIRECT` | URI de retorno exata desse cliente. |
-| `DISCORD_MCP_METRICS_RETENTION_DAYS` | Retenção de métricas, entre 1 e 365 dias; padrão 30. |
-| `DISCORD_MCP_AUDIT_RETENTION_DAYS` | Retenção de auditoria, entre 1 e 3650 dias; padrão 90. |
+Após resultado perdido de migração ou rotação, `discord-mcp setup local vault
+compare-oauth --confirm` compara o candidato fornecido em uma única linha por
+stdin protegido não terminal com o segredo atualmente no cofre. Informa se é
+igual, diferente ou ausente, sem imprimi-lo nem alterá-lo. Erros de chave,
+corrupção e quarentena não são tratados como ausência. A comparação reflete um
+snapshot: não identifica qual operação gravou o valor, não garante que ele não
+seja alterado depois e não prova validade, revogação ou adoção. Preserve a
+origem até verificação independente; nunca restaure automaticamente credenciais
+revogadas ou comprometidas.
 
-Registre no Discord as URIs de callback formadas por sua origem pública e
-`/oauth/discord/callback` e `/admin/discord/callback`. O recurso MCP será a
-origem seguida de `/mcp`.
-Esta versão aceita apenas **um cliente MCP pré-registrado**; registro dinâmico,
-documentos de metadados de cliente ainda não estão disponíveis.
+### Infisical opcional
 
-O operador local define permissões com
-`discord-mcp set-permission ID_DISCORD CANAL read|send|both|none` e consulta
-com `discord-mcp show-permissions CANAL`. O ID é o identificador numérico da
-conta Discord, não o nome exibido. Não há concessão automática no login. A
-substituição ou exclusão do canal revoga suas permissões; webhooks não aceitam
-permissão de leitura. Os comandos exigem acesso local ao banco e à chave.
+Para buscar **somente o segredo OAuth do Discord** na inicialização HTTP,
+selecione `DISCORD_MCP_SECRET_PROVIDER=infisical` e forneça
+`DISCORD_MCP_INFISICAL_ORIGIN`, `DISCORD_MCP_INFISICAL_PROJECT_ID`,
+`DISCORD_MCP_INFISICAL_ENVIRONMENT`, `DISCORD_MCP_INFISICAL_SECRET_PATH` e
+`DISCORD_MCP_INFISICAL_TOKEN` por um mecanismo seguro. O segredo no Infisical
+deve se chamar `DISCORD_MCP_DISCORD_CLIENT_SECRET`. A origem exige HTTPS, exceto
+`http://127.0.0.1` para testes locais; a aplicação não segue redirecionamentos
+e recusa conflitos com a variável de segredo OAuth antiga. A chave
+`DISCORD_MCP_KEY` do banco ainda é fornecida separadamente. Falhas do provedor
+impedem o servidor de iniciar, sem fallback. O token deve ser uma credencial
+de máquina com acesso mínimo, já emitida e entregue pelo operador: renovação,
+rotação e atualização em processo não são implementadas. O preflight remoto
+somente de leitura não conecta ao provedor. O HTTP continua experimental.
 
-A área `/admin` permite à conta Discord cujo ID corresponde a
-`DISCORD_MCP_ADMIN_ID` consultar e alterar permissões por canal. O login de
-qualquer outra conta não concede administração. A sessão administrativa expira
-após 30 minutos e termina ao reiniciar o servidor ou sair; mudanças exigem uma
-requisição da mesma origem. A visão geral apresenta contagens reais do banco no
-momento da consulta: canais, usuários com concessões, permissões de leitura e
-envio e tokens MCP não expirados. Tokens não expirados não são conexões ativas.
-A criação de canais ainda é feita na interface local.
+### AWS Secrets Manager opcional
 
-O formulário de permissões fica vinculado à versão do canal exibido. Se o canal
-for substituído antes do envio, a alteração é recusada; volte à lista e confira
-o canal novamente. A tabela de permissões e a versão exibidas são lidas do
-mesmo snapshot do SQLite.
+Compile com `--features aws-secrets-manager`, selecione
+`DISCORD_MCP_SECRET_PROVIDER=aws-secrets-manager` e configure
+`DISCORD_MCP_AWS_SECRET_ID` com o nome ou ARN do segredo. Seu `SecretString`
+é interpretado integralmente como o segredo OAuth do Discord, não como JSON;
+`SecretBinary` é recusado. O SDK usa a cadeia de credenciais AWS habilitada
+na compilação, região e configuração do ambiente. Prefira identidade de workload
+com permissão mínima; essa compilação não habilita o provedor SSO do SDK. Trate
+perfis, endpoint overrides e credenciais AWS como configuração confiável.
 
-Alterações de permissão pela interface administrativa ou pela CLI remota também
-verificam uma revisão por canal. Se outra alteração de permissões ocorrer desde
-a abertura da página ou criação da solicitação, a edição é recusada e deve ser
-refeita após revisão. Essa proteção é conservadora: alterações de usuários
-diferentes no mesmo canal também podem conflitar; canais distintos têm revisões
-independentes. Escritores externos e versões antigas da aplicação que não
-atualizem a revisão não são cobertos; não os use no mesmo banco.
+O servidor recusa a variável OAuth antiga nesse modo e não usa fallback se a
+consulta falhar. A chave SQLite continua separada; o segredo é carregado apenas
+na inicialização, sem atualização automática, e a recuperação exige revisão
+independente. O preflight somente de leitura não consulta a AWS. Testes usam
+endpoint e credenciais sintéticos; nenhuma integração AWS real foi validada.
 
-Para alterar uma permissão remotamente, use
-`discord-mcp remote-set-permission ORIGEM ID_DISCORD CANAL read|send|both|none`.
-A origem deve ser HTTPS (HTTP somente em loopback). Abra o link exibido, entre
-com a conta administradora pelo Discord, reabra o link após o login, confira a
-operação e confirme; então pressione Enter na CLI. A CLI não precisa do banco
-nem da chave. A solicitação fica em memória por até cinco minutos, é vinculada
-à prova mantida pela CLI e pode ser consumida uma única vez. Reiniciar o
-servidor invalida solicitações pendentes. Se a resposta se perder ou a operação
-falhar após o consumo, confira o estado e a auditoria antes de iniciar outra
-solicitação. Tokens MCP não concedem autorização administrativa. O cookie da
-sessão web não é transferido para a CLI.
+Com essa feature habilitada, `discord-mcp setup local vault
+migrate-oauth-from-aws-secrets-manager --preview` mostra a operação sem consultar
+a AWS; substitua por `--confirm` para copiar o segredo configurado ao cofre
+existente. A operação não altera o segredo de origem, a seleção de provedor ou
+um segredo já cadastrado. Falhas ou destino em quarentena impedem a cópia. Não
+configure a variável OAuth antiga junto a essa operação. Um resultado perdido
+após o commit exige comparação e verificação independentes: preserve a origem e não presuma
+que ocorreu rollback ou adoção pelo servidor.
 
-Para alterações de permissão e cadastros remotos, o serviço também verifica
-na transação se o registro do canal permanece igual ao início da solicitação.
-Se tiver sido substituído, criado ou removido nesse intervalo, a operação é
-recusada; inicie outra solicitação e confira o consentimento novamente.
+### AWS Systems Manager Parameter Store opcional
 
-Para consultar somente os nomes dos canais, use
-`discord-mcp remote-list-channels ORIGEM` e confirme a consulta no navegador.
-Essa é uma autorização distinta, também de uso único: ela não concede
-permissão para alterar canais nem retorna tokens, webhooks ou credenciais. A
-consulta é recusada se o banco estiver em quarentena.
+Compile com `--features aws-parameter-store`, selecione
+`DISCORD_MCP_SECRET_PROVIDER=aws-parameter-store` e configure
+`DISCORD_MCP_AWS_PARAMETER_NAME` com o nome ou ARN do parâmetro. A integração
+consulta exatamente esse parâmetro com descriptografia e exige `SecureString`;
+o valor completo é o segredo OAuth. A cadeia de credenciais e as mesmas
+ressalvas de IAM, SSO, endpoint, chave SQLite, rotação e testes sintéticos
+descritas para Secrets Manager também se aplicam. Uma consulta negada, tipo
+incorreto ou segredo OAuth antigo no ambiente impedem a inicialização, sem
+fallback. O preflight somente de leitura não consulta a AWS.
 
-Para consultar as concessões de um canal específico, use
-`discord-mcp remote-show-permissions ORIGEM CANAL` e confirme a consulta no
-navegador. O consentimento é limitado ao canal informado e não autoriza
-alterações; a saída contém IDs Discord e permissões de leitura e envio. Um
-canal inexistente ou um banco em quarentena produz erro, não uma lista vazia.
+Com essa feature, `discord-mcp setup local vault migrate-oauth-from-aws-parameter-store --preview`
+apresenta a cópia sem consultar a AWS; `--confirm` copia o `SecureString` para
+um cofre existente, sem substituir segredo ou alterar a origem e a seleção de
+provedor. Resultado ambíguo após commit não possui reconciliação automática:
+preserve a origem e não presuma rollback nem adoção pelo servidor.
 
-Para cadastrar ou substituir um webhook remotamente, use
-`discord-mcp remote-add-webhook ORIGEM CANAL`. Forneça a URL em uma linha por
-stdin protegido **não conectado a um terminal**; mantenha o stdin aberto para
-enviar uma segunda linha após o consentimento. Por exemplo, em um shell POSIX,
-com um arquivo privado contendo a URL e uma quebra de linha:
+Para gerar uma chave nova, revise `discord-mcp setup local --generate-key --preview`. Com `--confirm`, o comando emite a chave somente em stdout não terminal, para ser recebido por um mecanismo de segredos confiável; não salva arquivos nem configura a aplicação. Proteja o destino e a cópia de recuperação. **Não troque a chave de um banco existente:** isso impede a leitura dos dados cifrados.
 
-```sh
-{ cat /caminho/privado/webhook; read -r _ </dev/tty; printf '\n'; } | discord-mcp remote-add-webhook https://servidor.exemplo CANAL
-```
+## Modos e ferramentas
 
-Abra o link exibido, entre como administrador, reabra o link, confira o nome e
-o ID do webhook e autorize; então pressione Enter. Substituir um canal revoga
-suas permissões anteriores. A credencial é enviada ao serviço no corpo HTTPS
-após o Enter na CLI, nunca na URL, nos argumentos ou no consentimento; se o
-administrador ainda não tiver autorizado, o serviço recusará a operação.
-Quando armazenada, a credencial é cifrada no banco. O proxy não deve registrar
-corpos de requisições. Uma
-falha ou perda da resposta após consumo exige verificar o estado e a auditoria
-antes de tentar novamente. Esse comando cadastra webhook, não token de bot.
+| Modo | Uso | Estado |
+| --- | --- | --- |
+| stdio local | Cliente MCP inicia o processo localmente | Webhook e bot; permissões do Discord ainda precisam ser verificadas |
+| HTTP remoto | `discord-mcp serve` atrás de proxy HTTPS | Experimental; requer configuração e validação operacional |
 
-Para cadastrar um canal com bot, use
-`discord-mcp remote-add-bot ORIGEM CANAL ID_CANAL_DISCORD`. Forneça o token do
-bot por stdin protegido não terminal, com uma quebra de linha, e mantenha o
-stdin aberto para a confirmação após o consentimento no navegador, como no
-exemplo anterior. O consentimento mostra o nome e o ID do canal Discord, não o
-token; a autorização é vinculada ao token e de uso único. A substituição de
-um canal revoga suas concessões anteriores. O serviço cifra o token no banco e
-registra o administrador Discord na auditoria; o proxy não deve registrar
-corpos de requisição. O cadastro não verifica o token nem as permissões do bot
-no Discord: isso exige validação posterior no ambiente autorizado.
+O remoto é **opcional**: clientes locais que usam stdio não precisam configurar
+HTTP, proxy, TLS, systemd ou supervisor. No remoto, a rotação do segredo OAuth
+é acompanhada pelo operador: publique o substituto, reinicie e teste novos logins
+OAuth e administrativo, conforme o [procedimento de rotação](docs/operations.md#rotação-operacional-do-segredo-oauth).
+Não há comprovação automática de adoção; observações locais não são prova de
+identidade da instância. Testes sintéticos não validam o Discord ou um provedor
+real; a avaliação de uso em produção cabe ao operador.
 
-Para remover a configuração local de um canal e revogar suas concessões, use
-`discord-mcp remote-delete-channel ORIGEM CANAL` e confirme a exclusão no
-navegador. A operação não exclui o canal no Discord. A autorização é de uso
-único e vinculada à versão do registro existente no início da solicitação: se o
-canal for substituído antes da execução, a exclusão é recusada e será preciso
-iniciar outra solicitação. A exclusão e a revogação são auditadas na mesma
-transação. Em caso de resposta perdida, confira o estado antes de tentar outra vez.
+`send_message` envia por webhook ou bot; `read_messages` lê até 20 mensagens de canal de bot. Menções automáticas são desativadas. O bot requer permissões Discord apropriadas, e a leitura de conteúdo pode exigir o intent privilegiado `MESSAGE_CONTENT`.
 
-Em `/admin/observability`, a conta administradora pode consultar as últimas 24
-horas de requisições MCP HTTP, respostas HTTP 4xx/5xx e ferramentas de leitura e
-envio concluídas com ou sem erro. Os dados são agregados por minuto no SQLite,
-sem conteúdo, credenciais ou identificadores de usuário e canal. As falhas das
-ferramentas incluem negação de acesso, validação e erros do Discord; não são
-equivalentes a falhas HTTP. O tempo médio é medido até a produção da resposta
-HTTP estar pronta, antes da gravação da própria métrica e não até o término da
-transmissão do corpo; cada amostra é limitada a 10 minutos.
+Para planejar o ambiente remoto, execute `discord-mcp setup remote` e leia as [opções de execução](docs/remote-runtime-options.md). No ambiente do serviço, `discord-mcp setup remote --check` verifica a configuração com as mesmas validações de inicialização, sem exibir valores. Esses comandos não conectam nem alteram servidor e não validam disponibilidade de TLS, credenciais, acesso ao banco ou recuperação. O serviço escuta somente em loopback; proxy, TLS, segredos e recuperação são responsabilidade do operador.
 
-A coleta é de melhor esforço e pode omitir operações canceladas ou gravações
-que falharam. Um aviso aparece se uma falha de gravação for detectada durante a
-execução atual; ele não sobrevive ao reinício. A limpeza da retenção ocorre na
-inicialização e quando um novo evento é gravado: dados antigos podem permanecer
-em um servidor ocioso até o próximo evento ou reinício. A coleta não cobre stdio,
-OAuth, interface administrativa nem a saúde do Discord.
+Para revisar os componentes juntos, use `discord-mcp setup remote bundle HOST --preview`. A criação opcional com `discord-mcp setup remote bundle HOST NOVO_DIRETORIO_ABSOLUTO --confirm` gera um pacote local sem segredos, sem sobrescrever caminhos existentes e sem instalar serviços. Revise cada arquivo e as dependências operacionais antes de qualquer ativação; se houver falha de escrita, o diretório parcial é preservado para inspeção.
 
-Em `/admin/audit`, o administrador pode consultar eventos de login Discord após
-validação da tentativa, alterações de canais locais e concessões ou revogações
-de permissões. Alterações bem-sucedidas e seus eventos são gravados na mesma
-transação; se o registro falhar, a alteração é revertida. O histórico inclui
-identificadores Discord e nomes de canais, mas não inclui conteúdo de mensagens,
-tokens ou URLs de webhook. Esses metadados ficam no mesmo banco SQLite, protegidos
-pelas permissões do arquivo, mas não são cifrados nem resistentes à adulteração
-por quem controla o banco. Tentativas rejeitadas antes da validação do login,
-erros de token MCP e eventos anteriores à implementação não são registrados.
+Para um banco já existente, `discord-mcp setup remote --check-storage` verifica metadados do arquivo e do diretório pai imediato sem abri-lo ou criá-lo. Não verifica dono, diretórios ancestrais, conteúdo, chave ou recuperação e não elimina possíveis alterações concorrentes no caminho.
 
-A retenção de auditoria é de 90 dias por padrão; sua limpeza ocorre na
-inicialização e em novas gravações, podendo ser adiada enquanto o servidor está
-ocioso. Falhas de gravação de tentativas de login negadas são indicadas na
-interface apenas durante a execução atual. O histórico não é uma trilha de
-auditoria completa ou imutável.
+`discord-mcp setup remote --check-https-origin` verifica a sintaxe da origem HTTPS sem rede. Não verifica DNS, certificado, proxy, acesso público ou saúde do serviço.
 
-Em `SIGINT` ou `SIGTERM`, o servidor tenta drenar requisições por até 15
-segundos. Ao exceder o limite, operações em andamento podem ficar incompletas;
-isso não garante entrega de mensagens ou recuperação após interrupção forçada.
-O teste local `cargo test --test drain` envia `SIGTERM` enquanto uma requisição
-MCP está sendo recebida e verifica a conclusão, o fechamento do listener e o
-prazo para uma requisição bloqueada. Ele não testa uma chamada real ao Discord,
-streams longos ou efeitos externos iniciados antes do encerramento.
+Opcionalmente, `discord-mcp setup remote caddy HOST --preview` mostra um site Caddy HTTPS para o listener `127.0.0.1:8000`. Após revisão, `discord-mcp setup remote caddy HOST DIRETORIO_ABSOLUTO --confirm` cria um arquivo novo sem sobrescrever outro. Não instala nem recarrega o proxy, configura DNS ou emite certificado. O operador deve revisar a configuração global, a redação de logs, as portas e TLS antes de ativá-la; o hostname precisa corresponder à origem pública.
 
-### Canais com bot
+Para preparar o modelo systemd, revise `discord-mcp setup remote systemd --preview`. Opcionalmente gere os arquivos locais com `discord-mcp setup remote systemd NOVO_DIRETORIO --confirm`. O diretório não pode existir; nada é instalado ou enviado ao servidor. O modelo não inclui segredos, TLS ou backup e exige revisão específica do host.
 
-Na interface local, informe o nome, o ID do canal e o token de um bot já
-instalado no servidor Discord. O token é cifrado no mesmo banco e não é exibido
-novamente. `send_message` envia pelo bot ou webhook; `read_messages` só aceita
-canais de bot e retorna até 20 mensagens recentes. O bot precisa das permissões
-Discord adequadas, incluindo `VIEW_CHANNEL`, `SEND_MESSAGES` e
-`READ_MESSAGE_HISTORY` para as respectivas operações. A ausência de
-`READ_MESSAGE_HISTORY` pode resultar em lista vazia; não prova que o canal não
-tem mensagens. O Discord também pode retornar conteúdo vazio quando o intent
-privilegiado `MESSAGE_CONTENT` não está configurado ou aprovado. Esta versão
-não acompanha mensagens em tempo real e ainda não foi validada contra o Discord
-real.
+Após essa revisão, no próprio host e com permissões adequadas, `discord-mcp setup remote systemd --install-unit DIRETORIO_ABSOLUTO --confirm` grava a unidade em um diretório systemd confiável escolhido pelo operador, somente se ainda não existir. Em Unix, o diretório não pode ser gravável por grupo ou outros. Não solicita privilégios, recarrega o systemd, inicia serviço ou configura o restante do servidor. Confira também proprietário e diretórios ancestrais; não use caminhos controlados por usuários não confiáveis.
+
+O mesmo preview mostra um modelo de variáveis sem valores. `discord-mcp setup remote systemd --install-env-template DIRETORIO_ABSOLUTO --confirm` cria `service.env.example` sem sobrescrever outro arquivo; não lê segredos nem cria o arquivo de ambiente do serviço. A entrega efetiva das credenciais depende do mecanismo escolhido pelo operador.
+
+O preview também inclui um drop-in **opcional** para Ciphera. Após revisar os caminhos, `discord-mcp setup remote systemd --install-ciphera-dropin DIRETORIO_ABSOLUTO --confirm` cria `ciphera.conf` no diretório de drop-ins escolhido, sem sobrescrever ou reiniciar. Ele exige Ciphera CLI compatível, um token de máquina fornecido por `LoadCredentialEncrypted` e arquivo separado com `CIPHERA_PROJECT` e `CIPHERA_ENV`; não cria nem consulta essas credenciais. Veja os limites e etapas em [opções de execução](docs/remote-runtime-options.md).
+
+## Referências
+
+- [Configuração, permissões, administração e segurança](docs/operations.md)
+- [Modelos de execução remota e limitações](docs/remote-runtime-options.md)
+- [Exercício sintético de backup e recuperação](docs/sqlite-recovery-drill.md)
+- [Benchmark isolado e resultados](docs/benchmarks.md)
+- Comandos disponíveis: `discord-mcp --help`
+
+`discord-mcp setup recovery` apresenta a sequência de preparação em quarentena,
+revisão e ativação explícita sem tocar nos arquivos. O exercício sintético não
+comprova recuperação operacional ou prazo de recuperação em produção.
 
 ## Desenvolvimento
 
-Requer Rust e Cargo. Execute `cargo run` para iniciar o protocolo stdio. Este
-comando não abre uma interface web e é destinado a clientes MCP. Configure a
-variável de ambiente por um mecanismo seguro do cliente, sem colocar a URL em
-argumentos, histórico do shell ou arquivos versionados.
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo build --locked --all-features
+cargo test --locked --all-features
+```
 
-Verificações: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo build` e `cargo test`.
-
-Nunca registre tokens de bot, URLs de webhook ou segredos OAuth no repositório.
-
-Para o exercício opt-in de snapshot e restauração com dados sintéticos usando o
-projeto irmão, consulte [docs/sqlite-recovery-drill.md](docs/sqlite-recovery-drill.md).
-O documento também descreve a preparação em quarentena e a ativação explícita de
-uma cópia offline. O exercício não configura recuperação de desastre em produção.
-
-O benchmark isolado de caminhos MCP HTTP e suas limitações estão documentados
-em [docs/benchmarks.md](docs/benchmarks.md).
+Os testes opcionais de replicação e o exercício Floci têm pré-requisitos próprios; veja o guia de recuperação. Nunca use credenciais ou serviços reais nos testes locais.

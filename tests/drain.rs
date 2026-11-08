@@ -28,6 +28,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_supervisor(false).await
+    }
+
+    async fn start_with_supervisor(supervised: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let db = directory.path().join("drain.db");
         let key = [121; 32];
@@ -48,9 +52,18 @@ impl Fixture {
         .unwrap();
         let token = store.issue_access_token("11", &resource, now, 60).unwrap();
         drop(store);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"));
+        let mut child = if supervised {
+            let script = include_str!("../drills/supervisor_serve_fixture.py");
+            let mut command = Command::new("/usr/bin/python3");
+            command.args(["-I", "-c", script, env!("CARGO_BIN_EXE_discord-mcp")]);
+            command
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_discord-mcp"));
+            command.arg("serve");
+            command
+        };
         child
-            .arg("serve")
+            .env_clear()
             .env("DISCORD_MCP_DB", &db)
             .env("DISCORD_MCP_KEY", hex::encode(key))
             .env("DISCORD_MCP_LISTEN", address.to_string())
@@ -144,6 +157,42 @@ impl Fixture {
         .await
         .expect("listener did not close during drain");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fixture_supervisor_forwards_sigterm_and_real_serve_drains() {
+    let mut fixture = Fixture::start_with_supervisor(true).await;
+    let (mut writer, mut reader, rest) = fixture.begin_request().await;
+    fixture.terminate().await;
+    fixture.wait_until_listener_closed().await;
+    writer.write_all(&rest).await.unwrap();
+    writer.flush().await.unwrap();
+    let mut response = String::new();
+    timeout(Duration::from_secs(5), reader.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains("message must contain"));
+    assert!(
+        timeout(Duration::from_secs(5), fixture.child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fixture_supervisor_sigkill_closes_real_serve_listener() {
+    let mut fixture = Fixture::start_with_supervisor(true).await;
+    // Parent death is abrupt: an in-flight request is not promised to finish.
+    let (_writer, _reader, _rest) = fixture.begin_request().await;
+    fixture.child.kill().await.unwrap();
+    assert!(!fixture.child.wait().await.unwrap().success());
+    fixture.wait_until_listener_closed().await;
 }
 
 #[tokio::test]

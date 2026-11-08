@@ -6,9 +6,8 @@ use rmcp::serde_json::{Value, json};
 #[test]
 fn initializes_over_stdio_and_advertises_local_webhook_scope() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
-        .env_remove("DISCORD_WEBHOOK_URL")
-        .env_remove("DISCORD_MCP_DB")
-        .env_remove("DISCORD_MCP_KEY")
+        // No remote, OAuth, provider or supervisor configuration is inherited.
+        .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

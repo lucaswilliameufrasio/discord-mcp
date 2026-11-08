@@ -10,6 +10,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+#[cfg(all(discord_mcp_synthetic_authority, not(debug_assertions)))]
+compile_error!("synthetic Discord authority builds are restricted to debug profiles");
+
 #[derive(Debug)]
 pub enum LoginError {
     InvalidConfiguration,
@@ -41,8 +44,21 @@ pub struct DiscordLoginClient {
     client_id: String,
     client_secret: String,
     redirect_uri: Url,
+    rotation_observation: Option<RotationObservation>,
     #[cfg(test)]
     test_base: Option<Url>,
+    #[cfg(discord_mcp_synthetic_authority)]
+    synthetic_base: Url,
+}
+
+#[derive(Clone)]
+struct RotationObservation {
+    path: std::path::PathBuf,
+    key: [u8; 32],
+    revision: [u8; 16],
+    instance: [u8; 16],
+    boot: [u8; 16],
+    consumer: crate::rotation_progress::Consumer,
 }
 
 pub struct PendingDiscordLogin {
@@ -85,6 +101,29 @@ impl DiscordLoginClient {
         client_secret: &str,
         redirect_uri: &str,
     ) -> Result<Self, LoginError> {
+        #[cfg(discord_mcp_synthetic_authority)]
+        let synthetic_base = {
+            if client_id != "123" || !matches!(client_secret, "synthetic-old" | "synthetic-new") {
+                return Err(LoginError::InvalidConfiguration);
+            }
+            let base = Url::parse(
+                &std::env::var("DISCORD_TEST_SYNTHETIC_AUTHORITY")
+                    .map_err(|_| LoginError::InvalidConfiguration)?,
+            )
+            .map_err(|_| LoginError::InvalidConfiguration)?;
+            if base.scheme() != "http"
+                || base.host_str() != Some("127.0.0.1")
+                || base.port().is_none()
+                || base.path() != "/"
+                || base.query().is_some()
+                || base.fragment().is_some()
+                || !base.username().is_empty()
+                || base.password().is_some()
+            {
+                return Err(LoginError::InvalidConfiguration);
+            }
+            base
+        };
         let uri = Url::parse(redirect_uri).map_err(|_| LoginError::InvalidConfiguration)?;
         let loopback = uri.scheme() == "http"
             && matches!(
@@ -106,9 +145,12 @@ impl DiscordLoginClient {
         {
             return Err(LoginError::InvalidConfiguration);
         }
-        let client = Client::builder()
+        let builder = Client::builder()
             .redirect(Policy::none())
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10));
+        #[cfg(discord_mcp_synthetic_authority)]
+        let builder = builder.no_proxy();
+        let client = builder
             .build()
             .map_err(|_| LoginError::ProviderUnavailable)?;
         Ok(Self {
@@ -116,9 +158,33 @@ impl DiscordLoginClient {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: uri,
+            rotation_observation: None,
             #[cfg(test)]
             test_base: None,
+            #[cfg(discord_mcp_synthetic_authority)]
+            synthetic_base,
         })
+    }
+
+    /// Attach local best-effort observation; the instance label is not authenticated.
+    pub fn with_rotation_observation(
+        mut self,
+        path: std::path::PathBuf,
+        key: [u8; 32],
+        revision: [u8; 16],
+        instance: [u8; 16],
+        boot: [u8; 16],
+        consumer: crate::rotation_progress::Consumer,
+    ) -> Self {
+        self.rotation_observation = Some(RotationObservation {
+            path,
+            key,
+            revision,
+            instance,
+            boot,
+            consumer,
+        });
+        self
     }
 
     /// The caller must put browser_binding in a protected, HttpOnly, SameSite cookie.
@@ -159,6 +225,11 @@ impl DiscordLoginClient {
     ) -> Result<DiscordIdentity, LoginError> {
         let base =
             Url::parse("https://discord.com/").map_err(|_| LoginError::InvalidConfiguration)?;
+        #[cfg(discord_mcp_synthetic_authority)]
+        let base = {
+            let _ = base;
+            self.synthetic_base.clone()
+        };
         #[cfg(test)]
         let base = self.test_base.clone().unwrap_or(base);
         self.finish_at(pending, state, browser_binding, issuer, code, &base)
@@ -229,6 +300,31 @@ impl DiscordLoginClient {
         {
             return Err(LoginError::InvalidResponse);
         }
+        if let Some(observation) = &self.rotation_observation {
+            let recorded = crate::channels::ChannelStore::open(&observation.path, &observation.key)
+                .and_then(|store| {
+                    store.record_rotation_login_observation(
+                        observation.revision,
+                        observation.instance,
+                        observation.boot,
+                        observation.consumer,
+                        &self.client_secret,
+                    )
+                });
+            if recorded.is_err() {
+                eprintln!("rotation login observation unavailable; adoption remains unverified");
+            }
+            #[cfg(all(discord_mcp_synthetic_authority, target_os = "linux"))]
+            if std::env::var_os("DISCORD_TEST_SUPERVISED_EVENTS").is_some() {
+                let event: &[u8] = match observation.consumer {
+                    crate::rotation_progress::Consumer::OAuth => b"oauth",
+                    crate::rotation_progress::Consumer::Admin => b"admin",
+                };
+                // Test-only, nonblocking and never trusted as proof of adoption.
+                let _ =
+                    rustix::net::send(std::io::stdin(), event, rustix::net::SendFlags::DONTWAIT);
+            }
+        }
         Ok(identity)
     }
 }
@@ -287,6 +383,123 @@ mod tests {
             .unwrap()
             .1
             .into_owned()
+    }
+
+    #[tokio::test]
+    async fn rotated_vault_secret_is_adopted_only_by_new_consumers_and_revocation_fails_closed() {
+        use crate::channels::{ChannelStore, EmbeddedSecret};
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::{IntoResponse, Response},
+            routing::{get, post},
+        };
+        use base64::engine::general_purpose::STANDARD;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        async fn token(State(epoch): State<Arc<AtomicUsize>>, headers: HeaderMap) -> Response {
+            let expected = match epoch.load(Ordering::SeqCst) {
+                0 => "123:synthetic-old",
+                1 => "123:synthetic-new",
+                _ => "123:no-valid-credential",
+            };
+            let auth = format!("Basic {}", STANDARD.encode(expected));
+            if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some(auth.as_str()) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            (StatusCode::OK, axum::Json(rmcp::serde_json::json!({"access_token":"synthetic-access","token_type":"Bearer"}))).into_response()
+        }
+        async fn identity(headers: HeaderMap) -> Response {
+            if headers.get("authorization").and_then(|h| h.to_str().ok())
+                != Some("Bearer synthetic-access")
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            (
+                StatusCode::OK,
+                axum::Json(rmcp::serde_json::json!({"id":"123","username":"synthetic"})),
+            )
+                .into_response()
+        }
+        async fn login(client: &DiscordLoginClient) -> Result<DiscordIdentity, LoginError> {
+            let (pending, url) = client.begin()?;
+            let state = state_from(&url);
+            let binding = pending.browser_binding().to_owned();
+            client
+                .finish(
+                    pending,
+                    &state,
+                    &binding,
+                    "https://discord.com",
+                    "synthetic-code",
+                )
+                .await
+        }
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/oauth2/token", post(token))
+            .route("/api/v10/users/@me", get(identity))
+            .with_state(epoch.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        let key = [92; 32];
+        let secret = EmbeddedSecret::DiscordOAuthClientSecret;
+        let store = ChannelStore::open(&db, &key).unwrap();
+        store
+            .insert_embedded_secret(secret, "synthetic-old")
+            .unwrap();
+        let make_consumer = || {
+            let store = ChannelStore::open(&db, &key).unwrap();
+            let value = store.get_embedded_secret(secret).unwrap();
+            DiscordLoginClient::new("123", &value, "http://127.0.0.1:8765/callback")
+                .unwrap()
+                .with_test_base(base.clone())
+        };
+        let old_oauth = make_consumer();
+        let old_admin = make_consumer();
+        assert_eq!(login(&old_oauth).await.unwrap().id, "123");
+        assert!(
+            store
+                .rotate_embedded_secret(secret, "wrong", "synthetic-new")
+                .is_err()
+        );
+        assert_eq!(login(&old_admin).await.unwrap().id, "123");
+        store
+            .rotate_embedded_secret(secret, "synthetic-old", "synthetic-new")
+            .unwrap();
+        // Publication alone does not update already constructed consumers.
+        assert_eq!(login(&old_oauth).await.unwrap().id, "123");
+        epoch.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            login(&old_oauth).await,
+            Err(LoginError::ProviderRejected)
+        ));
+        assert!(matches!(
+            login(&old_admin).await,
+            Err(LoginError::ProviderRejected)
+        ));
+        let new_oauth = make_consumer();
+        let new_admin = make_consumer();
+        assert_eq!(login(&new_oauth).await.unwrap().id, "123");
+        assert_eq!(login(&new_admin).await.unwrap().id, "123");
+        epoch.store(2, Ordering::SeqCst);
+        assert!(matches!(
+            login(&new_oauth).await,
+            Err(LoginError::ProviderRejected)
+        ));
+        assert!(matches!(
+            login(&new_admin).await,
+            Err(LoginError::ProviderRejected)
+        ));
+        assert_eq!(store.get_embedded_secret(secret).unwrap(), "synthetic-new");
+        server.abort();
     }
 
     #[tokio::test]

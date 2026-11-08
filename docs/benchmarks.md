@@ -13,14 +13,27 @@ não entrega ou leitura no Discord real.
 Execute na raiz do projeto:
 
 ```sh
-TMPDIR=/tmp/opencode cargo run --release --features benchmark-fixture --example mcp_benchmark > /tmp/opencode/discord-mcp-benchmark.json
+python3 drills/benchmark/report.py > benchmark-result.json
 ```
+
+O wrapper emite JSON versão 1 com o resultado versão 3 e metadados permitidos:
+commit, indicação de alterações locais, SHA-256 dos arquivos Rust em `src`, do
+exemplo e de `Cargo.toml`/`Cargo.lock`, versões Rust/Cargo, versão numérica do
+kernel, alvo e CPUs disponíveis. Não coleta nome do host, variáveis de ambiente,
+caminhos, credenciais ou conteúdo de mensagens reais. O hash não inclui arquivos
+de configuração Cargo, toolchain nem arquivos fora desse escopo; registre à
+parte condições relevantes sem segredos. O wrapper usa Cargo offline e falha
+se esses arquivos mudarem durante a medição. Revise o resultado antes de
+compartilhar: até metadados de hardware podem ser sensíveis no seu contexto.
+As verificações do wrapper podem ser repetidas com
+`python3 -m unittest discover -s drills/benchmark -p 'test_*.py'`.
 
 O programa usa parâmetros fixos e limitados: 5 cenários, concorrência de 1 e 4,
 3 repetições por combinação, 10 requisições sequenciais de aquecimento e 100
 requisições por trabalhador em cada repetição. O modelo é fechado: cada
 trabalhador espera uma resposta antes de enviar a próxima. O relatório JSON
-versão 2 registra tentativas, sucessos de medição, erros, duração, vazão e
+versão 3 registra SO, arquitetura, CPUs disponíveis, versão do pacote e modo
+de compilação, além de tentativas, sucessos de medição, erros, duração, vazão e
 latências p50/p95/p99 de ponta a ponta pelo cliente. A latência inclui leitura e
 validação da resposta; aquecimento não entra nos resultados. As métricas e a
 auditoria padrão da aplicação ficam ativas. As mesmas conexões e o mesmo banco
@@ -30,6 +43,14 @@ O endpoint injetável só é compilado com a feature explícita
 pela CLI. O servidor falso compartilha o processo e a máquina com o gerador e
 o servidor MCP; não representa os limites de throughput do Discord.
 
+Para comparação, registre separadamente o commit, se havia alterações locais,
+versão do Rust, modelo de CPU, memória e limites efetivos de recursos, sem
+hostnames, caminhos pessoais, variáveis de ambiente ou credenciais. A versão do
+pacote não identifica o commit. Confira o JSON antes de compartilhá-lo: dados de
+hardware e versões podem ser sensíveis em alguns ambientes. Compare somente
+campanhas com o mesmo código da carga, parâmetros e topologia; diferenças de
+máquina impedem atribuir mudanças de resultado apenas ao código.
+
 Este é um teste funcional de carga leve e referência inicial, não um teste de
 saturação: não há taxa de chegada independente, nem limiar acordado de
 capacidade, nem coleta de CPU, memória ou profundidade de fila. O gerador e o
@@ -37,6 +58,57 @@ servidor competem pelos mesmos recursos, e o modelo fechado pode esconder
 sobrecarga. Não há TLS, proxy, rede externa, Discord real, leitura de mensagens
 ou envio real; não extrapolar para produção. Arquivos sob `/tmp/opencode` são
 descartáveis e não devem conter credenciais ou dados reais.
+
+## Referência isolada — 2026-11-06
+
+### Execução com relatório estruturado
+
+Execução posterior após adicionar o guia de recuperação ao pacote: base `bd457ff`,
+árvore modificada, SHA-256 dos arquivos medidos
+`6fac719ffe8f37c301a0d25bbde16dbc19f2934d002a0f77f56f61925febd676`.
+Em sandbox de rede com loopback, houve 7.500 tentativas e zero erros. A leitura
+simulada com concorrência 4 teve mediana de **1.384,914 req/s**, p50 **2,622 ms**,
+p95 **5,175 ms** e p99 **8,162 ms** em três repetições. Não é uma comparação
+controlada com a execução anterior nem uma medida de capacidade de produção.
+
+Código base `bd457ff`, árvore modificada; hash dos arquivos medidos
+`101d9cac5e523e739ade0cb5d076fbda127c152bd39727e4c2e2adb8d9445a9f`.
+Sandbox de rede com loopback, Linux x86_64, compilação release e 24 CPUs
+lógicas disponíveis; limites efetivos de cgroup e interferência de outros
+processos não foram medidos. **7.500 tentativas, zero erros**. A leitura
+simulada com concorrência 4 teve mediana de **1.356,988 req/s**, p50 **2,490 ms**,
+p95 **5,265 ms** e p99 **7,238 ms** entre três repetições. Isso não mede
+capacidade de produção. O hash identifica apenas o escopo descrito acima; a
+árvore modificada não é representada integralmente pelo commit.
+
+### Execução anterior
+
+`bd457ff` com alterações locais, incluindo metadados no benchmark; SHA-256 do
+diff de `examples/mcp_benchmark.rs`: `0068cfbf11d755edbb2f36981835765b887590aa4dbb619b22c7047fa446cd0f`.
+Rust 1.99.1, `--release`, Linux 7.3.0-5-cachyos, x86_64, 24 CPUs lógicas
+disponíveis. Mesmo processo/host, loopback e SQLite temporário; CPU, memória,
+limites de cgroup e carga externa não foram medidos. A campanha foi executada
+sem a suíte de testes concorrente. Foram 7.500 tentativas e zero erros de
+medição; fixture contou 1.560 leituras e 1.560 envios incluindo aquecimento.
+
+Medianas de três repetições; percentis são medianas por repetição, não uma
+distribuição agrupada:
+
+| Cenário | Concorrência | req/s | p50 ms | p95 ms | p99 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Leitura negada | 1 | 684,711 | 1,456 | 1,541 | 1,593 |
+| Leitura negada | 4 | 1503,091 | 2,008 | 5,085 | 7,835 |
+| Limite inválido | 1 | 662,458 | 1,495 | 1,611 | 1,728 |
+| Limite inválido | 4 | 1540,433 | 2,102 | 4,914 | 6,340 |
+| Leitura simulada | 1 | 630,494 | 1,580 | 1,658 | 1,747 |
+| Leitura simulada | 4 | 1327,901 | 2,490 | 5,787 | 8,181 |
+| Envio vazio | 1 | 620,253 | 1,508 | 2,056 | 2,533 |
+| Envio vazio | 4 | 1412,335 | 2,070 | 4,994 | 6,871 |
+| Envio simulado | 1 | 599,770 | 1,614 | 2,080 | 2,374 |
+| Envio simulado | 4 | 1452,873 | 2,132 | 4,968 | 6,465 |
+
+Execuções curtas em host compartilhado não comprovam capacidade sustentada nem
+isolamento de carga externa. Dados sintéticos; nenhum Discord, TLS ou rede real.
 
 ## Referência local — 2026-11-05
 

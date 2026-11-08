@@ -287,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         rmcp::serde_json::to_string_pretty(
-            &json!({"schema":2,"model":"closed-loop","warmup_requests_per_run":10,"requests_per_worker":100,"fixture_reads":reads,"fixture_sends":sends,"scenarios":results})
+            &json!({"schema":3,"model":"closed-loop","environment":{"os":std::env::consts::OS,"architecture":std::env::consts::ARCH,"logical_cpus_available":std::thread::available_parallelism().ok().map(|n| n.get()),"package_version":env!("CARGO_PKG_VERSION"),"debug_assertions":cfg!(debug_assertions)},"topology":"single process, loopback, synthetic Discord, temporary SQLite","warmup_requests_per_run":10,"requests_per_worker":100,"fixture_reads":reads,"fixture_sends":sends,"scenarios":results})
         )?
     );
     Ok(())
