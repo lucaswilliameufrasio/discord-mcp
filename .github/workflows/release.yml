@@ -136,4 +136,14 @@ jobs:
         run: |
           cp compose.yaml release/compose.yaml
           (cd release && sha256sum -c ./*.sha256 && sha256sum compose.yaml > compose.yaml.sha256)
-          gh release create "$TAG" release/* --verify-tag --generate-notes
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## Imagens Docker
+
+          - Aplicação (CLI e servidor): \`ghcr.io/${GITHUB_REPOSITORY}:${TAG}\`
+          - Relay HTTP interno, sem TLS: \`ghcr.io/${GITHUB_REPOSITORY}-relay:${TAG}\`
+
+          O Compose usa as duas imagens; o relay encaminha o loopback e não substitui o proxy HTTPS externo. Para systemd e stdio, use apenas o binário da release.
+
+          [Instalação do servidor: Docker Compose, Docker ou systemd](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/docs/server-setup.md)
+          EOF
+          gh release create "$TAG" release/* --verify-tag --generate-notes --notes-file "$RUNNER_TEMP/release-notes.md"

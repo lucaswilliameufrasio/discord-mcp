@@ -10,6 +10,8 @@ Para compilar a partir do código, instale Rust e Cargo, execute `cargo build --
 
 O fluxo de release e o Compose para Linux estão descritos em [Releases e containers](docs/releases.md). O mesmo executável atende a CLI local/stdio e ao servidor com o comando `serve`; proxy HTTPS e deploy são responsabilidade do operador.
 
+Para preparar um servidor com Docker Compose, Docker ou systemd, veja o [guia de instalação do servidor](docs/server-setup.md).
+
 1. Execute `discord-mcp setup local` para conferir os requisitos de configuração.
 2. Configure `DISCORD_MCP_DB` e `DISCORD_MCP_KEY` por um mecanismo seguro. A chave deve ter 32 bytes aleatórios em hexadecimal; mantenha uma cópia de recuperação separada do banco.
 3. Execute `discord-mcp setup local --init` para inicializar o banco, sem substituir canais existentes.

@@ -24,8 +24,7 @@ Isso não é uma execução nativa ARM nem verifica o runner ARM do GitHub.
 O teste `drills/release/compose_smoke.py` também foi executado duas vezes com
 imagens locais amd64 em Docker rootless: gravou um canal sintético no SQLite,
 recriou o container e confirmou o canal no mesmo volume. O teste deixa seu
-volume de fixture para inspeção; não valida backups nem a integração real com
-Uirapuru.
+volume de fixture para inspeção; não valida backups nem infraestrutura real.
 
 Para preparar uma versão, atualize e revise `Cargo.toml` e `Cargo.lock`, faça
 os testes e integre a alteração normalmente. A criação e o envio da tag são uma
@@ -44,7 +43,10 @@ Começar do README. Configure seu cliente MCP para iniciar o executável sem
 argumentos. O release Linux não depende de Docker, systemd nem de servidor HTTP.
 Arquivos para Windows e macOS não são produzidos neste fluxo.
 
-## Compose para servidor
+## Servidor remoto
+
+O [guia de instalação do servidor](server-setup.md) apresenta instruções
+independentes para Docker Compose, Docker sem Compose e systemd.
 
 O arquivo `compose.yaml` contém a aplicação e um relay HTTP interno: não instala
 proxy HTTPS, TLS, serviços externos ou Ciphera. O relay apenas encaminha a porta
@@ -52,8 +54,7 @@ publicada em loopback para o listener privado da aplicação. Usa imagens `lates
 por padrão; para fixá-las, forneça `DISCORD_MCP_IMAGE` e
 `DISCORD_MCP_RELAY_IMAGE` com referências da mesma versão ou seus digests. Configure as
 variáveis descritas em [Operação](operations.md), inclusive `DISCORD_MCP_KEY`,
-e disponibilize-as por mecanismo seguro. O Uirapuru pode fornecer os valores
-por suas variáveis do serviço; valores de ambiente de containers podem ser
+e disponibilize-as por mecanismo seguro. Valores de ambiente de containers podem ser
 vistos por quem tem acesso ao daemon Docker. Não versione credenciais.
 O volume nomeado persiste o SQLite em `/data`; guarde a chave separadamente e
 prepare backups antes de alterar volumes. Não execute `down -v` para atualização.
@@ -65,13 +66,10 @@ este recebe conexões na porta interna 8080. O Docker publica somente em
 livre. O relay não fornece HTTPS nem deve ser confundido com o proxy externo.
 Quando um proxy roda em outro namespace, acesso ao loopback do host depende da
 configuração do ambiente; um proxy em outro container não o acessa automaticamente.
-O operador escolhe e configura o proxy externo, exposição, HTTPS e integração
-com o Uirapuru. O Compose não altera a validação de loopback da aplicação.
-O relay compartilha o namespace de rede do serviço (`network_mode: service:`):
-o analisador de blue-green do Uirapuru considera `network_mode` incompatível com
-duas versões simultâneas. Use uma instância por Compose e não presuma suporte a
-blue-green ou escala automática com esse arquivo. A integração completa com o
-Uirapuru depende da versão e da configuração do ambiente e não foi testada aqui.
+O operador escolhe e configura o proxy externo, exposição e HTTPS. O Compose
+não altera a validação de loopback da aplicação. O relay compartilha o namespace
+de rede do serviço (`network_mode: service:`). Use uma instância por banco;
+blue-green ou escala automática com o mesmo banco não foram estabelecidos.
 
 O volume e a chave são necessários para comandos administrativos e recuperação;
 use o mesmo volume e configuração quando executar comandos administrativos com
@@ -82,7 +80,7 @@ entregues pelo mecanismo de identidade escolhido; o Compose não as cria.
 ## Referências do workflow
 
 As versões e avisos publicados nos repositórios oficiais foram consultados em
-2026-11-08; os `uses` apontam para commits completos. O aviso
+2026-11-09; os `uses` apontam para commits completos. O aviso
 [GHSA-cxww-7g56-2vh6](https://github.com/advisories/GHSA-cxww-7g56-2vh6)
 afeta versões antigas do download-artifact anteriores à correção 4.1.3, não a
 versão selecionada.

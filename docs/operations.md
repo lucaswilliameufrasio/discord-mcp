@@ -1,9 +1,9 @@
 # Discord MCP
 
-> Em desenvolvimento. O modo HTTP é experimental, não foi validado com o
-> Discord real e não deve ser utilizado como serviço de produção.
+> O modo HTTP é experimental e ainda não foi validado com o Discord real.
+> A decisão sobre seu uso cabe ao operador.
 
-Servidor MCP em Rust planejado para integrar canais do Discord por webhook ou
+Servidor MCP em Rust para integrar canais do Discord por webhook ou
 bot. Webhooks permitem apenas envio; bots podem enviar e consultar mensagens
 conforme as permissões concedidas no Discord.
 
@@ -11,8 +11,8 @@ conforme as permissões concedidas no Discord.
 
 O protocolo stdio oferece envio para um webhook configurado na variável de
 ambiente `DISCORD_WEBHOOK_URL`; mensagens não permitem menções automáticas. O
-modo servidor HTTP possui OAuth e controle de acesso experimentais; a gestão
-guiada de segredos ainda falta.
+modo servidor HTTP possui OAuth e controle de acesso experimentais. Para
+instalação, consulte o [guia do servidor](server-setup.md).
 
 Também é possível cadastrar múltiplos webhooks em SQLite local e selecionar o
 canal pelo nome no argumento `channel` da ferramenta `send_message`. Configure
@@ -28,8 +28,8 @@ arquivos versionados, argumentos de processo ou histórico do shell.
 exibi-la. Use uma entrada segura e não a digite em terminal com eco habilitado.
 `discord-mcp list-channels` lista apenas nomes. O arquivo de banco novo é criado
 com permissões restritas no Unix; um arquivo existente com permissões de grupo
-ou outros usuários é recusado. O fluxo guiado de gerenciamento de chaves ainda
-não existe.
+ou outros usuários é recusado. A CLI também oferece comandos de preparação e
+geração de chave; consulte `discord-mcp --help`.
 
 ### Interface web local
 
