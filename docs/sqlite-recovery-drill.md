@@ -1,5 +1,8 @@
 # Exercício isolado de recuperação SQLite
 
+Para os testes mediados Floci, Caddy e snapshot em containers descartáveis,
+consulte [o harness Testcontainers](../drills/testcontainers/README.md).
+
 Este exercício qualifica somente um snapshot local de dados sintéticos; **não é
 um procedimento de restauração de produção nem prova recuperação de desastre**.
 Não recebe caminho de banco, segredo ou backup real. O teste cria seus próprios
@@ -137,6 +140,8 @@ dois snapshots independentes, **não** captura contínua ou incremental.
 
 O isolamento usa contêiner e diretório temporário próprios; interrupções abruptas
 podem deixar recursos do exercício, que devem ser identificados antes de limpar.
+Em término normal ou erro tratável, o script remove seu diretório exclusivo de
+build e o contêiner que criou; não remove caches ou volumes preexistentes.
 O emulador local não valida IAM, criptografia de objetos, rede, consistência,
 latência ou políticas de qualquer provedor real, nem perda de host. O restore
 S3 da biblioteca irmã baixa o repositório inteiro para staging temporário e
