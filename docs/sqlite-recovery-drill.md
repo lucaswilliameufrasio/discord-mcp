@@ -48,13 +48,13 @@ diretório exclusivo no fixture. O processo foi encerrado após o teste; os arqu
 do fixture de validação permanecem no diretório persistente de build. Isso não
 valida armazenamento remoto real nem recuperação operacional.
 
-O teste opt-in `ciphera_injected_key_recovers_without_overwriting_or_restoring_authority`
-em `tests/ciphera_cli.rs` conecta a CLI Ciphera real a uma API sintética de
+O teste `ciphera_injected_key_recovers_without_overwriting_or_restoring_authority`
+em `tests/ciphera_cli.rs` conecta um injetor simulado a uma API sintética de
 loopback e usa a chave injetada para preparar e ativar uma cópia em quarentena.
 Ele exercita recusa, 503, chave ausente e destino ocupado, preservando a origem;
 confere que canal persiste, mas permissões e tokens antigos não são reativados.
-Requer `CIPHERA_TEST_BINARY` apontando para uma CLI verificada e um sandbox sem
-rede externa. Não acessa Ciphera, S3 ou systemd reais e não comprova custódia,
+Requer Python 3 e um sandbox sem rede externa. Não executa Ciphera nem acessa
+Ciphera, S3 ou systemd reais e não comprova custódia,
 backup remoto ou recuperação operacional.
 
 ## Dependência e execução

@@ -4,9 +4,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 : "${CADDY_BIN:?Set CADDY_BIN to a verified Caddy executable}"
-: "${CIPHERA_TEST_BINARY:?Set CIPHERA_TEST_BINARY to a verified Ciphera CLI executable}"
 [[ -x "$CADDY_BIN" ]] || { printf '%s\n' 'Caddy executable unavailable.' >&2; exit 1; }
-[[ -x "$CIPHERA_TEST_BINARY" ]] || { printf '%s\n' 'Ciphera CLI executable unavailable.' >&2; exit 1; }
 interfaces="$(ip -o link show | awk -F ': ' '{print $2}')"
 [[ "$interfaces" == 'lo' ]] || { printf '%s\n' 'An isolated loopback-only network namespace is required.' >&2; exit 1; }
 work="$(mktemp -d "${TMPDIR:-/tmp}/discord-mcp-caddy.XXXXXXXX")"
@@ -57,11 +55,11 @@ status="$(curl --silent --retry 8 --retry-all-errors --retry-delay 1 --cacert "$
 "${cargo_env[@]}" DISCORD_MCP_CADDY_CA="$ca" DISCORD_MCP_CADDY_CONFIG="$work/Caddyfile" \
     cargo test --locked --all-features --manifest-path "$root/Cargo.toml" \
     --test caddy_tls -- --ignored --test-threads=1
-"${cargo_env[@]}" CIPHERA_TEST_BINARY="$CIPHERA_TEST_BINARY" CIPHERA_TEST_PROXY_CA="$ca" \
+"${cargo_env[@]}" CIPHERA_TEST_PROXY_CA="$ca" \
     DISCORD_MCP_BUNDLE_PATH="$work/bundle" cargo test --locked --all-features \
-    --manifest-path "$root/Cargo.toml" --test ciphera_cli -- --ignored --test-threads=1
+    --manifest-path "$root/Cargo.toml" --test ciphera_cli -- --test-threads=1
 if grep -q 'synthetic-log-marker' "$work/caddy.log"; then
     printf '%s\n' 'Synthetic marker was found in Caddy logs.' >&2
     exit 1
 fi
-printf '%s\n' 'Verified bundle preservation, Ciphera bootstrap fixture, HTTPS, authentication, outage and absence of the synthetic marker in Caddy logs.'
+printf '%s\n' 'Verified bundle preservation, synthetic injection contract, HTTPS, authentication, outage and absence of the synthetic marker in Caddy logs.'

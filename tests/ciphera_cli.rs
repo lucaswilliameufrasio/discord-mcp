@@ -1,4 +1,4 @@
-//! Opt-in protocol check against a local synthetic Ciphera API, never production.
+//! Contract tests using a synthetic injector and local API, not the Ciphera CLI.
 use std::{
     process::Command,
     sync::{
@@ -14,6 +14,15 @@ use axum::{
     routing::get,
 };
 use rmcp::serde_json::{Value, json};
+
+#[cfg(unix)]
+fn synthetic_injector(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("synthetic-injector");
+    std::fs::write(&path, include_str!("fixtures/ciphera_stub.py")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
 
 async fn bootstrap_secrets(
     State(mode): State<Arc<AtomicU8>>,
@@ -41,13 +50,12 @@ async fn bootstrap_secrets(
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a separately provided Ciphera CLI executable"]
 async fn ciphera_injected_key_recovers_without_overwriting_or_restoring_authority() {
     use discord_mcp::channels::{ChannelAction, ChannelStore};
     use std::{ffi::OsStr, os::unix::fs::PermissionsExt};
 
-    let cli = std::env::var_os("CIPHERA_TEST_BINARY").expect("provide a test Ciphera binary");
     let dir = tempfile::tempdir().unwrap();
+    let cli = synthetic_injector(dir.path());
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let source = dir.path().join("source.db");
     let destination = dir.path().join("recovered.db");
@@ -78,7 +86,7 @@ async fn ciphera_injected_key_recovers_without_overwriting_or_restoring_authorit
         Command::new(&cli)
             .env_clear()
             .env("HOME", dir.path())
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("CIPHERA_TOKEN", "synthetic-token")
             .env("DISCORD_MCP_DB", db)
             .args([
@@ -156,12 +164,12 @@ async fn ciphera_injected_key_recovers_without_overwriting_or_restoring_authorit
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a separately provided Ciphera CLI executable"]
-async fn dropin_shell_with_real_cli_preserves_existing_database_on_failures() {
+async fn dropin_shell_with_synthetic_injector_preserves_database_on_failures() {
     use discord_mcp::channels::ChannelStore;
     use std::{os::unix::fs::PermissionsExt, process::Stdio, time::Duration};
 
-    let cli = std::env::var("CIPHERA_TEST_BINARY").expect("provide a test Ciphera binary");
+    let dir = tempfile::tempdir().unwrap();
+    let cli = synthetic_injector(dir.path());
     if let Some(bundle) = std::env::var_os("DISCORD_MCP_BUNDLE_PATH") {
         let bundle = std::path::Path::new(&bundle);
         assert_eq!(
@@ -182,12 +190,19 @@ async fn dropin_shell_with_real_cli_preserves_existing_database_on_failures() {
         );
     }
     let proxy_ca = std::env::var_os("CIPHERA_TEST_PROXY_CA");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = listener.local_addr().unwrap();
+    drop(listener);
     let origin = if proxy_ca.is_some() {
-        "https://example.test:8443"
+        "https://example.test:8443".to_owned()
     } else {
-        "http://127.0.0.1:8000"
+        format!("http://{listen}")
     };
-    let dir = tempfile::tempdir().unwrap();
+    let listen = if proxy_ca.is_some() {
+        "127.0.0.1:8000".to_owned()
+    } else {
+        listen.to_string()
+    };
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let database = dir.path().join("existing.db");
     let key = [0x47u8; 32];
@@ -219,7 +234,7 @@ async fn dropin_shell_with_real_cli_preserves_existing_database_on_failures() {
         .strip_suffix('\'')
         .unwrap()
         .replace("$$", "$")
-        .replace("/usr/local/bin/ciphera", &cli)
+        .replace("/usr/local/bin/ciphera", cli.to_str().unwrap())
         .replace(
             "/usr/local/bin/discord-mcp",
             env!("CARGO_BIN_EXE_discord-mcp"),
@@ -229,14 +244,14 @@ async fn dropin_shell_with_real_cli_preserves_existing_database_on_failures() {
         cmd.env_clear()
             .args(["-c", &shell])
             .env("HOME", dir.path())
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("CREDENTIALS_DIRECTORY", dir.path())
             .env("CIPHERA_API_URL", format!("http://{address}"))
             .env("CIPHERA_PROJECT", project)
             .env("CIPHERA_ENV", "test")
             .env("DISCORD_MCP_DB", &database)
-            .env("DISCORD_MCP_LISTEN", "127.0.0.1:8000")
-            .env("DISCORD_MCP_PUBLIC_ORIGIN", origin)
+            .env("DISCORD_MCP_LISTEN", &listen)
+            .env("DISCORD_MCP_PUBLIC_ORIGIN", &origin)
             .env("DISCORD_MCP_DISCORD_CLIENT_ID", "123")
             .env("DISCORD_MCP_ADMIN_ID", "1")
             .env("DISCORD_MCP_CLIENT_ID", "fixture")
@@ -315,11 +330,11 @@ async fn fake_secrets(
     ])))
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a separately provided Ciphera CLI executable"]
-async fn real_ciphera_cli_fails_closed_and_injects_synthetic_secrets() {
-    let cli = std::env::var_os("CIPHERA_TEST_BINARY").expect("provide a test Ciphera binary");
+async fn synthetic_injector_contract_fails_closed_and_injects_secrets() {
     let dir = tempfile::tempdir().unwrap();
+    let cli = synthetic_injector(dir.path());
     let database = dir.path().join("no-database.db");
     let project = "00000000-0000-4000-8000-000000000001";
     let allow = Arc::new(AtomicBool::new(false));
@@ -336,7 +351,7 @@ async fn real_ciphera_cli_fails_closed_and_injects_synthetic_secrets() {
         Command::new(&cli)
             .env_clear()
             .env("HOME", dir.path())
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("CIPHERA_TOKEN", "synthetic-token")
             .env("DISCORD_MCP_DB", &database)
             .env("DISCORD_MCP_LISTEN", "127.0.0.1:8000")

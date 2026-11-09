@@ -34,18 +34,17 @@ configurações globais ou outros componentes deixam de registrar dados sensíve
 revise e teste o caminho completo antes de ativá-lo.
 
 O exercício automatizado `drills/caddy/run.sh` exige Caddy previamente
-verificado em `CADDY_BIN`, CLI Ciphera verificada em `CIPHERA_TEST_BINARY`,
-Rust/Cargo, curl, ip e um namespace de rede que
+verificado em `CADDY_BIN`, Python 3, Rust/Cargo, curl, ip e um namespace de rede que
 contenha apenas loopback; ele recusa outras interfaces, usa somente dados
 sintéticos e não usa Docker. Execute-o dentro de um sandbox autorizado, sem
 acesso a credenciais, serviços ou sockets do host, com cache Cargo local e
-os dois apontando para binários de teste. Exemplo dentro desse sandbox:
-`CADDY_BIN=/caminho/caddy CIPHERA_TEST_BINARY=/caminho/ciphera bash drills/caddy/run.sh`. O processo cria e remove
+o binário apontando para o Caddy de teste. Exemplo dentro desse sandbox:
+`CADDY_BIN=/caminho/caddy bash drills/caddy/run.sh`. O processo cria e remove
 seu diretório temporário, inclusive a CA sintética; interrupções forçadas podem
 deixar arquivos temporários. Ele não valida certificados ou proxies reais.
 O exercício confere que o pacote não sobrescreve um diretório existente, usa seu
-site Caddy e verifica os demais arquivos contra os modelos. Com a CLI Ciphera
-real e API sintética, cobre falhas e inicialização do MCP por HTTPS; a expansão
+site Caddy e verifica os demais arquivos contra os modelos. Com um injetor
+simulado e API sintética, cobre falhas e inicialização do MCP por HTTPS; a expansão
 do drop-in é simulada e não substitui sua execução sob systemd.
 
 As opções globais do fixture estão em `drills/caddy/global-options.caddy` e o
@@ -238,18 +237,12 @@ com uma instância Ciphera. O teste posterior na VM, descrito acima, cobre a
 expansão e entrega de uma credencial sintética com chave nula, não a custódia real.
 O teste simulado cobre falha do cliente e execução sem chave da aplicação: ambos
 encerram com erro antes da criação de um banco novo, sem registrar o token sintético.
-O teste opt-in `tests/ciphera_cli.rs` também executou Ciphera CLI 0.4.0 real
-contra uma API sintética em loopback: a recusa HTTP impediu a criação do banco,
-e uma resposta sintética válida injetou as variáveis necessárias para o preflight
-da aplicação sem exibi-las. Para repetir, use um sandbox sem rede externa e com
-executável Ciphera verificado fornecido por `CIPHERA_TEST_BINARY`, então execute
-`cargo test --locked --all-features --test ciphera_cli -- --ignored
---test-threads=1`. O endpoint, token, projeto e segredos desse teste são
-sintéticos; ele não verifica autenticação, entrega, rotação ou falhas da
-instância Ciphera real, nem substitui a execução do drop-in no systemd.
-Um segundo caso executa o fragmento shell do drop-in com a CLI real e a mesma API
-sintética: recusa HTTP, indisponibilidade HTTP 503 e resposta sem chave preservam um banco existente, e uma
-resposta válida inicia o MCP sem remover o canal sintético. A expansão `$$` é
+O teste `tests/ciphera_cli.rs` usa um injetor simulado com API sintética em
+loopback, sem executar Ciphera. Execute em sandbox sem rede externa com Python 3:
+`cargo test --locked --all-features --test ciphera_cli -- --test-threads=1`.
+Ele cobre recusa, indisponibilidade e ausência de chave, preservação do banco e
+inicialização com valores sintéticos. Não verifica a implementação ou instância
+Ciphera real. A expansão `$$` é
 simulada nesse caso; ele não valida o parser em execução nem credenciais systemd.
 Uma tentativa posterior de iniciar um gerenciador systemd de usuário em
 namespaces descartáveis falhou ao acessar a hierarquia de cgroups; não foram
